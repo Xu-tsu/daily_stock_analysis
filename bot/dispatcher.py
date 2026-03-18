@@ -248,18 +248,25 @@ class CommandDispatcher:
         cmd_name, args = message.get_command_and_args(self.command_prefix)
 
         if cmd_name is None:
-            # 没有命令前缀，但@了机器人，自动当作对话处理
             if message.mentioned:
                 chat_cmd = self.get_command("chat")
                 if chat_cmd is None:
                     chat_cmd = self.get_command("ask")
                 if chat_cmd:
                     try:
-                        return chat_cmd.execute(message, message.text.strip())
+                        # 尝试多种属性名获取消息文本
+                        msg_text = ""
+                        for attr in ("text", "content", "raw_content", "body", "message"):
+                            val = getattr(message, attr, None)
+                            if val and isinstance(val, str) and len(val.strip()) > 0:
+                                msg_text = val.strip()
+                                break
+                        if not msg_text:
+                            msg_text = str(message)
+                        return chat_cmd.execute(message, msg_text)
                     except Exception as e:
                         logger.error(f"[Dispatcher] 默认对话失败: {e}")
                         return BotResponse.error_response(f"处理失败: {str(e)[:100]}")
-            # 没@机器人，不处理
             return BotResponse.text_response("")
 
         logger.info(f"[Dispatcher] 收到命令: {cmd_name}, 参数: {args}, 用户: {message.user_name}")
