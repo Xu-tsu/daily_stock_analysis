@@ -246,19 +246,24 @@ class CommandDispatcher:
         
         # 2. 解析命令和参数
         cmd_name, args = message.get_command_and_args(self.command_prefix)
-        
+
         if cmd_name is None:
-            # 不是命令，检查是否 @了机器人
+            # 没有命令前缀，但@了机器人，自动当作对话处理
             if message.mentioned:
-                return BotResponse.text_response(
-                    "你好！我是股票分析助手。\n"
-                    f"发送 `{self.command_prefix}help` 查看可用命令。"
-                )
-            # 非命令消息，不处理
+                chat_cmd = self.get_command("chat")
+                if chat_cmd is None:
+                    chat_cmd = self.get_command("ask")
+                if chat_cmd:
+                    try:
+                        return chat_cmd.execute(message, message.text.strip())
+                    except Exception as e:
+                        logger.error(f"[Dispatcher] 默认对话失败: {e}")
+                        return BotResponse.error_response(f"处理失败: {str(e)[:100]}")
+            # 没@机器人，不处理
             return BotResponse.text_response("")
-        
+
         logger.info(f"[Dispatcher] 收到命令: {cmd_name}, 参数: {args}, 用户: {message.user_name}")
-        
+
         # 3. 查找命令处理器
         command = self.get_command(cmd_name)
         

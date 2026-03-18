@@ -21,6 +21,16 @@ A股自选股智能分析系统 - 主调度程序
 - 效率优先：关注筹码集中度好的股票
 - 买点偏好：缩量回踩 MA5/MA10 支撑
 """
+import mimetypes
+_original_guess = mimetypes.guess_type
+def _patched_guess(url, strict=True):
+    url_str = str(url)
+    if url_str.endswith('.js') or url_str.endswith('.mjs'):
+        return ('application/javascript', None)
+    if url_str.endswith('.css'):
+        return ('text/css', None)
+    return _original_guess(url, strict)
+mimetypes.guess_type = _patched_guess
 import os
 from src.config import setup_env
 setup_env()
@@ -269,6 +279,20 @@ def run_full_analysis(
         # Issue #529: Hot-reload STOCK_LIST from .env on each scheduled run
         if stock_codes is None:
             config.refresh_stock_list()
+        # === 自动扫描强势股并追加到分析列表 ===
+        if os.getenv("SCHEDULE_RUN_SCANNER", "false").lower() == "true":
+            try:
+                from scanner import scan_market
+                logger.info("正在执行全市场扫描...")
+                candidates = scan_market(max_cap=200, min_turnover=2.0, max_bias=5.0, top_n=10)
+                if candidates:
+                    scan_codes = [c["代码"] for c in candidates]
+                    logger.info(f"扫描到 {len(scan_codes)} 只强势股: {scan_codes}")
+                    current_list = stock_codes if stock_codes is not None else config.stock_list
+                    stock_codes = list(dict.fromkeys(current_list + scan_codes))
+                    logger.info(f"合并后分析列表: {len(stock_codes)} 只")
+            except Exception as e:
+                logger.warning(f"全市场扫描失败（已跳过）: {e}")
 
         # Issue #373: Trading day filter (per-stock, per-market)
         effective_codes = stock_codes if stock_codes is not None else config.stock_list
