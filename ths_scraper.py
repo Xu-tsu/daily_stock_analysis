@@ -2,8 +2,8 @@
 """
 ths_scraper.py — 资金流向数据采集（多数据源自动回退）
 
-数据源优先级：东方财富 → 新浪财经 → 腾讯行情兜底
-海外（日本等）东方财富经常限流/连不上，自动切换不中断。
+数据源优先级：新浪财经 → 东方财富 → 腾讯行情兜底
+实测从日本连接：新浪 0.9s（最稳） > 东方财富 1.6s（常抽风） > 腾讯 0.2s（无资金流）
 
 导出函数:
   fetch_stock_fund_flow_rank()       → Top N 个股资金流排行
@@ -162,20 +162,19 @@ def _em_single_stock_fund_flow(stock_code: str) -> Optional[dict]:
 # 新浪财经（备选数据源）
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def _sina_stock_fund_flow_rank(top_n: int) -> List[dict]:
-    """新浪财经个股资金流排行"""
+    """新浪财经个股资金流排行（ssl_bkzj_ssggzj 接口，海外稳定快速）"""
     url = (
         "https://vip.stock.finance.sina.com.cn/quotes_service/api/"
-        "json_v2.php/MoneyFlow.ssl_bkzj_zjlrqs?"
-        f"page=1&num={min(top_n, 80)}&sort=r0_net&asc=0&bankuai=&shession="
+        "json_v2.php/MoneyFlow.ssl_bkzj_ssggzj?"
+        f"page=1&num={min(top_n, 80)}&sort=netamount&asc=0"
     )
     try:
-        r = requests.get(url, headers=_HEADERS_SINA, timeout=10)
+        r = requests.get(url, headers=_HEADERS_SINA, timeout=8)
         r.encoding = "gbk"
         text = r.text.strip()
         if not text or text == "null":
             return []
-        # 新浪返回的是非标准 JSON（键名无引号），需要特殊处理
-        # 格式: [{symbol:"sh600519",name:"贵州茅台",...}, ...]
+        # 新浪返回非标准 JSON（键名无引号）
         text = re.sub(r'(\w+):', r'"\1":', text)
         items = json.loads(text)
         results = []
@@ -185,16 +184,17 @@ def _sina_stock_fund_flow_rank(top_n: int) -> List[dict]:
             r0_net = _safe_float(item.get("r0_net"))
             r0_in = _safe_float(item.get("r0_in"))
             r0_out = _safe_float(item.get("r0_out"))
+            net_amount = _safe_float(item.get("netamount"))
             results.append({
                 "code": code,
                 "name": str(item.get("name", "")),
                 "price": _safe_float(item.get("trade")),
                 "change_pct": _safe_float(item.get("changeratio")) * 100,
-                "main_net": round(r0_net / 10000, 2),
-                "main_net_pct": round(r0_net / (r0_in + r0_out) * 100, 2) if (r0_in + r0_out) > 0 else 0,
-                "super_large_net": 0,
-                "large_net": 0,
-                "turnover_rate": _safe_float(item.get("turnover")) * 100,
+                "main_net": round(net_amount / 10000, 2),
+                "main_net_pct": _safe_float(item.get("ratioamount")) * 100,
+                "super_large_net": round(r0_net / 10000, 2),  # 新浪 r0=超大单
+                "large_net": round(_safe_float(item.get("r3_net")) / 10000, 2),
+                "turnover_rate": _safe_float(item.get("turnover")),
                 "source": "sina",
             })
         return results
@@ -339,17 +339,20 @@ def _tencent_single_stock_fund_flow(stock_code: str) -> Optional[dict]:
 # 对外接口（自动回退）
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def fetch_stock_fund_flow_rank(top_n: int = 50) -> List[dict]:
-    """获取个股主力资金流排行（东方财富 → 新浪 → 空列表）"""
-    # 1. 东方财富
-    results = _em_stock_fund_flow_rank(top_n)
-    if results:
-        logger.info(f"[资金流] 个股排行 Top{len(results)} (来源: 东方财富)")
-        return results
+    """获取个股主力资金流排行（新浪优先 → 东方财富备选）
 
-    # 2. 新浪财经
+    新浪从海外（日本）连接更快更稳（0.9s vs 1.6s），优先使用。
+    """
+    # 1. 新浪财经（海外更快更稳）
     results = _sina_stock_fund_flow_rank(top_n)
     if results:
         logger.info(f"[资金流] 个股排行 Top{len(results)} (来源: 新浪财经)")
+        return results
+
+    # 2. 东方财富（备选）
+    results = _em_stock_fund_flow_rank(top_n)
+    if results:
+        logger.info(f"[资金流] 个股排行 Top{len(results)} (来源: 东方财富)")
         return results
 
     logger.warning("[资金流] 个股资金流排行所有数据源均失败")
@@ -357,19 +360,19 @@ def fetch_stock_fund_flow_rank(top_n: int = 50) -> List[dict]:
 
 
 def fetch_sector_fund_flow_rank(sector_type: str = "hy", top_n: int = 30) -> List[dict]:
-    """获取板块资金流排行（东方财富 → 新浪 → 空列表）"""
+    """获取板块资金流排行（新浪优先 → 东方财富备选）"""
     type_name = "行业" if sector_type == "hy" else "概念"
 
-    # 1. 东方财富
-    results = _em_sector_fund_flow_rank(sector_type, top_n)
-    if results:
-        logger.info(f"[资金流] {type_name}板块 Top{len(results)} (来源: 东方财富)")
-        return results
-
-    # 2. 新浪财经
+    # 1. 新浪财经
     results = _sina_sector_fund_flow_rank(sector_type, top_n)
     if results:
         logger.info(f"[资金流] {type_name}板块 Top{len(results)} (来源: 新浪财经)")
+        return results
+
+    # 2. 东方财富
+    results = _em_sector_fund_flow_rank(sector_type, top_n)
+    if results:
+        logger.info(f"[资金流] {type_name}板块 Top{len(results)} (来源: 东方财富)")
         return results
 
     logger.warning(f"[资金流] {type_name}板块资金流所有数据源均失败")
@@ -377,18 +380,18 @@ def fetch_sector_fund_flow_rank(sector_type: str = "hy", top_n: int = 30) -> Lis
 
 
 def fetch_single_stock_fund_flow(stock_code: str) -> Optional[dict]:
-    """获取单股资金流（东方财富 → 新浪 → 腾讯估算）"""
-    # 1. 东方财富
-    result = _em_single_stock_fund_flow(stock_code)
-    if result:
-        return result
-
-    # 2. 新浪财经
+    """获取单股资金流（新浪 → 东方财富 → 腾讯估算）"""
+    # 1. 新浪财经
     result = _sina_single_stock_fund_flow(stock_code)
     if result:
         return result
 
-    # 3. 腾讯行情估算
+    # 2. 东方财富
+    result = _em_single_stock_fund_flow(stock_code)
+    if result:
+        return result
+
+    # 3. 腾讯行情估算（兜底）
     result = _tencent_single_stock_fund_flow(stock_code)
     if result:
         logger.debug(f"[资金流] {stock_code} 使用腾讯估算数据")
