@@ -499,9 +499,19 @@ class FeishuStreamClient:
         self._running = False
 
     def _create_message_handler(self) -> Callable[[BotMessage], BotResponse]:
-        """创建消息处理函数"""
+        """创建消息处理函数（含持仓管理指令拦截）"""
 
         def handle_message(message: BotMessage) -> BotResponse:
+            try:
+                from portfolio_bot import is_portfolio_command, handle_portfolio_command
+                text = message.content.strip() if message.content else ""
+                if is_portfolio_command(text):
+                    reply = handle_portfolio_command(text)
+                    return BotResponse.text_response(reply, at_user=False)
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(f"持仓指令处理失败: {e}")
+
             from bot.dispatcher import get_dispatcher
             dispatcher = get_dispatcher()
             return dispatcher.dispatch(message)

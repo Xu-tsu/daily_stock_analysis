@@ -1,0 +1,60 @@
+{
+  "updated_at": "2026-03-27 20:16:10",
+  "cash": 10028.28,
+  "total_asset": 20582.28,
+  "target_position_ratio": 0.7,
+  "holdings": [
+    {
+      "code": "600744",
+      "name": "华银电力",
+      "shares": 200,
+      "cost_price": 8.861,
+      "current_price": 8.54,
+      "market_value": 1708.0,
+      "pnl": -65.48,
+      "pnl_pct": -3.62,
+      "sector": "电力",
+      "buy_date": "2026-03-18",
+      "strategy_tag": "趋势"
+    },
+    {
+      "code": "002131",
+      "name": "利欧股份",
+      "shares": 500,
+      "cost_price": 7.952,
+      "current_price": 7.51,
+      "market_value": 3755.0,
+      "pnl": -223.48,
+      "pnl_pct": -5.56,
+      "sector": "数字营销",
+      "buy_date": "2026-03-15",
+      "strategy_tag": "趋势"
+    },
+    {
+      "code": "002506",
+      "name": "协鑫集成",
+      "shares": 400,
+      "cost_price": 5.441,
+      "current_price": 5.4,
+      "market_value": 2160.0,
+      "pnl": -17.78,
+      "pnl_pct": -0.74,
+      "sector": "光伏",
+      "buy_date": "2026-03-22",
+      "strategy_tag": "趋势"
+    },
+    {
+      "code": "603949",
+      "name": "雪龙集团",
+      "shares": 200,
+      "cost_price": 18.042,
+      "current_price": 17.18,
+      "market_value": 3436.0,
+      "pnl": -174.68,
+      "pnl_pct": -4.78,
+      "sector": "消防设备",
+      "buy_date": "2026-03-10",
+      "strategy_tag": "中线"
+    }
+  ]
+}

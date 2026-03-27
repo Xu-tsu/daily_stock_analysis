@@ -219,7 +219,16 @@ def parse_arguments() -> argparse.Namespace:
         action='store_true',
         help='强制回测（即使已有回测结果也重新计算）'
     )
-
+    parser.add_argument("--all", action="store_true",
+                        help="启动全部功能：Web + 定时分析 + 盘中监控")
+    parser.add_argument("--monitor", action="store_true",
+                        help="启动盘中实时监控（含特朗普新闻源）")
+    parser.add_argument("--interval", type=int, default=10,
+                        help="监控检查间隔（分钟，默认10）")
+    parser.add_argument("--rebalance", action="store_true",
+                       help="执行持仓调仓分析（大盘→板块→个股→调仓建议）")
+    parser.add_argument("--portfolio", type=str, default=None,
+                       help="持仓文件路径，默认 data/portfolio.json")
     return parser.parse_args()
 
 
@@ -270,20 +279,34 @@ def run_full_analysis(
     args: argparse.Namespace,
     stock_codes: Optional[List[str]] = None
 ):
-    """
-    执行完整的分析流程（个股 + 大盘复盘）
-
-    这是定时任务调用的主函数
-    """
+    """执行完整的分析流程（扫描 + 个股 + 大盘复盘）"""
     try:
-        # Issue #529: Hot-reload STOCK_LIST from .env on each scheduled run
         if stock_codes is None:
             config.refresh_stock_list()
-        # === 自动扫描强势股并追加到分析列表 ===
-        if os.getenv("SCHEDULE_RUN_SCANNER", "false").lower() == "true":
+
+        # === 新版全市场扫描 ===
+        if os.getenv("USE_NEW_SCANNER", "false").lower() == "true":
+            try:
+                from market_scanner import scan_market as new_scan
+                logger.info("正在执行全市场扫描（新版）...")
+                candidates = new_scan(max_price=10.0, min_turnover=2.0, top_n=10, mode="trend")
+                if candidates:
+                    scan_codes = [c["code"] for c in candidates]
+                    logger.info(f"扫描到 {len(scan_codes)} 只候选: {scan_codes}")
+                    current_list = stock_codes if stock_codes is not None else config.stock_list
+                    stock_codes = list(dict.fromkeys(current_list + scan_codes))
+                    logger.info(f"合并后分析列表: {len(stock_codes)} 只")
+                    try:
+                        from data_store import save_scan_results
+                        save_scan_results(candidates)
+                    except:
+                        pass
+            except Exception as e:
+                logger.warning(f"全市场扫描失败（已跳过）: {e}")
+        elif os.getenv("SCHEDULE_RUN_SCANNER", "false").lower() == "true":
             try:
                 from scanner import scan_market
-                logger.info("正在执行全市场扫描...")
+                logger.info("正在执行全市场扫描（原版）...")
                 candidates = scan_market(max_cap=200, min_turnover=2.0, max_bias=5.0, top_n=10)
                 if candidates:
                     scan_codes = [c["代码"] for c in candidates]
@@ -294,26 +317,22 @@ def run_full_analysis(
             except Exception as e:
                 logger.warning(f"全市场扫描失败（已跳过）: {e}")
 
-        # Issue #373: Trading day filter (per-stock, per-market)
+        # === 交易日过滤 ===
         effective_codes = stock_codes if stock_codes is not None else config.stock_list
         filtered_codes, effective_region, should_skip = _compute_trading_day_filter(
             config, args, effective_codes
         )
         if should_skip:
-            logger.info(
-                "今日所有相关市场均为非交易日，跳过执行。可使用 --force-run 强制执行。"
-            )
+            logger.info("今日所有相关市场均为非交易日，跳过执行。可使用 --force-run 强制执行。")
             return
         if set(filtered_codes) != set(effective_codes):
             skipped = set(effective_codes) - set(filtered_codes)
             logger.info("今日休市股票已跳过: %s", skipped)
         stock_codes = filtered_codes
 
-        # 命令行参数 --single-notify 覆盖配置（#55）
         if getattr(args, 'single_notify', False):
             config.single_stock_notify = True
 
-        # Issue #190: 个股与大盘复盘合并推送
         merge_notification = (
             getattr(config, 'merge_email_notification', False)
             and config.market_review_enabled
@@ -321,7 +340,7 @@ def run_full_analysis(
             and not config.single_stock_notify
         )
 
-        # 创建调度器
+        # === 创建分析管道 ===
         save_context_snapshot = None
         if getattr(args, 'no_context_snapshot', False):
             save_context_snapshot = False
@@ -334,7 +353,7 @@ def run_full_analysis(
             save_context_snapshot=save_context_snapshot
         )
 
-        # 1. 运行个股分析
+        # === 1. 运行个股分析 ===
         results = pipeline.run(
             stock_codes=stock_codes,
             dry_run=args.dry_run,
@@ -342,7 +361,7 @@ def run_full_analysis(
             merge_notification=merge_notification
         )
 
-        # Issue #128: 分析间隔 - 在个股分析和大盘分析之间添加延迟
+        # 分析间隔
         analysis_delay = getattr(config, 'analysis_delay', 0)
         if (
             analysis_delay > 0
@@ -350,10 +369,10 @@ def run_full_analysis(
             and not args.no_market_review
             and effective_region != ''
         ):
-            logger.info(f"等待 {analysis_delay} 秒后执行大盘复盘（避免API限流）...")
+            logger.info(f"等待 {analysis_delay} 秒后执行大盘复盘...")
             time.sleep(analysis_delay)
 
-        # 2. 运行大盘复盘（如果启用且不是仅个股模式）
+        # === 2. 大盘复盘 ===
         market_report = ""
         if (
             config.market_review_enabled
@@ -368,19 +387,17 @@ def run_full_analysis(
                 merge_notification=merge_notification,
                 override_region=effective_region,
             )
-            # 如果有结果，赋值给 market_report 用于后续飞书文档生成
             if review_result:
                 market_report = review_result
 
-        # Issue #190: 合并推送（个股+大盘复盘）
+        # === 3. 合并推送 ===
         if merge_notification and (results or market_report) and not args.no_notify:
             parts = []
             if market_report:
                 parts.append(f"# 📈 大盘复盘\n\n{market_report}")
             if results:
                 dashboard_content = pipeline.notifier.generate_aggregate_report(
-                    results,
-                    getattr(config, 'report_type', 'simple'),
+                    results, getattr(config, 'report_type', 'simple'),
                 )
                 parts.append(f"# 🚀 个股决策仪表盘\n\n{dashboard_content}")
             if parts:
@@ -388,10 +405,8 @@ def run_full_analysis(
                 if pipeline.notifier.is_available():
                     if pipeline.notifier.send(combined_content, email_send_to_all=True):
                         logger.info("已合并推送（个股+大盘复盘）")
-                    else:
-                        logger.warning("合并推送失败")
 
-        # 输出摘要
+        # === 4. 输出摘要 ===
         if results:
             logger.info("\n===== 分析结果摘要 =====")
             for r in sorted(results, key=lambda x: x.sentiment_score, reverse=True):
@@ -403,50 +418,34 @@ def run_full_analysis(
 
         logger.info("\n任务执行完成")
 
-        # === 新增：生成飞书云文档 ===
+        # === 5. 飞书云文档 ===
         try:
             from src.feishu_doc import FeishuDocManager
-
             feishu_doc = FeishuDocManager()
             if feishu_doc.is_configured() and (results or market_report):
-                logger.info("正在创建飞书云文档...")
-
-                # 1. 准备标题 "01-01 13:01大盘复盘"
                 tz_cn = timezone(timedelta(hours=8))
                 now = datetime.now(tz_cn)
                 doc_title = f"{now.strftime('%Y-%m-%d %H:%M')} 大盘复盘"
-
-                # 2. 准备内容 (拼接个股分析和大盘复盘)
                 full_content = ""
-
-                # 添加大盘复盘内容（如果有）
                 if market_report:
                     full_content += f"# 📈 大盘复盘\n\n{market_report}\n\n---\n\n"
-
-                # 添加个股决策仪表盘（使用 NotificationService 生成，按 report_type 分支）
                 if results:
                     dashboard_content = pipeline.notifier.generate_aggregate_report(
-                        results,
-                        getattr(config, 'report_type', 'simple'),
+                        results, getattr(config, 'report_type', 'simple'),
                     )
                     full_content += f"# 🚀 个股决策仪表盘\n\n{dashboard_content}"
-
-                # 3. 创建文档
                 doc_url = feishu_doc.create_daily_doc(doc_title, full_content)
                 if doc_url:
                     logger.info(f"飞书云文档创建成功: {doc_url}")
-                    # 可选：将文档链接也推送到群里
                     if not args.no_notify:
-                        pipeline.notifier.send(f"[{now.strftime('%Y-%m-%d %H:%M')}] 复盘文档创建成功: {doc_url}")
-
+                        pipeline.notifier.send(f"[{now.strftime('%Y-%m-%d %H:%M')}] 复盘文档: {doc_url}")
         except Exception as e:
             logger.error(f"飞书文档生成失败: {e}")
 
-        # === Auto backtest ===
+        # === 6. 自动回测 ===
         try:
             if getattr(config, 'backtest_enabled', False):
                 from src.services.backtest_service import BacktestService
-
                 logger.info("开始自动回测...")
                 service = BacktestService()
                 stats = service.run_backtest(
@@ -456,11 +455,11 @@ def run_full_analysis(
                     limit=200,
                 )
                 logger.info(
-                    f"自动回测完成: processed={stats.get('processed')} saved={stats.get('saved')} "
-                    f"completed={stats.get('completed')} insufficient={stats.get('insufficient')} errors={stats.get('errors')}"
+                    f"自动回测完成: processed={stats.get('processed')} "
+                    f"saved={stats.get('saved')} errors={stats.get('errors')}"
                 )
         except Exception as e:
-            logger.warning(f"自动回测失败（已忽略）: {e}")
+            logger.warning(f"自动回测失败: {e}")
 
     except Exception as e:
         logger.exception(f"分析流程执行失败: {e}")
@@ -611,6 +610,155 @@ def main() -> int:
         return 0
 
     try:
+        # ━━━ 模式A: 全功能模式（Web + 定时 + 监控 + 调仓）━━━
+        if getattr(args, 'all', False):
+            logger.info("模式: 全功能（Web + 定时分析 + 盘中监控 + 调仓）")
+
+            # 强制跳过交易日检查（监控模块自己判断交易时间）
+            args.force_run = True
+
+            import threading
+
+            # 后台线程1: 盘中监控
+            def _monitor():
+                from market_monitor import run_monitor_loop
+                run_monitor_loop(
+                    interval_minutes=getattr(args, 'interval', 10),
+                    auto_rebalance=True,
+                )
+
+            threading.Thread(target=_monitor, daemon=True).start()
+            logger.info("盘中监控已在后台启动")
+
+            # 启动时立即执行一次：扫描 + 分析 + 调仓
+            logger.info("立即执行首次全量分析...")
+            run_full_analysis(config, args, stock_codes)
+
+            # 如果有持仓，也跑一次调仓
+            try:
+                from portfolio_manager import load_portfolio
+                portfolio = load_portfolio()
+                if portfolio.get("holdings"):
+                    logger.info("立即执行首次调仓分析...")
+                    from rebalance_engine import run_rebalance_analysis
+                    from portfolio_manager import format_rebalance_report
+                    result = run_rebalance_analysis(config=config)
+                    if "error" not in result:
+                        report = format_rebalance_report(result)
+                        logger.info(f"\n{report}")
+                        if not args.no_notify:
+                            try:
+                                from src.notification import NotificationService
+                                notifier = NotificationService()
+                                if notifier.is_available():
+                                    notifier.send(report)
+                            except:
+                                pass
+            except Exception as e:
+                logger.warning(f"首次调仓失败: {e}")
+
+            # 定时循环（每天 SCHEDULE_TIME 再跑一次）
+            from src.scheduler import run_with_schedule
+            run_with_schedule(
+                task=lambda: run_full_analysis(config, args, stock_codes),
+                schedule_time=config.schedule_time,
+                run_immediately=False,  # 上面已经手动跑过了
+            )
+            return 0
+        # ━━━ 模式M: 盘中实时监控 ━━━
+        if getattr(args, 'monitor', False):
+            logger.info("模式: 盘中实时监控")
+            from market_monitor import run_monitor_loop
+            run_monitor_loop(
+                interval_minutes=getattr(args, 'interval', 10),
+                auto_rebalance=True,
+            )
+            return 0
+        # ━━━ 模式R: 持仓调仓分析（多Agent） ━━━
+        if getattr(args, 'rebalance', False):
+            logger.info("模式: 持仓调仓分析（多Agent）")
+
+            # 如果指定了持仓文件路径
+            if getattr(args, 'portfolio', None):
+                os.environ["PORTFOLIO_FILE"] = args.portfolio
+
+            # 交易日检查
+            if not getattr(args, 'force_run', False) and getattr(config, 'trading_day_check_enabled', True):
+                try:
+                    from src.core.trading_calendar import get_open_markets_today
+                    open_markets = get_open_markets_today()
+                    if 'cn' not in open_markets and 'CN' not in open_markets:
+                        logger.info("今日A股非交易日，跳过调仓分析。可使用 --force-run 强制执行。")
+                        return 0
+                except Exception:
+                    pass  # 如果交易日历模块出错就不拦截
+
+            try:
+                from rebalance_engine import run_rebalance_analysis
+                from portfolio_manager import format_rebalance_report, load_portfolio
+
+                # 检查持仓文件是否存在
+                portfolio = load_portfolio()
+                if not portfolio.get("holdings"):
+                    logger.error("持仓为空！请先编辑 data/portfolio.json 填入你的持仓信息")
+                    logger.error("模板参考: https://github.com/你的仓库/data/portfolio.json")
+                    return 1
+
+                holding_names = [
+                    f"{h.get('name', '')}({h['code']})"
+                    for h in portfolio["holdings"]
+                ]
+                logger.info(f"当前持仓 {len(portfolio['holdings'])} 只: {', '.join(holding_names)}")
+                logger.info(f"现金: {portfolio.get('cash', 0)}")
+
+                # 执行多Agent调仓分析
+                logger.info("开始执行多Agent调仓分析...")
+                rebalance_result = run_rebalance_analysis(config=config)
+
+                if "error" in rebalance_result:
+                    logger.error(f"调仓分析失败: {rebalance_result['error']}")
+                    return 1
+
+                # 格式化报告
+                report = format_rebalance_report(rebalance_result)
+                logger.info("\n" + "=" * 60)
+                logger.info("调仓建议报告:")
+                logger.info("=" * 60)
+                logger.info("\n" + report)
+
+                # 推送通知（复用项目已有的通知模块）
+                if not args.no_notify:
+                    try:
+                        from src.notification import NotificationService
+                        notifier = NotificationService()
+                        if notifier.is_available():
+                            notifier.send(report)
+                            logger.info("调仓报告已推送")
+                        else:
+                            logger.warning("未配置通知渠道，跳过推送")
+                    except Exception as e:
+                        logger.error(f"推送失败: {e}")
+
+                # 保存分析结果到本地
+                import json as _json
+                from pathlib import Path as _Path
+                result_dir = _Path("data/rebalance_history")
+                result_dir.mkdir(parents=True, exist_ok=True)
+                filename = result_dir / f"rebalance_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                with open(filename, "w", encoding="utf-8") as f:
+                    _json.dump(rebalance_result, f, ensure_ascii=False, indent=2)
+                logger.info(f"调仓结果已保存到 {filename}")
+
+            except ImportError as e:
+                logger.error(f"缺少调仓模块: {e}")
+                logger.error(
+                    "请确认 rebalance_engine.py, macro_data_collector.py, portfolio_manager.py 已放到项目根目录")
+                return 1
+            except Exception as e:
+                logger.exception(f"调仓分析执行失败: {e}")
+                return 1
+
+            return 0
         # 模式0: 回测
         if getattr(args, 'backtest', False):
             logger.info("模式: 回测")

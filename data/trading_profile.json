@@ -1,0 +1,26 @@
+
+{
+  "trader_name": "华尔街之狼",
+  "style": "短线趋势+板块轮动",
+  "holding_period": "1-10天",
+  "preferences": {
+    "price_range": "10元以下低价股优先",
+    "market_cap": "流通市值50亿以下小盘股",
+    "themes": "热门题材概念、政策驱动、资金驱动",
+    "buy_signal": "板块资金连续流入+个股放量突破+乖离率<5%",
+    "sell_signal": "板块资金转向+破MA5+亏损超8%止损",
+    "position_per_stock": "单只不超过总资金20%"
+  },
+  "blacklist": {
+    "types": ["大盘蓝筹", "白马股", "银行股", "保险股"],
+    "stocks": ["600519", "601318", "000858"],
+    "reason": "不做价值投资，只做短线趋势"
+  },
+  "risk_rules": {
+    "max_loss_per_stock": "-8%止损",
+    "max_position_ratio": "80%",
+    "min_cash_reserve": "20%",
+    "max_stocks": 8,
+    "avoid_ipo_days": 5
+  }
+}
