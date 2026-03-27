@@ -1182,6 +1182,29 @@ class DataFetcherManager:
         logger.warning(f"[筹码分布] {stock_code} 所有数据源均失败")
         return None
 
+    @staticmethod
+    def _get_stock_name_tencent(stock_code: str) -> Optional[str]:
+        """通过腾讯行情接口快速获取股票名称（无限频限制）"""
+        import re
+        import requests as _requests
+        prefix = "sh" if stock_code.startswith(("6", "9")) else "sz"
+        symbol = f"{prefix}{stock_code}"
+        try:
+            r = _requests.get(
+                f"http://qt.gtimg.cn/q={symbol}",
+                timeout=5,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            r.encoding = "gbk"
+            m = re.search(r'v_\w+="([^"]+)"', r.text)
+            if m:
+                fields = m.group(1).split("~")
+                if len(fields) > 1 and fields[1]:
+                    return fields[1]
+        except Exception as e:
+            logger.debug(f"[股票名称] 腾讯行情获取 {stock_code} 失败: {e}")
+        return None
+
     def get_stock_name(self, stock_code: str, allow_realtime: bool = True) -> Optional[str]:
         """
         获取股票中文名称（自动切换数据源）
@@ -1225,7 +1248,14 @@ class DataFetcherManager:
             self._stock_name_cache[stock_code] = static_name
             return static_name
 
-        # 3. 依次尝试各个数据源
+        # 3. 腾讯行情接口快速获取名称（无限频，响应快）
+        tencent_name = self._get_stock_name_tencent(stock_code)
+        if is_meaningful_stock_name(tencent_name, stock_code):
+            self._stock_name_cache[stock_code] = tencent_name
+            logger.info(f"[股票名称] 从腾讯行情获取: {stock_code} -> {tencent_name}")
+            return tencent_name
+
+        # 4. 依次尝试各个数据源
         for fetcher in self._fetchers:
             if hasattr(fetcher, 'get_stock_name'):
                 try:

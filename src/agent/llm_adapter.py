@@ -249,7 +249,12 @@ class LLMToolAdapter:
         models_to_try = [m for m in models_to_try if m]
 
         last_error = None
+        _skip_providers: set = set()
         for model in models_to_try:
+            _provider = model.split("/")[0] if "/" in model else ""
+            if _provider and _provider in _skip_providers:
+                logger.info(f"[Agent LLM] 跳过 {model}（{_provider} 已限频）")
+                continue
             try:
                 return self._call_litellm_model(
                     messages,
@@ -260,7 +265,15 @@ class LLMToolAdapter:
                     timeout=timeout,
                 )
             except Exception as e:
-                logger.warning(f"Agent LLM call failed with {model}: {e}")
+                error_str = str(e).lower()
+                is_rate_limit = any(kw in error_str for kw in (
+                    "rate", "quota", "429", "resource_exhausted", "exceeded",
+                ))
+                if is_rate_limit and _provider:
+                    logger.warning(f"[Agent LLM] {model} 限频/配额用尽，{_provider}/* 后续跳过: {e}")
+                    _skip_providers.add(_provider)
+                else:
+                    logger.warning(f"[Agent LLM] {model} failed: {e}")
                 last_error = e
                 continue
 
