@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### 新功能
 
 - 📱 **Social Sentiment Intelligence (US stocks)** — 新增 Reddit / X (Twitter) / Polymarket 社交媒体情绪数据源，为美股分析提供实时社交舆情情报。数据来自 api.adanos.org，包含 Buzz Score、情绪评分、提及量等指标。完全可选（需配置 `SOCIAL_SENTIMENT_API_KEY`），仅对美股生效，A 股 / 港股不受影响。
+- 🧩 **本地监控/调仓最小闭环模块** — 新增 `market_monitor.py`、`rebalance_engine.py`、`macro_data_collector.py`、`portfolio_manager.py`、`data_store.py`，提供扫描持久化、持仓实时估值、基础调仓建议与监控循环能力，便于与 `main.py --all/--monitor/--rebalance` 一键协同。
 ### 文档
 
 - 新增云服务器 Web 界面部署与访问教程 (Fixes #686)

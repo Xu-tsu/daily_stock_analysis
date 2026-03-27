@@ -245,6 +245,8 @@ LITELLM_MODEL=openai/deepseek-chat
 如果同时启用了 `LITELLM_CONFIG`，YAML 仍然是运行时主模型 / fallback / Vision 的唯一来源；渠道编辑器只保存渠道条目，不会覆盖 YAML 的运行时选择。
 
 > 若使用 `python main.py --all` 或 `python main.py --monitor`，`market_monitor.py` 属于可选扩展模块：缺失时 `--all` 会自动跳过监控线程并继续其他流程；`--monitor` 会提示缺少模块并退出。
+>
+> 现在仓库已内置 `market_monitor.py` / `rebalance_engine.py` / `portfolio_manager.py` / `macro_data_collector.py` / `data_store.py` 最小闭环实现，可直接用于本地监控与调仓流程。
 
 > Docker 部署、定时任务配置请参考 [完整指南](docs/full-guide.md)
 > 桌面客户端打包请参考 [桌面端打包说明](docs/desktop-package.md)
