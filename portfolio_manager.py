@@ -1,0 +1,134 @@
+"""
+portfolio_manager.py — 持仓管理与调仓建议模块
+放在项目根目录，与 analyzer_service.py 同级
+"""
+import json, os, logging
+from datetime import datetime
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+PORTFOLIO_FILE = os.getenv("PORTFOLIO_FILE", "data/portfolio.json")
+
+# ──────────────────────────────────────────────
+# 1. 持仓数据读写
+# ──────────────────────────────────────────────
+DEFAULT_PORTFOLIO = {
+    "updated_at": "",
+    "cash": 0,
+    "total_asset": 0,
+    "target_position_ratio": 0.7,
+    "holdings": []
+    # 每条 holding:
+    # {
+    #   "code": "600519", "name": "贵州茅台",
+    #   "shares": 100, "cost_price": 1580.0,
+    #   "current_price": 0, "market_value": 0,
+    #   "sector": "白酒", "buy_date": "2026-01-15",
+    #   "strategy_tag": "价值长持"
+    # }
+}
+
+def load_portfolio() -> dict:
+    """加载本地持仓 JSON"""
+    p = Path(PORTFOLIO_FILE)
+    if p.exists():
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+    logger.warning(f"持仓文件 {PORTFOLIO_FILE} 不存在，使用空持仓")
+    return DEFAULT_PORTFOLIO.copy()
+
+def save_portfolio(portfolio: dict):
+    """保存持仓到本地"""
+    p = Path(PORTFOLIO_FILE)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    portfolio["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(portfolio, f, ensure_ascii=False, indent=2)
+    logger.info(f"持仓已保存到 {PORTFOLIO_FILE}")
+
+def update_current_prices(portfolio: dict, price_map: dict) -> dict:
+    """用实时价格更新持仓市值
+    price_map: {"600519": 1820.0, "300750": 225.0, ...}
+    """
+    total_mv = 0
+    for h in portfolio["holdings"]:
+        code = h["code"]
+        if code in price_map:
+            h["current_price"] = price_map[code]
+            h["market_value"] = round(h["current_price"] * h["shares"], 2)
+            h["pnl_pct"] = round(
+                (h["current_price"] - h["cost_price"]) / h["cost_price"] * 100, 2
+            )
+        total_mv += h.get("market_value", 0)
+    portfolio["total_asset"] = round(total_mv + portfolio.get("cash", 0), 2)
+    portfolio["actual_position_ratio"] = (
+        round(total_mv / portfolio["total_asset"], 4)
+        if portfolio["total_asset"] > 0 else 0
+    )
+    return portfolio
+
+
+# ──────────────────────────────────────────────
+# 2. 调仓建议格式化（给通知模块用）
+# ──────────────────────────────────────────────
+def format_rebalance_report(rebalance: dict) -> str:
+    """把 LLM 返回的调仓 JSON 格式化为推送文本"""
+    lines = []
+    lines.append("📊 **调仓建议报告**")
+    lines.append(f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    lines.append("")
+
+    # 总仓位建议
+    pos = rebalance.get("overall_position_advice", "")
+    if pos:
+        lines.append(f"🎯 **仓位建议**: {pos}")
+        lines.append("")
+
+    # 大盘判断
+    market = rebalance.get("market_assessment", "")
+    if market:
+        lines.append(f"📈 **大盘研判**: {market}")
+        lines.append("")
+
+    # 板块分析
+    sector = rebalance.get("sector_assessment", "")
+    if sector:
+        lines.append(f"🔥 **板块轮动**: {sector}")
+        lines.append("")
+
+    # 逐只操作
+    actions = rebalance.get("actions", [])
+    if actions:
+        lines.append("📋 **操作建议**:")
+        for a in actions:
+            emoji = {"buy": "🟢", "hold": "🟡", "reduce": "🟠", "sell": "🔴"}.get(
+                a.get("action", "hold"), "⚪"
+            )
+            action_cn = {
+                "buy": "加仓", "hold": "持有",
+                "reduce": "减仓", "sell": "清仓"
+            }.get(a.get("action", "hold"), a.get("action", ""))
+            lines.append(
+                f"{emoji} **{a.get('name', a.get('code', ''))}** → {action_cn}"
+            )
+            if a.get("detail"):
+                lines.append(f"   {a['detail']}")
+            if a.get("reason"):
+                lines.append(f"   💡 {a['reason']}")
+        lines.append("")
+
+    # 候选换股
+    candidates = rebalance.get("new_candidates", [])
+    if candidates:
+        lines.append("🔍 **换股候选**:")
+        for c in candidates:
+            lines.append(f"  • {c.get('name', '')}({c.get('code', '')}) — {c.get('reason', '')}")
+        lines.append("")
+
+    # 风险提示
+    risk = rebalance.get("risk_warning", "")
+    if risk:
+        lines.append(f"⚠️ **风险提示**: {risk}")
+
+    return "\n".join(lines)
