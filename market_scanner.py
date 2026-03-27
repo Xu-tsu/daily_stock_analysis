@@ -273,6 +273,38 @@ def analyze_kline(df: pd.DataFrame) -> dict:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 全市场扫描主流程
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def _load_winning_patterns() -> dict:
+    """加载交易盈利模式（如果有足够数据的话）"""
+    try:
+        from trade_journal import analyze_winning_patterns
+        patterns = analyze_winning_patterns(days=90)
+        if "optimal_strategy" in patterns:
+            return patterns["optimal_strategy"]
+    except Exception:
+        pass
+    return {}
+
+
+def _load_fund_flow_stocks() -> dict:
+    """加载当日主力资金流入的股票集合，返回 {code: main_net}"""
+    try:
+        from ths_scraper import fetch_stock_fund_flow_rank
+        stocks = fetch_stock_fund_flow_rank(top_n=50)
+        return {s["code"]: s.get("main_net", 0) for s in stocks if s.get("main_net", 0) > 0}
+    except Exception:
+        return {}
+
+
+def _load_mainline_sectors() -> set:
+    """加载当前主线板块名称集合"""
+    try:
+        from data_store import get_sector_mainline
+        sectors = get_sector_mainline(min_days=2)
+        return {s["sector_name"] for s in sectors[:10]}
+    except Exception:
+        return set()
+
+
 def scan_market(
     max_price: float = 10.0,
     min_turnover: float = 2.0,
@@ -296,8 +328,18 @@ def scan_market(
       trend  — 趋势股（MA多头+缩量回踩）
       breakout — 突破股（放量突破近期高点）
       oversold — 超跌反弹（RSI低+MACD底背离）
+      sub_dragon — 副龙头（短期题材+低位+资金流入+即将拉升）
     """
     start_time = time.time()
+
+    # 预加载辅助数据（用于打分增强）
+    winning_patterns = _load_winning_patterns()
+    fund_flow_stocks = {}
+    mainline_sectors = set()
+    if mode == "sub_dragon":
+        logger.info("[预加载] 获取资金流和主线板块数据...")
+        fund_flow_stocks = _load_fund_flow_stocks()
+        mainline_sectors = _load_mainline_sectors()
 
     # Step 1: 获取股票列表
     logger.info("[扫描 1/4] 获取A股列表...")
@@ -375,10 +417,41 @@ def scan_market(
                 bonus += 15
             if ta.get("macd_signal") == "底部收敛":
                 bonus += 10
+        elif mode == "sub_dragon":
+            # 副龙头策略：低位 + 题材催化 + 资金流入 + 技术底部
+            # 1. 主力资金流入加分
+            if code in fund_flow_stocks:
+                net = fund_flow_stocks[code]
+                bonus += 15 if net > 5000 else 10 if net > 1000 else 5
+            # 2. 低位启动（近10日跌幅大+今日开始反弹）
+            chg_10d = ta.get("chg_10d", 0)
+            chg_today = q.get("change_pct", 0)
+            if chg_10d < -5 and chg_today > 1:
+                bonus += 10  # 超跌反弹启动
+            elif chg_10d < -3 and chg_today > 0:
+                bonus += 5
+            # 3. MACD 底部信号（金叉或底部收敛=即将拉升）
+            if ta.get("macd_signal") in ("金叉", "底部收敛"):
+                bonus += 10
+            # 4. 换手率活跃（>5%=市场关注度高）
+            if q.get("turnover_rate", 0) > 5:
+                bonus += 5
+            # 5. RSI 不超买（<60 安全区间）
+            if ta.get("rsi", 50) < 45:
+                bonus += 5
+
+        # 盈利模式加分（基于历史交易数据学习）
+        if winning_patterns:
+            best_ma = winning_patterns.get("best_ma_trend", "")
+            best_macd = winning_patterns.get("best_macd_signal", "")
+            if best_ma and ta.get("ma_trend") == best_ma:
+                bonus += 5
+            if best_macd and ta.get("macd_signal") == best_macd:
+                bonus += 5
 
         final_score = ta.get("score", 0) + bonus
 
-        results.append({
+        entry = {
             "code": code,
             "name": q.get("name", ""),
             "price": q.get("price", 0),
@@ -397,7 +470,11 @@ def scan_market(
             "chg_5d": ta.get("chg_5d", 0),
             "chg_10d": ta.get("chg_10d", 0),
             "tech_score": final_score,
-        })
+        }
+        # 副龙头模式额外信息
+        if mode == "sub_dragon" and code in fund_flow_stocks:
+            entry["main_net"] = fund_flow_stocks[code]
+        results.append(entry)
 
         time.sleep(0.1)  # 控制K线请求频率
 

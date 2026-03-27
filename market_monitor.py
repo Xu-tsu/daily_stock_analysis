@@ -39,10 +39,25 @@ def run_pre_market_scan() -> list:
     logger.info(f"盘前扫描 {today}")
     logger.info("=" * 60)
 
-    # 1. 全市场扫描
-    logger.info("[盘前 1/3] 全市场扫描...")
+    # 1. 全市场扫描（趋势模式）
+    logger.info("[盘前 1/4] 全市场趋势扫描...")
     candidates = scan_market(max_price=10.0, min_turnover=2.0, top_n=30, mode="trend")
     save_scan_results(candidates, scan_date=today, mode="trend")
+
+    # 1.5 副龙头扫描（短期题材+低位+资金流入）
+    logger.info("[盘前 1.5/4] 副龙头扫描...")
+    try:
+        sub_dragons = scan_market(max_price=15.0, min_turnover=3.0, top_n=20, mode="sub_dragon")
+        save_scan_results(sub_dragons, scan_date=today, mode="sub_dragon")
+        if sub_dragons:
+            logger.info(f"  副龙头候选 Top5:")
+            for s in sub_dragons[:5]:
+                logger.info(
+                    f"    {s['code']} {s['name']} {s['price']:.2f}元 "
+                    f"主力:{s.get('main_net', 0):.0f}万 得分:{s['tech_score']}"
+                )
+    except Exception as e:
+        logger.warning(f"副龙头扫描失败: {e}")
 
     # 2. 积累个股资金流（同花顺 Top50）
     logger.info("[盘前 2/3] 积累个股资金流...")
