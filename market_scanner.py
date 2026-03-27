@@ -17,6 +17,7 @@ market_scanner.py — A股全市场扫描 + K线技术分析
   python market_scanner.py --mode trend          # 趋势模式
 """
 import argparse, json, logging, math, os, time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import List, Optional
 import requests
@@ -37,49 +38,68 @@ def _code_to_tc(code: str) -> str:
     return f"sz{code}"
 
 
-def _batch_tencent_quotes(codes: list, batch_size: int = 80) -> dict:
-    """批量获取腾讯行情，每批最多80只"""
-    all_results = {}
+def _fetch_one_batch(batch_codes: list, batch_idx: int) -> dict:
+    """获取单批腾讯行情（供线程池调用）"""
+    import re
+    results = {}
+    tc_codes = [_code_to_tc(c) for c in batch_codes]
+    code_str = ",".join(tc_codes)
+    try:
+        r = requests.get(
+            f"https://qt.gtimg.cn/q={code_str}",
+            timeout=15, headers=HEADERS,
+        )
+        r.encoding = "gbk"
+        for line in r.text.strip().split("\n"):
+            m = re.match(r'v_(\w+)="(.+)"', line.strip().rstrip(";"))
+            if not m:
+                continue
+            fields = m.group(2).split("~")
+            if len(fields) < 45:
+                continue
+            raw_code = fields[2]
+            results[raw_code] = {
+                "name": fields[1],
+                "code": raw_code,
+                "price": float(fields[3]) if fields[3] else 0,
+                "prev_close": float(fields[4]) if fields[4] else 0,
+                "open": float(fields[5]) if fields[5] else 0,
+                "volume": int(fields[6]) if fields[6] else 0,
+                "change_pct": float(fields[32]) if fields[32] else 0,
+                "high": float(fields[33]) if fields[33] else 0,
+                "low": float(fields[34]) if fields[34] else 0,
+                "amount": float(fields[37]) if fields[37] else 0,
+                "turnover_rate": float(fields[38]) if fields[38] else 0,
+                "market_cap": float(fields[44]) if fields[44] else 0,
+                "amplitude": float(fields[43]) if fields[43] else 0,
+            }
+    except Exception as e:
+        logger.warning(f"腾讯批量行情第 {batch_idx+1} 批失败: {e}")
+    return results
+
+
+def _batch_tencent_quotes(codes: list, batch_size: int = 80, max_workers: int = 10) -> dict:
+    """批量获取腾讯行情，多线程并发（每批最多80只）"""
+    batches = []
     for i in range(0, len(codes), batch_size):
-        batch = codes[i:i + batch_size]
-        tc_codes = [_code_to_tc(c) for c in batch]
-        code_str = ",".join(tc_codes)
-        try:
-            r = requests.get(
-                f"https://qt.gtimg.cn/q={code_str}",
-                timeout=20, headers=HEADERS,
-            )
-            r.encoding = "gbk"
-            import re
-            for line in r.text.strip().split("\n"):
-                m = re.match(r'v_(\w+)="(.+)"', line.strip().rstrip(";"))
-                if not m:
-                    continue
-                tc = m.group(1)
-                fields = m.group(2).split("~")
-                if len(fields) < 45:
-                    continue
-                raw_code = fields[2]
-                all_results[raw_code] = {
-                    "name": fields[1],
-                    "code": raw_code,
-                    "price": float(fields[3]) if fields[3] else 0,
-                    "prev_close": float(fields[4]) if fields[4] else 0,
-                    "open": float(fields[5]) if fields[5] else 0,
-                    "volume": int(fields[6]) if fields[6] else 0,
-                    "change_pct": float(fields[32]) if fields[32] else 0,
-                    "high": float(fields[33]) if fields[33] else 0,
-                    "low": float(fields[34]) if fields[34] else 0,
-                    "amount": float(fields[37]) if fields[37] else 0,
-                    "turnover_rate": float(fields[38]) if fields[38] else 0,
-                    "market_cap": float(fields[44]) if fields[44] else 0,
-                    "amplitude": float(fields[43]) if fields[43] else 0,
-                }
-        except Exception as e:
-            logger.warning(f"腾讯批量行情第 {i//batch_size+1} 批失败: {e}")
-        # 控制频率
-        if i + batch_size < len(codes):
-            time.sleep(0.3)
+        batches.append(codes[i:i + batch_size])
+
+    total = len(batches)
+    logger.info(f"  共 {total} 批请求，{max_workers} 线程并发...")
+    all_results = {}
+    done_count = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_fetch_one_batch, batch, idx): idx
+            for idx, batch in enumerate(batches)
+        }
+        for future in as_completed(futures):
+            results = future.result()
+            all_results.update(results)
+            done_count += 1
+            if done_count % 50 == 0 or done_count == total:
+                logger.info(f"  行情进度: {done_count}/{total} 批完成，已获取 {len(all_results)} 只")
 
     return all_results
 
@@ -122,11 +142,8 @@ def get_all_stock_codes() -> list:
     # 沪市主板 600000-605999
     for i in range(600000, 606000):
         all_codes.append(f"{i:06d}")
-    # 深市创业板 300000-302999
+    # 深市创业板 300000-302999（已包含301000-301999）
     for i in range(300000, 303000):
-        all_codes.append(f"{i:06d}")
-    # 深市创业板补充 301000-301999
-    for i in range(301000, 302000):
         all_codes.append(f"{i:06d}")
     # 沪市科创板 688000-688999
     for i in range(688000, 689000):
