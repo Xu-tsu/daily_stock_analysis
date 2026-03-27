@@ -253,6 +253,45 @@ class TestAgentResultConversion(unittest.TestCase):
         )
         self.assertEqual(result.name, "贵州茅台")
 
+    def test_enhance_failed_result_with_trend_signal(self):
+        """Failed Agent result should be upgraded from trend signals when available."""
+        pipeline = self._make_pipeline()
+
+        from src.agent.executor import AgentResult
+        from src.enums import ReportType
+        from src.stock_analyzer import TrendAnalysisResult, BuySignal, TrendStatus
+
+        agent_result = AgentResult(
+            success=False,
+            content="",
+            dashboard=None,
+            error="quota exhausted",
+        )
+        result = pipeline._agent_result_to_analysis_result(
+            agent_result, "002506", "协鑫集成", ReportType.SIMPLE, "q-fallback"
+        )
+        self.assertEqual(result.sentiment_score, 50)
+        self.assertEqual(result.operation_advice, "观望")
+
+        trend_result = TrendAnalysisResult(
+            code="002506",
+            buy_signal=BuySignal.BUY,
+            signal_score=68,
+            trend_status=TrendStatus.BULL,
+            current_price=5.42,
+        )
+        pipeline._enhance_agent_failure_with_trend_signals(
+            result=result,
+            trend_result=trend_result,
+            realtime_quote=None,
+        )
+
+        self.assertEqual(result.sentiment_score, 68)
+        self.assertEqual(result.operation_advice, "买入")
+        self.assertEqual(result.decision_type, "buy")
+        self.assertIn("系统信号=买入", result.trend_prediction)
+        self.assertIn("fallback_mode", result.dashboard)
+
 
 # ============================================================
 # Skill registration in pipeline

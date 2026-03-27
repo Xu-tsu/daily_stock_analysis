@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### 修复
 
+- 🧠 **评分降级不再固定 50 分** — 当 Agent/LLM 因限流或配额失败时，Pipeline 现在会基于技术分析信号（`buy_signal` + `signal_score` + `trend_status`）生成降级评分与建议，避免批量出现“50/观望/未知”占位结果。
 - 🤖 **飞书持仓指令拦截与持仓实时价兼容性** — `Feishu Stream` 路径新增可配置的持仓指令优先拦截（`FEISHU_PORTFOLIO_COMMAND_INTERCEPT`，默认开启），命中后直接返回，避免与原 dispatcher 重复处理；持仓价格更新兼容 `price/close/last/current_price` 多字段，降低行情源降级时价格不刷新的概率。
 - 📧 **邮件中文发件人名编码**（#708）— 邮件通知现在会对包含中文的 `EMAIL_SENDER_NAME` 自动做 RFC 2047 编码，并在异常路径补充 SMTP 连接清理，修复 GitHub Actions / QQ SMTP 下 `'ascii' codec can't encode characters` 导致的发送失败。
 - 🐛 **港股 Agent 实时行情去重与快速路由** — 统一 `HK01810` / `1810.HK` / `01810` 等港股代码归一规则；港股实时行情改为直接走单次 `akshare_hk` 路径，避免按 A 股 source priority 重复触发同一失败接口；Agent 运行期对显式 `retriable=false` 的工具失败增加短路缓存，减少同轮分析中的重复失败调用。

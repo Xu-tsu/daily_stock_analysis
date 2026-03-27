@@ -660,6 +660,11 @@ class StockAnalysisPipeline:
             # price_position fallback (same as non-agent path Step 7.7)
             if result:
                 fill_price_position_if_needed(result, trend_result, realtime_quote)
+                self._enhance_agent_failure_with_trend_signals(
+                    result=result,
+                    trend_result=trend_result,
+                    realtime_quote=realtime_quote,
+                )
 
             resolved_stock_name = result.name if result and result.name else stock_name
 
@@ -707,6 +712,88 @@ class StockAnalysisPipeline:
             logger.error(f"[{code}] Agent 分析失败: {e}")
             logger.exception(f"[{code}] Agent 详细错误信息:")
             return None
+
+    def _enhance_agent_failure_with_trend_signals(
+        self,
+        result: Optional[AnalysisResult],
+        trend_result: Optional[TrendAnalysisResult],
+        realtime_quote: Any,
+    ) -> None:
+        """
+        When Agent output fails, use deterministic trend signals to avoid
+        placeholder-only result (e.g. 50/观望/未知).
+        """
+        if not result or result.success or not trend_result:
+            return
+
+        def _to_float(v: Any) -> Optional[float]:
+            try:
+                fv = float(v)
+                return fv
+            except (TypeError, ValueError):
+                return None
+
+        raw_score = getattr(trend_result, "signal_score", None)
+        score = int(raw_score) if isinstance(raw_score, (int, float)) else 0
+        if score <= 0:
+            score = 50
+        score = max(0, min(100, score))
+
+        buy_signal = getattr(getattr(trend_result, "buy_signal", None), "value", "")
+        buy_signal = str(buy_signal or "观望").strip()
+        signal_lower = buy_signal.lower()
+
+        if "强烈买入" in buy_signal:
+            advice = "强烈买入"
+            decision_type = "strong_buy"
+        elif "买入" in buy_signal:
+            advice = "买入"
+            decision_type = "buy"
+        elif ("强烈卖出" in buy_signal) or ("strong_sell" in signal_lower):
+            advice = "强烈卖出"
+            decision_type = "strong_sell"
+        elif ("卖出" in buy_signal) or ("sell" == signal_lower):
+            advice = "卖出"
+            decision_type = "sell"
+        elif ("持有" in buy_signal) or ("hold" in signal_lower):
+            advice = "持有"
+            decision_type = "hold"
+        else:
+            advice = "观望"
+            decision_type = "hold"
+
+        trend_status = getattr(getattr(trend_result, "trend_status", None), "value", "盘整")
+        trend_status = str(trend_status or "盘整")
+        current_price = _to_float(getattr(realtime_quote, "price", None))
+        if current_price is None or current_price <= 0:
+            current_price = _to_float(getattr(trend_result, "current_price", None))
+
+        trend_text = f"技术面{trend_status}，系统信号={buy_signal}，评分={score}/100"
+        if current_price and current_price > 0:
+            trend_text = f"{trend_text}，现价≈{current_price:.2f}"
+
+        # Override placeholder-like values so summary is actionable.
+        result.sentiment_score = score
+        result.operation_advice = advice
+        result.trend_prediction = trend_text
+        result.decision_type = decision_type
+
+        if not (result.analysis_summary or "").strip():
+            result.analysis_summary = (
+                "LLM分析暂不可用，已使用技术面信号生成降级结论。"
+                "建议结合仓位与风险偏好再决策。"
+            )
+
+        if not result.dashboard:
+            result.dashboard = {}
+        result.dashboard.setdefault("fallback_mode", "trend_signal")
+        result.dashboard.setdefault("fallback_reason", result.error_message or "llm_unavailable")
+        logger.info(
+            "[%s] Agent失败后启用技术面降级评分: advice=%s, score=%s",
+            result.code,
+            advice,
+            score,
+        )
 
     def _agent_result_to_analysis_result(
         self, agent_result, code: str, stock_name: str, report_type: ReportType, query_id: str
