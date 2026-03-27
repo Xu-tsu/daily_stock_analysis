@@ -862,7 +862,7 @@ class Config:
                         "api_key": "ollama",  # Ollama 不需要真实 key
                     },
                 })
-            logger.info(f"[LLM] 检测到本地 Ollama 模型，已加入兜底: {_new_ollama}")
+            print(f"[LLM] 检测到本地 Ollama 模型，已加入兜底: {_new_ollama}")
 
         # 解析搜索引擎 API Keys（支持多个 key，逗号分隔）
         bocha_keys_str = os.getenv('BOCHA_API_KEYS', '')
