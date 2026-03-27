@@ -802,7 +802,12 @@ class GeminiAnalyzer:
         use_channel_router = self._has_channel_config(config)
 
         last_error = None
+        _skip_providers: set = set()  # 限频的 provider 整体跳过
         for model in models_to_try:
+            _provider = model.split("/")[0] if "/" in model else ""
+            if _provider and _provider in _skip_providers:
+                logger.info(f"[LiteLLM] 跳过 {model}（{_provider} 已限频）")
+                continue
             try:
                 model_short = model.split("/")[-1] if "/" in model else model
                 call_kwargs: Dict[str, Any] = {
@@ -847,7 +852,15 @@ class GeminiAnalyzer:
                 raise ValueError("LLM returned empty response")
 
             except Exception as e:
-                logger.warning(f"[LiteLLM] {model} failed: {e}")
+                error_str = str(e).lower()
+                is_rate_limit = any(kw in error_str for kw in (
+                    "rate", "quota", "429", "resource_exhausted", "exceeded",
+                ))
+                if is_rate_limit and _provider:
+                    logger.warning(f"[LiteLLM] {model} 限频/配额用尽，{_provider}/* 后续跳过: {e}")
+                    _skip_providers.add(_provider)
+                else:
+                    logger.warning(f"[LiteLLM] {model} failed: {e}")
                 last_error = e
                 continue
 

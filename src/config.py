@@ -133,6 +133,34 @@ def channel_allows_empty_api_key(protocol: Optional[str], base_url: Optional[str
     return parsed.hostname in {"127.0.0.1", "localhost", "0.0.0.0"}
 
 
+def detect_local_ollama_models() -> List[str]:
+    """检测本地 Ollama 可用模型，返回 ollama/model_name 列表。
+
+    如果 Ollama 未运行或不可达，返回空列表（不报错）。
+    优先使用 REBALANCE_LOCAL_MODEL 环境变量指定的模型。
+    """
+    import requests as _requests
+    base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    # 如果有明确指定的本地模型，优先用它
+    explicit_model = os.getenv("REBALANCE_LOCAL_MODEL", "").strip()
+    if explicit_model:
+        # 验证 Ollama 是否可达
+        try:
+            _requests.get(f"{base_url}/api/tags", timeout=2)
+            return [explicit_model]
+        except Exception:
+            return []
+    # 否则自动检测
+    try:
+        r = _requests.get(f"{base_url}/api/tags", timeout=2)
+        if r.status_code == 200:
+            models = r.json().get("models", [])
+            return [f"ollama/{m['name']}" for m in models if m.get("name")]
+    except Exception:
+        pass
+    return []
+
+
 def normalize_llm_channel_model(model: str, protocol: Optional[str], base_url: Optional[str] = None) -> str:
     """Attach a provider prefix when the model omits it."""
     normalized_model = model.strip()
@@ -816,6 +844,25 @@ class Config:
                 m for m in _all_ch_models
                 if m not in _seen and not _seen.add(m)  # type: ignore[func-returns-value]
             ]
+
+        # === 自动检测本地 Ollama 作为兜底模型 ===
+        _existing_models = {litellm_model} | set(litellm_fallback_models)
+        _ollama_models = detect_local_ollama_models()
+        _new_ollama = [m for m in _ollama_models if m not in _existing_models]
+        if _new_ollama:
+            litellm_fallback_models = litellm_fallback_models + _new_ollama
+            # 同时将 Ollama 加入 model_list 供 Router 使用
+            _ollama_base = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+            for _om in _new_ollama:
+                llm_model_list.append({
+                    "model_name": _om,
+                    "litellm_params": {
+                        "model": _om,
+                        "api_base": f"{_ollama_base}/v1",
+                        "api_key": "ollama",  # Ollama 不需要真实 key
+                    },
+                })
+            logger.info(f"[LLM] 检测到本地 Ollama 模型，已加入兜底: {_new_ollama}")
 
         # 解析搜索引擎 API Keys（支持多个 key，逗号分隔）
         bocha_keys_str = os.getenv('BOCHA_API_KEYS', '')
