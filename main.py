@@ -621,7 +621,14 @@ def main() -> int:
 
             # 后台线程1: 盘中监控
             def _monitor():
-                from market_monitor import run_monitor_loop
+                try:
+                    from market_monitor import run_monitor_loop
+                except ModuleNotFoundError:
+                    logger.warning(
+                        "未找到 market_monitor.py，已跳过盘中监控线程。"
+                        "如需启用，请将 market_monitor.py 放在项目根目录。"
+                    )
+                    return
                 run_monitor_loop(
                     interval_minutes=getattr(args, 'interval', 10),
                     auto_rebalance=True,
@@ -668,7 +675,14 @@ def main() -> int:
         # ━━━ 模式M: 盘中实时监控 ━━━
         if getattr(args, 'monitor', False):
             logger.info("模式: 盘中实时监控")
-            from market_monitor import run_monitor_loop
+            try:
+                from market_monitor import run_monitor_loop
+            except ModuleNotFoundError:
+                logger.error(
+                    "缺少 market_monitor.py，无法启动 --monitor。"
+                    "请将 market_monitor.py 放在项目根目录后重试。"
+                )
+                return 1
             run_monitor_loop(
                 interval_minutes=getattr(args, 'interval', 10),
                 auto_rebalance=True,
