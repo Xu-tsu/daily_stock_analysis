@@ -502,15 +502,17 @@ class FeishuStreamClient:
         """创建消息处理函数（含持仓管理指令拦截）"""
 
         def handle_message(message: BotMessage) -> BotResponse:
+            intercept_enabled = os.getenv("FEISHU_PORTFOLIO_COMMAND_INTERCEPT", "true").lower() == "true"
             try:
-                from portfolio_bot import is_portfolio_command, handle_portfolio_command
-                text = message.content.strip() if message.content else ""
-                if is_portfolio_command(text):
-                    reply = handle_portfolio_command(text)
-                    return BotResponse.text_response(reply, at_user=False)
+                if intercept_enabled:
+                    from portfolio_bot import is_portfolio_command, handle_portfolio_command
+                    text = (message.content or "").replace("\u3000", " ").strip()
+                    if is_portfolio_command(text):
+                        reply = handle_portfolio_command(text)
+                        logger.info("[Feishu Stream] 持仓指令已拦截: %s", text[:32])
+                        return BotResponse.text_response(reply, at_user=False)
             except Exception as e:
-                import logging
-                logging.getLogger(__name__).warning(f"持仓指令处理失败: {e}")
+                logger.warning(f"持仓指令处理失败: {e}")
 
             from bot.dispatcher import get_dispatcher
             dispatcher = get_dispatcher()

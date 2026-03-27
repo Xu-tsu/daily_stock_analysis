@@ -47,6 +47,20 @@ def is_portfolio_command(text: str) -> bool:
     return any(text.startswith(kw) for kw in keywords)
 
 
+def _pick_quote_price(quote: dict) -> float:
+    """从行情字典中提取可用价格（兼容不同字段名）。"""
+    if not isinstance(quote, dict):
+        return 0.0
+    for key in ("price", "close", "last", "current_price"):
+        try:
+            val = float(quote.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            val = 0.0
+        if val > 0:
+            return val
+    return 0.0
+
+
 def handle_portfolio_command(text: str) -> str:
     """处理持仓管理指令"""
     text = text.strip()
@@ -253,7 +267,7 @@ def _handle_clear(text: str) -> str:
         from macro_data_collector import _fetch_tencent_quote, _stock_code_to_tencent
         tc = _stock_code_to_tencent(code)
         q = _fetch_tencent_quote([tc]).get(tc, {})
-        current_price = q.get("price", target.get("current_price", 0))
+        current_price = _pick_quote_price(q) or target.get("current_price", 0)
     except:
         current_price = target.get("current_price", 0)
 
@@ -294,8 +308,9 @@ def _handle_show_portfolio() -> str:
     for h in holdings:
         tc = _stock_code_to_tencent(h["code"])
         q = quotes.get(tc, {})
-        if q.get("price", 0) > 0:
-            price_map[h["code"]] = q["price"]
+        latest_price = _pick_quote_price(q)
+        if latest_price > 0:
+            price_map[h["code"]] = latest_price
 
     portfolio = update_current_prices(portfolio, price_map)
 
