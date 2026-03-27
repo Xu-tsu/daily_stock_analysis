@@ -449,6 +449,20 @@ def scan_market(
             if best_macd and ta.get("macd_signal") == best_macd:
                 bonus += 5
 
+        # 向量知识库加分：检索历史相似场景的胜率
+        try:
+            from knowledge_base import query_similar_trades
+            query = f"MA趋势:{ta.get('ma_trend','')} MACD:{ta.get('macd_signal','')}"
+            similar = query_similar_trades(query, n_results=5)
+            if similar:
+                wins = sum(1 for s in similar if s["metadata"].get("result") == "盈利")
+                if wins >= 3:
+                    bonus += 5  # 历史相似场景多数盈利
+                elif wins <= 1:
+                    bonus -= 5  # 历史相似场景多数亏损
+        except Exception:
+            pass
+
         final_score = ta.get("score", 0) + bonus
 
         entry = {
