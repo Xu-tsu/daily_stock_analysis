@@ -117,8 +117,9 @@ def _call_cloud_llm(prompt: str, agent_name: str = "") -> str:
         logger.info(f"[{agent_name}] 云端模型返回 {len(result)} 字符")
         return result
     except Exception as e:
-        logger.error(f"[{agent_name}] 云端 LLM 调用失败: {e}，回退到本地模型")
-        return _call_local_llm(prompt, agent_name)
+        logger.error(f"[{agent_name}] 云端 LLM 调用失败: {e}，回退到本地辩论模型")
+        # 回退到 DeepSeek-R1 而非 Qwen，避免激进派自己仲裁自己
+        return _call_debate_llm(prompt, f"{agent_name}_本地回退")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -237,6 +238,143 @@ def _parse_llm_json(response: str) -> dict:
                 pass
         logger.error(f"JSON 解析失败，原始响应前300字: {text[:300]}...")
         return {}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 降级处理函数（LLM全挂时的兜底策略）
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _merge_proposal_and_critique(proposal: dict, critique: dict) -> dict:
+    """云端仲裁失败时，本地合并激进派方案和保守派质疑。
+    策略：采纳激进派方案，但接受保守派的所有 critical_issues 修正。
+    """
+    result = dict(proposal)
+    result["debate_summary"] = "云端仲裁不可用，本地自动合并：采纳激进派方案，保守派关键修正已注入"
+
+    # 如果保守派对某只股有不同意见，优先采纳保守派
+    disagreements = {
+        d["code"]: d for d in critique.get("position_disagreements", [])
+        if d.get("code")
+    }
+    if disagreements:
+        for action in result.get("actions", []):
+            code = action.get("code", "")
+            if code in disagreements:
+                d = disagreements[code]
+                # 保守派建议更谨慎的操作（如 hold→reduce, hold→sell）
+                action["reason"] = (
+                    f"[激进派] {action.get('reason', '')} "
+                    f"[保守派修正] {d.get('reason', '')}"
+                )
+                # 如果保守派说要卖而激进派说持有，偏向保守
+                conservative_actions = {"sell": 4, "reduce": 3, "hold": 2, "buy": 1}
+                orig_weight = conservative_actions.get(action.get("action", "hold"), 2)
+                # 从 my_suggestion 提取动作
+                suggestion = d.get("my_suggestion", "")
+                if "清仓" in suggestion or "卖出" in suggestion:
+                    new_weight = 4
+                elif "减仓" in suggestion:
+                    new_weight = 3
+                elif "持有" in suggestion:
+                    new_weight = 2
+                else:
+                    new_weight = orig_weight
+                if new_weight > orig_weight:
+                    action["action"] = {4: "sell", 3: "reduce", 2: "hold", 1: "buy"}[new_weight]
+                    action["detail"] = f"保守派修正: {suggestion}"
+
+    return result
+
+
+def _apply_hard_rules(proposal: dict, portfolio: dict) -> dict:
+    """只有激进派方案、保守派挂了时，用硬规则过滤明显违规的建议。"""
+    result = dict(proposal)
+    result["debate_summary"] = "保守派审查不可用，已用硬规则自动风控过滤"
+
+    for action in result.get("actions", []):
+        code = action.get("code", "")
+        # 从portfolio找到对应持仓
+        holding = None
+        for h in portfolio.get("holdings", []):
+            if h["code"] == code:
+                holding = h
+                break
+        if not holding:
+            continue
+
+        pnl = holding.get("pnl_pct", 0)
+        sellable = holding.get("sellable_shares", holding.get("shares", 0))
+
+        # 硬规则1：亏损>5%必须清仓
+        if pnl <= -5.0 and action.get("action") not in ("sell",):
+            action["action"] = "sell"
+            action["detail"] = f"硬规则风控: 亏损{pnl}%超5%止损线，强制清仓"
+            action["reason"] = "止损5%硬规则触发"
+
+        # 硬规则2：卖出数不能超过可卖余额
+        if action.get("action") in ("sell", "reduce") and sellable == 0:
+            action["action"] = "hold"
+            action["detail"] = f"T+1约束: 今天无可卖余额（全部为今日买入），只能明天操作"
+
+    return result
+
+
+def _generate_rules_only_advice(portfolio: dict) -> dict:
+    """所有模型全挂了，纯规则引擎兜底——只做止损和超期清仓，不做新买入。"""
+    from datetime import datetime
+    today = datetime.now()
+    actions = []
+
+    for h in portfolio.get("holdings", []):
+        pnl = h.get("pnl_pct", 0)
+        code = h["code"]
+        name = h.get("name", code)
+        sellable = h.get("sellable_shares", h.get("shares", 0))
+
+        # 计算持仓天数
+        hold_days = 0
+        if h.get("buy_date"):
+            try:
+                bd = datetime.strptime(h["buy_date"][:10], "%Y-%m-%d")
+                hold_days = (today - bd).days
+            except (ValueError, TypeError):
+                pass
+
+        action_item = {
+            "code": code, "name": name,
+            "target_sell_price": None, "stop_loss_price": None,
+            "sell_timing": "模型不可用，仅硬规则判断",
+        }
+
+        if pnl <= -5.0 and sellable > 0:
+            action_item.update({
+                "action": "sell", "ratio": "清仓",
+                "detail": f"硬止损触发: 亏损{pnl:.1f}%超5%，可卖{sellable}股",
+                "reason": "所有模型不可用，纯规则引擎：止损5%强制清仓",
+            })
+        elif hold_days >= 7 and pnl < 5.0 and sellable > 0:
+            action_item.update({
+                "action": "sell", "ratio": "清仓",
+                "detail": f"超期清仓: 持仓{hold_days}天，盈利{pnl:.1f}%不足5%，可卖{sellable}股",
+                "reason": "所有模型不可用，纯规则引擎：超7天+盈利不足清仓",
+            })
+        else:
+            action_item.update({
+                "action": "hold", "ratio": "维持",
+                "detail": f"持仓{hold_days}天，盈亏{pnl:.1f}%，暂无触发条件",
+                "reason": "所有模型不可用，无触发止损/超期规则，默认持有",
+            })
+        actions.append(action_item)
+
+    return {
+        "overall_position_advice": "模型不可用，维持现有仓位，仅执行止损和超期清仓",
+        "market_assessment": "模型不可用，无法判断大盘",
+        "sector_assessment": "模型不可用，无法判断板块",
+        "debate_summary": "⚠️ 所有AI模型均不可用，本报告由纯规则引擎生成，仅包含止损和超期清仓建议，不包含新买入建议",
+        "actions": actions,
+        "new_candidates": [],
+        "risk_warning": "所有AI模型不可用！本报告仅基于硬规则（5%止损+7天超期），不包含趋势分析和换股建议，请谨慎参考。",
+    }
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -863,10 +1001,14 @@ def run_rebalance_analysis(config: Config = None) -> dict:
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # Step 5c: 仲裁者（Gemini云端）— 最终决策
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    logger.info("\n[Step 7/7] 仲裁者（云端模型）综合双方意见，最终裁决...")
+    logger.info("\n[Step 7/7] 仲裁者综合双方意见，最终裁决...")
+
+    debate_mode = "none"
+    prompt_used = ""
 
     if proposal and critique:
-        # 有辩论结果 → 仲裁模式
+        # ✅ 完整辩论 → 仲裁模式
+        debate_mode = "full_debate"
         prompt_arbitrate = PROMPT_DEBATE_ARBITRATE.format(
             proposal=json.dumps(proposal, ensure_ascii=False, indent=2),
             critique=json.dumps(critique, ensure_ascii=False, indent=2),
@@ -875,9 +1017,27 @@ def run_rebalance_analysis(config: Config = None) -> dict:
         )
         if risk_alerts_text:
             prompt_arbitrate = prompt_arbitrate + "\n" + risk_alerts_text
+        prompt_used = prompt_arbitrate
+
+        # 仲裁模型降级链：云端 → DeepSeek → Qwen
         rebalance_raw = _call_cloud_llm(prompt_arbitrate, "Agent4c_仲裁")
+        rebalance = _parse_llm_json(rebalance_raw)
+
+        if not rebalance or not rebalance.get("actions"):
+            logger.warning("[仲裁] 云端仲裁失败或返回空，尝试本地投票合并...")
+            debate_mode = "local_merge"
+            rebalance = _merge_proposal_and_critique(proposal, critique)
+
+    elif proposal:
+        # ⚠️ 只有激进派方案，保守派挂了 → 直接用方案但加风控过滤
+        debate_mode = "proposal_only"
+        logger.warning("  保守派审查失败，使用激进派方案 + 硬规则风控过滤...")
+        rebalance = _apply_hard_rules(proposal, portfolio)
+        rebalance_raw = json.dumps(rebalance, ensure_ascii=False)
+
     else:
-        # 辩论失败 → 退回原来的单模型直接决策
+        # ❌ 全挂了 → 单模型直接决策
+        debate_mode = "single_fallback"
         logger.warning("  辩论未完成，退回单模型直接决策...")
         prompt_fallback = PROMPT_REBALANCE_FINAL.format(
             market_judge=json.dumps(market_judge, ensure_ascii=False, indent=2),
@@ -888,28 +1048,35 @@ def run_rebalance_analysis(config: Config = None) -> dict:
         )
         if risk_alerts_text:
             prompt_fallback = prompt_fallback + risk_alerts_text
+        prompt_used = prompt_fallback
         rebalance_raw = _call_cloud_llm(prompt_fallback, "Agent4_仲裁_fallback")
+        rebalance = _parse_llm_json(rebalance_raw)
 
-    logger.info(f"[仲裁] 云端原始返回长度: {len(rebalance_raw)} 字符")
-    rebalance = _parse_llm_json(rebalance_raw)
-    if not rebalance:
-        logger.error(f"[仲裁] JSON解析失败！原始返回前500字:\n{rebalance_raw[:500]}")
+    # 最终兜底：如果解析全失败，至少给出风控硬规则的建议
+    if not rebalance or not rebalance.get("actions"):
+        logger.error("[仲裁] 所有模型均失败，启用纯规则引擎兜底...")
+        debate_mode = "rules_only"
+        rebalance = _generate_rules_only_advice(portfolio)
+        rebalance_raw = json.dumps(rebalance, ensure_ascii=False)
 
-    # 保存蒸馏样本
-    _save_distillation_sample(
-        agent_name="agent4c_arbitrate",
-        prompt=prompt_arbitrate if (proposal and critique) else prompt_fallback,
-        response=rebalance_raw,
-        parsed_json=rebalance,
-        metadata={
-            "holdings_count": len(holding_codes),
-            "holding_codes": holding_codes,
-            "market_stage": market_judge.get("market_stage", ""),
-            "hot_sectors": sector_judge.get("hot_sectors", []),
-            "debate_mode": bool(proposal and critique),
-            "debate_score": critique.get("overall_assessment", "N/A") if critique else "N/A",
-        },
-    )
+    logger.info(f"[仲裁] 决策模式: {debate_mode}, 返回长度: {len(rebalance_raw) if isinstance(rebalance_raw, str) else 'N/A'}")
+
+    # 保存蒸馏样本（仅在有实际LLM调用时）
+    if isinstance(rebalance_raw, str) and len(rebalance_raw) > 10:
+        _save_distillation_sample(
+            agent_name="agent4c_arbitrate",
+            prompt=prompt_used or "(local merge/rules only)",
+            response=rebalance_raw,
+            parsed_json=rebalance,
+            metadata={
+                "holdings_count": len(holding_codes),
+                "holding_codes": holding_codes,
+                "market_stage": market_judge.get("market_stage", ""),
+                "hot_sectors": sector_judge.get("hot_sectors", []),
+                "debate_mode": debate_mode,
+                "debate_score": critique.get("overall_assessment", "N/A") if critique else "N/A",
+            },
+        )
 
     elapsed = round(time.time() - start_time, 1)
     logger.info(f"\n调仓分析完成！耗时 {elapsed} 秒")
@@ -921,7 +1088,7 @@ def run_rebalance_analysis(config: Config = None) -> dict:
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "elapsed_seconds": elapsed,
         "holdings_count": len(holding_codes),
-        "agents_used": "4a+4b+4c (debate)" if (proposal and critique) else "4 (fallback)",
+        "agents_used": debate_mode,
         "local_model": os.getenv("REBALANCE_LOCAL_MODEL", "unknown"),
         "cloud_model": cloud_model,
     }
