@@ -90,36 +90,54 @@ def _call_debate_llm(prompt: str, agent_name: str = "") -> str:
 
 def _call_cloud_llm(prompt: str, agent_name: str = "") -> str:
     """
-    调用云端强模型（Agent 4 仲裁用，一天仅一次）
-    优先使用 CLOUD_MODEL 环境变量，否则使用 LITELLM_FALLBACK_MODELS 的第一个
+    调用云端强模型（Agent 4c 仲裁用）
+    降级链：REBALANCE_CLOUD_MODEL → REBALANCE_CLOUD_FALLBACK → LITELLM_MODEL → 本地DeepSeek
     """
     import litellm
 
-    # 云端模型优先级：REBALANCE_CLOUD_MODEL > 主项目的 LITELLM_MODEL > 回退到本地
-    cloud_model = os.getenv("REBALANCE_CLOUD_MODEL")
-    if not cloud_model:
-        cloud_model = os.getenv("LITELLM_MODEL")
-    if not cloud_model:
-        # 没有云端配置，回退到本地模型
-        logger.warning(f"[{agent_name}] 未配置云端模型，回退到本地模型")
-        return _call_local_llm(prompt, agent_name)
+    # 云端模型候选列表（按优先级）
+    candidates = []
+    primary = os.getenv("REBALANCE_CLOUD_MODEL")
+    if primary:
+        candidates.append(primary)
+    fallback = os.getenv("REBALANCE_CLOUD_FALLBACK")
+    if fallback:
+        candidates.append(fallback)
+    default = os.getenv("LITELLM_MODEL")
+    if default and default not in candidates:
+        candidates.append(default)
 
-    try:
-        logger.info(f"[{agent_name}] 调用云端模型: {cloud_model}")
-        response = litellm.completion(
-            model=cloud_model,
-            messages=[{"role": "user", "content": prompt}],
-            timeout=300,
-            temperature=0.3,
-            num_retries=1,
-        )
-        result = response.choices[0].message.content
-        logger.info(f"[{agent_name}] 云端模型返回 {len(result)} 字符")
-        return result
-    except Exception as e:
-        logger.error(f"[{agent_name}] 云端 LLM 调用失败: {e}，回退到本地辩论模型")
-        # 回退到 DeepSeek-R1 而非 Qwen，避免激进派自己仲裁自己
+    if not candidates:
+        logger.warning(f"[{agent_name}] 未配置任何云端模型，回退到本地辩论模型")
         return _call_debate_llm(prompt, f"{agent_name}_本地回退")
+
+    # 逐个尝试云端模型
+    last_error = None
+    for i, model in enumerate(candidates):
+        try:
+            tag = "主力" if i == 0 else f"备用{i}"
+            logger.info(f"[{agent_name}] 调用云端模型({tag}): {model}")
+            response = litellm.completion(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                timeout=300,
+                temperature=0.3,
+                num_retries=1,
+            )
+            result = response.choices[0].message.content
+            logger.info(f"[{agent_name}] 云端模型({tag})返回 {len(result)} 字符")
+            return result
+        except Exception as e:
+            last_error = e
+            logger.warning(f"[{agent_name}] 云端{tag} {model} 失败: {e}")
+            continue
+
+    # 所有云端都挂了 → 本地 DeepSeek 兜底
+    logger.error(
+        f"[{agent_name}] 所有云端模型({len(candidates)}个)均失败，"
+        f"最后错误: {last_error}，回退到本地辩论模型"
+    )
+    return _call_debate_llm(prompt, f"{agent_name}_本地回退")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
