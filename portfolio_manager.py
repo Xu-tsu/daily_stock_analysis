@@ -2,7 +2,7 @@
 portfolio_manager.py — 持仓管理与调仓建议模块
 放在项目根目录，与 analyzer_service.py 同级
 """
-import json, os, logging
+import json, os, logging, sqlite3
 from datetime import datetime
 from pathlib import Path
 
@@ -46,6 +46,120 @@ def save_portfolio(portfolio: dict):
     with open(p, "w", encoding="utf-8") as f:
         json.dump(portfolio, f, ensure_ascii=False, indent=2)
     logger.info(f"持仓已保存到 {PORTFOLIO_FILE}")
+
+def sync_portfolio_from_trades(portfolio: dict) -> dict:
+    """从 trade_log 自动校准每只持仓的 buy_date、shares、cost_price。
+
+    解决的核心问题：portfolio.json 是手动维护的，buy_date 经常与实际
+    交割记录不一致，导致持仓天数计算错误，进而导致错误的清仓建议。
+
+    逻辑：
+    1. 对每只持仓股，从 trade_log 中取出所有 buy/sell 记录
+    2. 用 FIFO 配对法计算当前未平仓的部分
+    3. 用最早的未平仓买入日期作为 buy_date
+    4. 用加权平均价作为 cost_price
+    """
+    DB_PATH = "data/scanner_history.db"
+    if not os.path.exists(DB_PATH):
+        logger.warning(f"trade_log 数据库 {DB_PATH} 不存在，跳过同步")
+        return portfolio
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+    except Exception as e:
+        logger.warning(f"连接 trade_log 数据库失败: {e}")
+        return portfolio
+
+    synced = 0
+    for h in portfolio.get("holdings", []):
+        code = h["code"]
+        try:
+            rows = conn.execute("""
+                SELECT trade_date, trade_type, shares, price, amount
+                FROM trade_log WHERE code = ?
+                ORDER BY trade_date ASC, id ASC
+            """, (code,)).fetchall()
+
+            if not rows:
+                continue
+
+            # FIFO 法：按时间顺序累积买入，减去卖出
+            buy_queue = []  # [(date, shares, price), ...]
+            for r in rows:
+                if r["trade_type"] == "buy":
+                    buy_queue.append({
+                        "date": r["trade_date"],
+                        "shares": abs(r["shares"]),
+                        "price": r["price"],
+                    })
+                elif r["trade_type"] == "sell":
+                    sell_remaining = abs(r["shares"])
+                    while sell_remaining > 0 and buy_queue:
+                        if buy_queue[0]["shares"] <= sell_remaining:
+                            sell_remaining -= buy_queue[0]["shares"]
+                            buy_queue.pop(0)
+                        else:
+                            buy_queue[0]["shares"] -= sell_remaining
+                            sell_remaining = 0
+
+            if not buy_queue:
+                # 所有买入都已被卖出覆盖 — 但portfolio里还有持仓
+                # 可能是通过其他渠道买入的，不动它
+                continue
+
+            # 用未平仓买入记录计算
+            total_shares = sum(b["shares"] for b in buy_queue)
+            weighted_cost = sum(b["shares"] * b["price"] for b in buy_queue) / total_shares
+            earliest_buy_date = buy_queue[0]["date"]
+
+            # T+1 可卖余额：排除今天买入的股数
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            today_bought = sum(b["shares"] for b in buy_queue if b["date"] == today_str)
+            sellable_shares = total_shares - today_bought
+
+            old_date = h.get("buy_date", "")
+            old_shares = h.get("shares", 0)
+
+            # 更新 buy_date（始终以 trade_log 为准）
+            if old_date != earliest_buy_date:
+                logger.info(
+                    f"  同步 {h.get('name', code)}: buy_date {old_date} → {earliest_buy_date}"
+                )
+                h["buy_date"] = earliest_buy_date
+                synced += 1
+
+            # 如果 trade_log 的股数与 portfolio 差别大，也校准
+            if abs(total_shares - old_shares) > 0 and total_shares > 0:
+                logger.info(
+                    f"  同步 {h.get('name', code)}: shares {old_shares} → {total_shares}, "
+                    f"cost {h.get('cost_price', 0):.3f} → {weighted_cost:.3f}"
+                )
+                h["shares"] = total_shares
+                h["cost_price"] = round(weighted_cost, 3)
+                synced += 1
+
+            # 更新 T+1 可卖余额
+            h["sellable_shares"] = sellable_shares
+            if today_bought > 0:
+                logger.info(
+                    f"  T+1 {h.get('name', code)}: 总{total_shares}股, "
+                    f"今日买入{today_bought}股不可卖, 可卖{sellable_shares}股"
+                )
+
+        except Exception as e:
+            logger.warning(f"同步 {code} 失败: {e}")
+
+    conn.close()
+
+    if synced > 0:
+        logger.info(f"持仓同步完成：修正了 {synced} 个字段")
+        save_portfolio(portfolio)
+    else:
+        logger.info("持仓同步检查完成：数据一致，无需修正")
+
+    return portfolio
+
 
 def update_current_prices(portfolio: dict, price_map: dict) -> dict:
     """用实时价格更新持仓市值
@@ -116,6 +230,19 @@ def format_rebalance_report(rebalance: dict) -> str:
                 lines.append(f"   {a['detail']}")
             if a.get("reason"):
                 lines.append(f"   💡 {a['reason']}")
+            # 卖点/止损价
+            tp = a.get("target_sell_price")
+            sl = a.get("stop_loss_price")
+            st = a.get("sell_timing")
+            if tp or sl:
+                price_info = []
+                if tp:
+                    price_info.append(f"目标卖出价: {tp}")
+                if sl:
+                    price_info.append(f"止损价: {sl}")
+                lines.append(f"   🎯 {' | '.join(price_info)}")
+            if st:
+                lines.append(f"   ⏰ 卖出时机: {st}")
         lines.append("")
 
     # 候选换股
@@ -123,7 +250,20 @@ def format_rebalance_report(rebalance: dict) -> str:
     if candidates:
         lines.append("🔍 **换股候选**:")
         for c in candidates:
-            lines.append(f"  • {c.get('name', '')}({c.get('code', '')}) — {c.get('reason', '')}")
+            line = f"  • {c.get('name', '')}({c.get('code', '')}) — {c.get('reason', '')}"
+            bp = c.get("buy_price_range")
+            tp = c.get("target_sell_price")
+            sl = c.get("stop_loss_price")
+            if bp or tp or sl:
+                prices = []
+                if bp:
+                    prices.append(f"买入区间:{bp}")
+                if tp:
+                    prices.append(f"目标:{tp}")
+                if sl:
+                    prices.append(f"止损:{sl}")
+                line += f"\n    🎯 {' | '.join(prices)}"
+            lines.append(line)
         lines.append("")
 
     # 风险提示
