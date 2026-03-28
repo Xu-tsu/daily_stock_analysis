@@ -186,7 +186,7 @@ def analyze_kline(df: pd.DataFrame) -> dict:
         ma_score = 20
     elif ma5 < ma10 < ma20:
         result["ma_trend"] = "空头排列"
-        ma_score = 0
+        ma_score = -10  # 负分！用户数据：空头排列胜率仅17.5%
     else:
         result["ma_trend"] = "震荡"
         ma_score = 10
@@ -263,9 +263,20 @@ def analyze_kline(df: pd.DataFrame) -> dict:
     if len(close) >= 10:
         result["chg_10d"] = round((latest / close.iloc[-11] - 1) * 100, 2) if close.iloc[-11] > 0 else 0
 
+    # === T+1 安全分（回调买入加分，追高扣分）===
+    # 价格贴近MA5支撑=止损距离短=T+1风险低
+    t1_score = 0
+    if abs(bias5) < 1.5:
+        t1_score = 10  # 贴近MA5，止损距离最短
+    elif bias5 < -3:
+        t1_score = 5   # 远低于MA5，超跌但风险大
+    elif bias5 > 5:
+        t1_score = -10  # 远高于MA5，追高危险
+    result["t1_safety"] = t1_score
+
     # === 总分 ===
-    result["score"] = ma_score + bias_score + rsi_score + macd_score + vol_score
-    result["max_score"] = 90
+    result["score"] = ma_score + bias_score + rsi_score + macd_score + vol_score + t1_score
+    result["max_score"] = 100
 
     return result
 
@@ -398,47 +409,68 @@ def scan_market(
         if ta.get("score", 0) == 0:
             continue
 
-        # 按模式加分
+        # ============ 按模式加分 ============
         bonus = 0
+        chg_today = q.get("change_pct", 0)
+
+        # ── T+1 追高惩罚（所有模式通用，最高优先级）──
+        # A股今天买明天才能卖，追高=承受隔夜风险无法止损
+        if chg_today >= 7:
+            bonus -= 30   # 涨停板附近，T+1极度危险
+        elif chg_today >= 5:
+            bonus -= 20   # 涨幅过大，禁止追高
+        elif chg_today >= 3:
+            bonus -= 10   # 追高警告
+        # 回调买入奖励：当日微跌但趋势向上 = 最佳T+1买点
+        if -2 < chg_today < 0.5 and ta.get("ma_trend") in ("多头排列", "短期多头"):
+            bonus += 15   # 强势股回调，明日大概率反弹
+
         if mode == "trend":
             if ta.get("ma_trend") == "多头排列":
                 bonus += 10
             if ta.get("vol_pattern") == "缩量回踩":
-                bonus += 10
-            if -2 < ta.get("bias5", 99) < 2:
+                bonus += 15  # 缩量回踩是T+1最安全的买点（提升权重）
+            elif ta.get("vol_pattern") == "温和放量":
                 bonus += 5
+            if -2 < ta.get("bias5", 99) < 1:
+                bonus += 10  # 贴近均线=止损距离短
+
         elif mode == "breakout":
+            # 突破模式降权：T+1下追突破风险极高
             if ta.get("vol_ratio", 0) > 1.5:
-                bonus += 10
-            if q.get("change_pct", 0) > 3:
-                bonus += 10
+                bonus += 5   # 降低（原来10分）
+            if chg_today > 3:
+                bonus -= 5   # 反而扣分（原来+10）：当日大涨的突破不追
+
         elif mode == "oversold":
             if ta.get("rsi", 50) < 30:
                 bonus += 15
             if ta.get("macd_signal") == "底部收敛":
                 bonus += 10
+            # 超跌反弹也不能追高买：等确认后再入
+            if chg_today > 5:
+                bonus -= 10  # 超跌反弹首日涨太多不追
+
         elif mode == "sub_dragon":
             # 副龙头策略：低位 + 题材催化 + 资金流入 + 技术底部
-            # 1. 主力资金流入加分
             if code in fund_flow_stocks:
                 net = fund_flow_stocks[code]
                 bonus += 15 if net > 5000 else 10 if net > 1000 else 5
-            # 2. 低位启动（近10日跌幅大+今日开始反弹）
             chg_10d = ta.get("chg_10d", 0)
-            chg_today = q.get("change_pct", 0)
-            if chg_10d < -5 and chg_today > 1:
-                bonus += 10  # 超跌反弹启动
+            if chg_10d < -5 and 0 < chg_today < 3:
+                bonus += 10  # 超跌+温和反弹（非暴涨）
             elif chg_10d < -3 and chg_today > 0:
                 bonus += 5
-            # 3. MACD 底部信号（金叉或底部收敛=即将拉升）
             if ta.get("macd_signal") in ("金叉", "底部收敛"):
                 bonus += 10
-            # 4. 换手率活跃（>5%=市场关注度高）
             if q.get("turnover_rate", 0) > 5:
                 bonus += 5
-            # 5. RSI 不超买（<60 安全区间）
             if ta.get("rsi", 50) < 45:
                 bonus += 5
+
+        # ── 空头排列惩罚（用户数据：空头排列胜率仅17.5%）──
+        if ta.get("ma_trend") == "空头排列":
+            bonus -= 15
 
         # 盈利模式加分（基于历史交易数据学习）
         if winning_patterns:

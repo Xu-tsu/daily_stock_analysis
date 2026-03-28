@@ -279,11 +279,23 @@ PROMPT_SECTOR_ROTATION = """你是一位专业的A股行业研究分析师。
 
 PROMPT_HOLDING_SCAN = """你是一位专业的A股短线交易顾问，专注低价小盘题材股。
 
-## 评级标准（短线视角）
-- 加仓条件：板块资金持续流入 + 个股缩量回踩MA5支撑 + 乖离率<5%
-- 持有条件：趋势未破 + 板块未转弱 + 亏损在5%以内
-- 减仓条件：板块资金开始流出 + 个股放量下跌破MA5
-- 清仓条件：亏损超8% 或 个股连续3日主力净流出 或 板块崩塌
+## 基于真实交易数据的评级标准
+
+### 核心风控规则（必须严格执行）
+1. 亏损超5%：必须"清仓"，无例外（用户历史数据：不止损→平均亏12.67%）
+2. 持仓超3个交易日且盈利不足5%：建议"减仓"或"清仓"（历史：超3天胜率骤降至56%）
+3. 盈利超8%：建议"减仓"一半锁定利润（用户平均盈利仅5.12%，8%已是超额）
+4. 禁止对亏损中的股票建议"加仓"（历史：补仓亏损股胜率仅17%）
+
+### T+1风险评估
+- 如果该股今日已大涨(>3%)，不建议加仓（明天大概率回调，T+1无法当天止损）
+- 评估该股是否处于"追高买入"状态：远高于MA5 = 高风险
+
+### 评级标准
+- 加仓条件：板块资金持续流入 + 个股缩量回踩MA5支撑 + 乖离率<2% + 当日涨幅<3%
+- 持有条件：趋势未破 + 板块未转弱 + 亏损在3%以内 + 持仓不超过3天
+- 减仓条件：板块资金流出 + 放量下跌破MA5 或 持仓超3天盈利不足 或 盈利超8%
+- 清仓条件：亏损超5% 或 连续3日主力净流出 或 板块崩塌 或 持仓超7天
 
 ## 大盘研判
 {market_judge}
@@ -326,13 +338,29 @@ PROMPT_HOLDING_SCAN = """你是一位专业的A股短线交易顾问，专注低
 
 PROMPT_REBALANCE_FINAL = """你是一位经验丰富的A股短线交易员，擅长低价小盘题材股的板块轮动策略。
 
-## 我的交易风格（必须严格遵守）
-- 操作风格：短线趋势交易，持股周期1-10天
+## 我的交易风格（基于233笔真实交易数据优化，必须严格遵守）
+
+### 核心策略：快进快出，小赚即走，严格止损
+- 操作风格：超短线趋势交易，持股周期1-3天（历史数据：1天内胜率93%，超3天暴降至56%）
 - 选股偏好：10元以下低价股、流通市值50亿以下小盘股、有热门题材概念的
-- 买入条件：板块资金持续流入 + 个股放量突破 + 乖离率<5%
-- 卖出条件：板块资金转向流出 + 个股破MA5 + 亏损超过8%止损
-- 绝对禁止：不买大盘蓝筹白马股（如茅台、宁德时代等），不做价值投资
-- 换股方向：必须从当前资金流入的热门题材板块中选低价小盘股
+- 买入条件：缩量回踩MA5支撑 + 板块资金持续流入 + 乖离率<2% + 当日涨幅<3%
+- 卖出条件：盈利5-8%止盈 / 亏损5%止损 / 持仓超3天 / 板块转弱
+- 绝对禁止：不买大盘蓝筹白马股，不做价值投资，不补仓亏损股
+
+### A股T+1追高禁令（最重要的规则！）
+- 绝对禁止买入当日涨幅超5%的股票
+- 当日涨幅超3%的股票需要降低仓位50%
+- 理由：A股T+1，追高买入后当天无法卖出，次日砸盘会导致巨额亏损
+- 我的血泪教训：追高买入的交易中，雪人集团-28%、招金黄金-28%、中国卫通-19%
+- 正确做法：买在回调支撑位（贴近MA5），而非追涨途中
+
+### 风控硬规则
+1. 止损5%：亏损超5%的持仓必须建议清仓，无任何例外
+2. 止盈8%：盈利超8%建议减仓一半锁利（我的平均盈利仅5.12%）
+3. 持仓3天上限：超3天且盈利不足5%必须建议减仓
+4. 禁止补仓亏损股：浮亏中的股票绝对不能加仓（历史补仓胜率仅17%）
+5. 单只仓位不超15%，最多同时持5只
+6. 换股方向：必须从当前资金流入的热门题材板块中选回调到位的低价小盘股
 
 ## 大盘研判
 {market_judge}
@@ -553,6 +581,40 @@ def run_rebalance_analysis(config: Config = None) -> dict:
                 for item in sector_info.get("top_inflow", [])[:3]:
                     hot_picks.append(item)
 
+    # 风控检查：为每只持仓标注风控状态
+    risk_alerts_text = ""
+    try:
+        from risk_control import check_stop_loss, format_risk_alerts, TRADING_RULES_FOR_LLM
+        _risk_holdings = [
+            {
+                "code": hh["code"], "name": hh.get("name", ""),
+                "cost_price": hh.get("cost_price", 0),
+                "current_price": hh.get("current_price", 0),
+                "pnl_pct": hh.get("pnl_pct", 0),
+                "buy_date": hh.get("buy_date", ""),
+                "shares": hh.get("shares", 0),
+            }
+            for hh in portfolio.get("holdings", [])
+        ]
+        alerts = check_stop_loss(_risk_holdings)
+        if alerts:
+            risk_alerts_text = "\n## 风控预警（必须优先处理）\n" + format_risk_alerts(alerts)
+    except Exception as e:
+        logger.debug(f"风控检查跳过: {e}")
+
+    # 过滤热门候选：去除当日涨幅>5%的追高股
+    filtered_hot = []
+    for pick in hot_picks[:15]:
+        chg = pick.get("change_pct", pick.get("涨跌幅", 0))
+        if isinstance(chg, str):
+            try:
+                chg = float(chg.replace("%", ""))
+            except (ValueError, TypeError):
+                chg = 0
+        if chg < 5.0:  # 涨幅<5%才推荐（T+1安全）
+            filtered_hot.append(pick)
+    hot_picks = filtered_hot[:10]
+
     prompt_final = PROMPT_REBALANCE_FINAL.format(
         market_judge=json.dumps(market_judge, ensure_ascii=False, indent=2),
         sector_judge=json.dumps(sector_judge, ensure_ascii=False, indent=2),
@@ -581,6 +643,9 @@ def run_rebalance_analysis(config: Config = None) -> dict:
         ),
         hot_picks=json.dumps(hot_picks[:10], ensure_ascii=False, indent=2),
     )
+    # 注入风控预警到 prompt
+    if risk_alerts_text:
+        prompt_final = prompt_final + risk_alerts_text
 
     # ★ 云端调用 + 蒸馏采集 ★
     rebalance_raw = _call_cloud_llm(prompt_final, "Agent4_仲裁")

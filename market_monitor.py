@@ -208,6 +208,44 @@ def check_market_anomaly() -> dict:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 4. 推送
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def _get_current_holdings() -> list:
+    """从持仓数据库获取当前持仓（供风控检查用）。"""
+    try:
+        from src.storage import get_engine
+        from sqlalchemy import text
+        engine = get_engine()
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT code, name, cost_price, current_price, shares,
+                       buy_date, pnl_pct, market_value
+                FROM portfolio WHERE shares > 0
+            """)).fetchall()
+            return [dict(r._mapping) for r in rows]
+    except Exception:
+        pass
+    # 备用：从 trade_journal 推算持仓
+    try:
+        from trade_journal import _conn
+        conn = _conn()
+        rows = conn.execute("""
+            SELECT code, name, price as cost_price, shares, trade_date as buy_date
+            FROM trade_log
+            WHERE trade_type = 'buy'
+            AND code NOT IN (
+                SELECT code FROM trade_log WHERE trade_type = 'sell'
+                GROUP BY code HAVING SUM(shares) >= (
+                    SELECT SUM(shares) FROM trade_log t2
+                    WHERE t2.code = trade_log.code AND t2.trade_type = 'buy'
+                )
+            )
+            ORDER BY trade_date DESC
+        """).fetchall()
+        conn.close()
+        return [dict(r) for r in rows] if rows else []
+    except Exception:
+        return []
+
+
 def send_alert(message: str):
     try:
         from src.notification import NotificationService
@@ -329,6 +367,22 @@ def run_monitor_loop(interval_minutes: int = 10, auto_rebalance: bool = True):
                     logger.info(f"  特朗普新闻: {trump_count} 条")
             except Exception as e:
                 logger.error(f"盘中检查失败: {e}")
+
+            # ── 风控检查：止损/止盈/持仓天数 ──
+            try:
+                from risk_control import check_stop_loss, format_risk_alerts
+                holdings = _get_current_holdings()
+                if holdings:
+                    alerts = check_stop_loss(holdings)
+                    critical_alerts = [a for a in alerts if a.level == "critical"]
+                    if critical_alerts:
+                        alert_text = "** 风控紧急预警 **\n" + format_risk_alerts(alerts)
+                        logger.warning(f"风控！\n{alert_text}")
+                        send_alert(alert_text)
+                    elif alerts:
+                        logger.info(f"  风控: {len(alerts)} 条提示")
+            except Exception as e:
+                logger.debug(f"风控检查跳过: {e}")
 
         # ── 收盘任务 15:00-15:45 ──
         elif is_after_close() and today not in after_close_done:
