@@ -78,8 +78,9 @@ def _call_cloud_llm(prompt: str, agent_name: str = "") -> str:
         response = litellm.completion(
             model=cloud_model,
             messages=[{"role": "user", "content": prompt}],
-            timeout=120,
+            timeout=300,
             temperature=0.3,
+            num_retries=1,
         )
         result = response.choices[0].message.content
         logger.info(f"[{agent_name}] 云端模型返回 {len(result)} 字符")
@@ -676,7 +677,12 @@ def run_rebalance_analysis(config: Config = None) -> dict:
 
     # ★ 云端调用 + 蒸馏采集 ★
     rebalance_raw = _call_cloud_llm(prompt_final, "Agent4_仲裁")
+    logger.info(f"[Agent4] 云端原始返回长度: {len(rebalance_raw)} 字符")
+    if len(rebalance_raw) < 10:
+        logger.error(f"[Agent4] 云端返回内容过短: {rebalance_raw!r}")
     rebalance = _parse_llm_json(rebalance_raw)
+    if not rebalance:
+        logger.error(f"[Agent4] JSON解析失败！原始返回前500字:\n{rebalance_raw[:500]}")
 
     # 保存蒸馏样本（云端模型的输出 = 本地模型未来的学习目标）
     _save_distillation_sample(
