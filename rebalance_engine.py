@@ -354,10 +354,19 @@ PROMPT_REBALANCE_FINAL = """你是一位经验丰富的A股短线交易员，擅
 - 我的血泪教训：追高买入的交易中，雪人集团-28%、招金黄金-28%、中国卫通-19%
 - 正确做法：买在回调支撑位（贴近MA5），而非追涨途中
 
+### T+1 可卖余额约束
+- 持仓明细中 sellable_shares 表示今天能实际卖出的股数（今天买入的不能卖）
+- 建议卖出时不能超过 sellable_shares，否则操作无法执行
+- 如果 sellable_shares < shares，说明有今天刚买入的部分，这部分只能明天操作
+
 ### 风控硬规则
 1. 止损5%：亏损超5%的持仓必须建议清仓，无任何例外
 2. 止盈8%：盈利超8%建议减仓一半锁利（我的平均盈利仅5.12%）
-3. 持仓3天上限：超3天且盈利不足5%必须建议减仓
+3. 持仓天数规则（不是死板的，要结合趋势判断）：
+   - 超3天且亏损：建议减仓或清仓
+   - 超3天但处于缓慢上涨趋势（沿MA5稳步上攻）：可以继续持有，设移动止损
+   - 超7天且盈利不足5%：建议清仓
+   - 注意：持仓天数必须从 buy_date 字段准确计算，不要瞎猜
 4. 禁止补仓亏损股：浮亏中的股票绝对不能加仓（历史补仓胜率仅17%）
 5. 单只仓位不超15%，最多同时持5只
 6. 换股方向：必须从当前资金流入的热门题材板块中选回调到位的低价小盘股
@@ -371,7 +380,7 @@ PROMPT_REBALANCE_FINAL = """你是一位经验丰富的A股短线交易员，擅
 ## 各持仓股评级
 {holdings_ratings}
 
-## 当前持仓明细
+## 当前持仓明细（注意：sellable_shares 是T+1可卖余额，今天买入的股不能卖）
 {portfolio}
 
 ## 今日主力净流入的低价热门股（真实数据，换股必须从这里选）
@@ -383,8 +392,11 @@ PROMPT_REBALANCE_FINAL = """你是一位经验丰富的A股短线交易员，擅
 2. 对每只持仓股给出 buy/hold/reduce/sell 建议和具体比例
 3. 如建议换股，**必须且只能**从上面"低价热门股"列表中选择，禁止自己编造股票代码和名称
 4. 给出具体比例（如 "减仓50%" 而非 "适当减仓"）
-5. 标注风险等级和止损位
-6. 如果大盘极弱，可以建议空仓等待，但一旦有板块异动要给出抄底候选
+5. **每只股票必须给出 target_sell_price（目标卖出价）和 stop_loss_price（止损价）**
+6. **每只股票必须给出 sell_timing（什么条件下卖出）**，如"盈利5%或跌破MA5卖出"
+7. 标注风险等级
+8. 持仓天数必须严格按照 buy_date 字段计算到今天的日历天数，不要编造
+9. 如果大盘极弱，可以建议空仓等待，但一旦有板块异动要给出抄底候选
 
 请严格按以下 JSON 格式回复：
 {{
@@ -395,10 +407,13 @@ PROMPT_REBALANCE_FINAL = """你是一位经验丰富的A股短线交易员，擅
     {{
       "code": "600519",
       "name": "贵州茅台",
-      "action": "hold",
-      "ratio": "维持当前仓位",
+      "action": "hold/buy/reduce/sell",
+      "ratio": "维持当前仓位 / 加仓X元 / 减仓50% / 清仓",
       "detail": "具体操作说明",
-      "reason": "综合理由"
+      "reason": "综合理由",
+      "target_sell_price": 10.5,
+      "stop_loss_price": 9.0,
+      "sell_timing": "建议在什么条件下卖出（如：盈利5%或跌破MA5时卖出）"
     }}
   ],
   "new_candidates": [
@@ -406,7 +421,10 @@ PROMPT_REBALANCE_FINAL = """你是一位经验丰富的A股短线交易员，擅
       "code": "代码",
       "name": "名称",
       "sector": "所属板块",
-      "reason": "推荐理由（必须是低价小盘题材股）"
+      "reason": "推荐理由（必须是低价小盘题材股）",
+      "target_sell_price": "目标卖出价",
+      "stop_loss_price": "止损价",
+      "buy_price_range": "建议买入价格区间"
     }}
   ],
   "risk_warning": "整体风险提示"
@@ -433,8 +451,13 @@ def run_rebalance_analysis(config: Config = None) -> dict:
     logger.info(f"云端模型: {cloud_model}")
     logger.info("=" * 60)
 
-    # ── Step 0: 加载持仓 ──
+    # ── Step 0: 加载持仓 + 从trade_log同步校准buy_date ──
     portfolio = load_portfolio()
+    try:
+        from portfolio_manager import sync_portfolio_from_trades
+        portfolio = sync_portfolio_from_trades(portfolio)
+    except Exception as e:
+        logger.warning(f"持仓同步失败（不影响主流程）: {e}")
     holding_codes = [h["code"] for h in portfolio.get("holdings", [])]
     holding_sectors = list(set(
         h.get("sector", "未知") for h in portfolio.get("holdings", [])
@@ -626,15 +649,19 @@ def run_rebalance_analysis(config: Config = None) -> dict:
                 "cash": portfolio.get("cash", 0),
                 "total_asset": portfolio.get("total_asset", 0),
                 "actual_position_ratio": portfolio.get("actual_position_ratio", 0),
+                "today": datetime.now().strftime("%Y-%m-%d"),
                 "holdings": [
                     {
                         "code": hh["code"],
                         "name": hh.get("name", ""),
                         "shares": hh.get("shares", 0),
+                        "sellable_shares": hh.get("sellable_shares", hh.get("shares", 0)),
                         "cost_price": hh.get("cost_price", 0),
                         "current_price": hh.get("current_price", 0),
                         "pnl_pct": hh.get("pnl_pct", 0),
                         "sector": hh.get("sector", ""),
+                        "buy_date": hh.get("buy_date", ""),
+                        "hold_days": (datetime.now() - datetime.strptime(hh["buy_date"], "%Y-%m-%d")).days if hh.get("buy_date") else "未知",
                     }
                     for hh in portfolio.get("holdings", [])
                 ],
