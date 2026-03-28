@@ -211,6 +211,12 @@ def format_rebalance_report(rebalance: dict) -> str:
         lines.append(f"🔥 **板块轮动**: {sector}")
         lines.append("")
 
+    # 辩论摘要（如果有）
+    debate = rebalance.get("debate_summary", "")
+    if debate:
+        lines.append(f"🤖 **多模型辩论**: {debate}")
+        lines.append("")
+
     # 逐只操作
     actions = rebalance.get("actions", [])
     if actions:

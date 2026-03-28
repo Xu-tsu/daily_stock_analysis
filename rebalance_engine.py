@@ -2,11 +2,12 @@
 rebalance_engine.py — 多 Agent 调仓决策引擎
 放在项目根目录，与 main.py / analyzer_service.py 同级
 
-架构:
-  Agent 1-3: 本地 Ollama 模型（省钱干苦力）
-  Agent 4:   云端强模型（最终仲裁，一天仅一次调用）
-  蒸馏采集:  每次云端调用的 prompt+response 自动存为训练样本
-             积累后可用于 LoRA 微调本地模型
+架构（辩论模式）:
+  Agent 1-3:  本地 Ollama Qwen（数据分析苦力）
+  Agent 4a:   本地 Ollama Qwen（激进派 — 提出调仓方案）
+  Agent 4b:   本地 Ollama DeepSeek-R1（保守派 — 质疑挑刺）
+  Agent 4c:   云端 Gemini（仲裁者 — 综合双方意见做最终决策）
+  蒸馏采集:   每次调用的 prompt+response 自动存为训练样本
 
 LLM 调用方式:
   直接使用 litellm.completion()，这是项目底层实际使用的库。
@@ -54,6 +55,36 @@ def _call_local_llm(prompt: str, agent_name: str = "") -> str:
         return result
     except Exception as e:
         logger.error(f"[{agent_name}] 本地 LLM 调用失败: {e}")
+        return "{}"
+
+
+def _call_debate_llm(prompt: str, agent_name: str = "") -> str:
+    """
+    调用本地第二模型（DeepSeek-R1，辩论用）
+    使用 REBALANCE_DEBATE_MODEL 环境变量
+    """
+    import litellm
+    model = os.getenv("REBALANCE_DEBATE_MODEL", "ollama/deepseek-r1:14b")
+    try:
+        logger.info(f"[{agent_name}] 调用辩论模型: {model}")
+        response = litellm.completion(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            timeout=300,
+            temperature=0.4,
+        )
+        result = response.choices[0].message.content
+        # DeepSeek-R1 会输出 <think>...</think> 思考过程，提取最终回答
+        if "<think>" in result and "</think>" in result:
+            think_part = result[result.index("<think>"):result.index("</think>") + len("</think>")]
+            final_part = result[result.index("</think>") + len("</think>"):].strip()
+            logger.info(f"[{agent_name}] DeepSeek思考链: {len(think_part)}字, 最终回答: {len(final_part)}字")
+            if final_part:
+                result = final_part
+        logger.info(f"[{agent_name}] 辩论模型返回 {len(result)} 字符")
+        return result
+    except Exception as e:
+        logger.error(f"[{agent_name}] 辩论模型调用失败: {e}")
         return "{}"
 
 
@@ -337,6 +368,107 @@ PROMPT_HOLDING_SCAN = """你是一位专业的A股短线交易顾问，专注低
   }}
 }}"""
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 辩论 Prompt 模板
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PROMPT_DEBATE_CRITIQUE = """你是一位严谨保守的A股风控专家，你的工作是审查另一位交易员的调仓方案，找出其中的漏洞和风险。
+
+## 交易员的调仓方案
+{proposal}
+
+## 当前持仓明细（注意：sellable_shares 是T+1可卖余额，今天买入的股不能卖）
+{portfolio}
+
+## 市场数据摘要
+- 大盘研判: {market_summary}
+- 板块轮动: {sector_summary}
+
+## 你的任务：挑刺和质疑
+请从以下角度严格审查这个方案：
+
+1. **T+1风险**：有没有追高买入的建议？买入价是否远离MA5支撑？
+2. **止损执行**：亏损超5%的是否建议了清仓？有没有心存侥幸？
+3. **持仓天数**：是否死板套用天数规则？应该看趋势——
+   - 如果一只股虽然持仓久但趋势在好转（亏损收窄、板块走强），不应无脑清仓
+   - 如果一只股持仓短但趋势恶化，应该提前跑
+4. **可卖余额**：建议卖出的股数是否超过了 sellable_shares？
+5. **补仓禁忌**：有没有建议对亏损股加仓？
+6. **换股质量**：推荐的新股是否真的符合低价小盘+缩量回踩+板块资金流入？
+7. **卖点合理性**：目标卖出价和止损价是否合理？止盈太贪或止损太松都不行
+
+请严格按以下 JSON 格式回复：
+{{
+  "overall_assessment": "该方案整体质量评分 1-10",
+  "critical_issues": ["必须修正的严重问题1", "问题2"],
+  "warnings": ["需要注意但不致命的问题1", "问题2"],
+  "suggestions": ["改进建议1", "建议2"],
+  "position_disagreements": [
+    {{
+      "code": "股票代码",
+      "name": "股票名称",
+      "original_action": "原方案建议",
+      "my_suggestion": "我认为应该...",
+      "reason": "原因"
+    }}
+  ]
+}}"""
+
+PROMPT_DEBATE_ARBITRATE = """你是最终仲裁者，需要综合激进派交易员和保守派风控专家的意见，做出最终调仓决策。
+
+## 激进派交易员的方案
+{proposal}
+
+## 保守派风控专家的质疑
+{critique}
+
+## 当前持仓明细（注意：sellable_shares 是T+1可卖余额）
+{portfolio}
+
+## 今日主力净流入的低价热门股（换股必须从这里选）
+{hot_picks}
+
+## 仲裁规则
+1. 如果双方对某只股意见一致 → 直接采纳
+2. 如果有分歧 → 偏向保守派（风控优先），但如果保守派的理由是纯粹死套规则而忽略趋势，则偏向激进派
+3. 止损5%红线不可商量 → 如果激进派想保留亏损超5%的股票，必须否决
+4. 卖出股数不能超过 sellable_shares（T+1约束）
+5. 每只股必须给出 target_sell_price 和 stop_loss_price
+6. 换股只能从热门股列表中选，不能自己编造
+
+请严格按以下 JSON 格式回复：
+{{
+  "overall_position_advice": "当前仓位X%，建议调整至Y%",
+  "market_assessment": "一句话大盘判断",
+  "sector_assessment": "一句话板块判断",
+  "debate_summary": "一句话总结辩论过程中的关键分歧和最终裁决理由",
+  "actions": [
+    {{
+      "code": "600519",
+      "name": "贵州茅台",
+      "action": "hold/buy/reduce/sell",
+      "ratio": "维持当前仓位 / 加仓X元 / 减仓50% / 清仓",
+      "detail": "具体操作说明（包含可卖股数约束）",
+      "reason": "综合理由（引用激进派和保守派的观点）",
+      "target_sell_price": 10.5,
+      "stop_loss_price": 9.0,
+      "sell_timing": "建议在什么条件下卖出"
+    }}
+  ],
+  "new_candidates": [
+    {{
+      "code": "代码",
+      "name": "名称",
+      "sector": "所属板块",
+      "reason": "推荐理由",
+      "target_sell_price": "目标卖出价",
+      "stop_loss_price": "止损价",
+      "buy_price_range": "建议买入价格区间"
+    }}
+  ],
+  "risk_warning": "整体风险提示"
+}}"""
+
 PROMPT_REBALANCE_FINAL = """你是一位经验丰富的A股短线交易员，擅长低价小盘题材股的板块轮动策略。
 
 ## 我的交易风格（基于233笔真实交易数据优化，必须严格遵守）
@@ -593,8 +725,8 @@ def run_rebalance_analysis(config: Config = None) -> dict:
         else:
             logger.warning(f"  → {name}: 分析结果解析失败")
 
-    # ── Step 5: Agent 4 — 调仓仲裁（云端强模型 + 蒸馏采集）──
-    logger.info("\n[Step 5/5] Agent 4: 调仓决策仲裁（云端模型）...")
+    # ── Step 5: 多模型辩论调仓（激进派 vs 保守派 → 仲裁）──
+    logger.info("\n[Step 5/7] 多模型辩论调仓决策...")
 
     # 真实换股候选（来自同花顺爬虫，不让LLM编造）
     hot_picks = macro_data.get("hot_candidates", [])
@@ -639,55 +771,134 @@ def run_rebalance_analysis(config: Config = None) -> dict:
             filtered_hot.append(pick)
     hot_picks = filtered_hot[:10]
 
-    prompt_final = PROMPT_REBALANCE_FINAL.format(
+    # 构建持仓JSON（三步辩论共用）
+    portfolio_json = json.dumps(
+        {
+            "cash": portfolio.get("cash", 0),
+            "total_asset": portfolio.get("total_asset", 0),
+            "actual_position_ratio": portfolio.get("actual_position_ratio", 0),
+            "today": datetime.now().strftime("%Y-%m-%d"),
+            "holdings": [
+                {
+                    "code": hh["code"],
+                    "name": hh.get("name", ""),
+                    "shares": hh.get("shares", 0),
+                    "sellable_shares": hh.get("sellable_shares", hh.get("shares", 0)),
+                    "cost_price": hh.get("cost_price", 0),
+                    "current_price": hh.get("current_price", 0),
+                    "pnl_pct": hh.get("pnl_pct", 0),
+                    "sector": hh.get("sector", ""),
+                    "buy_date": hh.get("buy_date", ""),
+                    "hold_days": (datetime.now() - datetime.strptime(hh["buy_date"], "%Y-%m-%d")).days if hh.get("buy_date") else "未知",
+                }
+                for hh in portfolio.get("holdings", [])
+            ],
+        },
+        ensure_ascii=False, indent=2,
+    )
+    hot_picks_json = json.dumps(hot_picks[:10], ensure_ascii=False, indent=2)
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Step 5a: 激进派（Qwen）— 提出调仓方案
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    logger.info("\n[Step 5a/7] 激进派（Qwen）提出调仓方案...")
+
+    prompt_proposal = PROMPT_REBALANCE_FINAL.format(
         market_judge=json.dumps(market_judge, ensure_ascii=False, indent=2),
         sector_judge=json.dumps(sector_judge, ensure_ascii=False, indent=2),
         holdings_ratings=json.dumps(
             holdings_ratings, ensure_ascii=False, indent=2
         ),
-        portfolio=json.dumps(
-            {
-                "cash": portfolio.get("cash", 0),
-                "total_asset": portfolio.get("total_asset", 0),
-                "actual_position_ratio": portfolio.get("actual_position_ratio", 0),
-                "today": datetime.now().strftime("%Y-%m-%d"),
-                "holdings": [
-                    {
-                        "code": hh["code"],
-                        "name": hh.get("name", ""),
-                        "shares": hh.get("shares", 0),
-                        "sellable_shares": hh.get("sellable_shares", hh.get("shares", 0)),
-                        "cost_price": hh.get("cost_price", 0),
-                        "current_price": hh.get("current_price", 0),
-                        "pnl_pct": hh.get("pnl_pct", 0),
-                        "sector": hh.get("sector", ""),
-                        "buy_date": hh.get("buy_date", ""),
-                        "hold_days": (datetime.now() - datetime.strptime(hh["buy_date"], "%Y-%m-%d")).days if hh.get("buy_date") else "未知",
-                    }
-                    for hh in portfolio.get("holdings", [])
-                ],
-            },
-            ensure_ascii=False, indent=2,
-        ),
-        hot_picks=json.dumps(hot_picks[:10], ensure_ascii=False, indent=2),
+        portfolio=portfolio_json,
+        hot_picks=hot_picks_json,
     )
-    # 注入风控预警到 prompt
     if risk_alerts_text:
-        prompt_final = prompt_final + risk_alerts_text
+        prompt_proposal = prompt_proposal + risk_alerts_text
 
-    # ★ 云端调用 + 蒸馏采集 ★
-    rebalance_raw = _call_cloud_llm(prompt_final, "Agent4_仲裁")
-    logger.info(f"[Agent4] 云端原始返回长度: {len(rebalance_raw)} 字符")
-    if len(rebalance_raw) < 10:
-        logger.error(f"[Agent4] 云端返回内容过短: {rebalance_raw!r}")
+    proposal_raw = _call_local_llm(prompt_proposal, "Agent4a_激进派")
+    proposal = _parse_llm_json(proposal_raw)
+    if proposal:
+        logger.info(f"  激进派方案: {proposal.get('overall_position_advice', 'N/A')}")
+        for a in proposal.get("actions", []):
+            logger.info(f"    {a.get('name','?')}: {a.get('action','?')} - {a.get('reason','')[:50]}")
+    else:
+        logger.warning("  激进派方案解析失败，将使用云端直接决策")
+
+    _save_agent_local_sample("agent4a_proposal", prompt_proposal, proposal_raw, proposal)
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Step 5b: 保守派（DeepSeek-R1）— 质疑和挑刺
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    logger.info("\n[Step 6/7] 保守派（DeepSeek-R1）审查质疑...")
+
+    critique = {}
+    critique_raw = "{}"
+    if proposal:
+        prompt_critique = PROMPT_DEBATE_CRITIQUE.format(
+            proposal=json.dumps(proposal, ensure_ascii=False, indent=2),
+            portfolio=portfolio_json,
+            market_summary=market_judge.get("summary", ""),
+            sector_summary=sector_judge.get("summary", ""),
+        )
+        critique_raw = _call_debate_llm(prompt_critique, "Agent4b_保守派")
+        critique = _parse_llm_json(critique_raw)
+        if critique:
+            score = critique.get("overall_assessment", "?")
+            issues = critique.get("critical_issues", [])
+            logger.info(f"  保守派评分: {score}/10")
+            for issue in issues:
+                logger.info(f"    ❌ {issue}")
+            for warn in critique.get("warnings", [])[:3]:
+                logger.info(f"    ⚠️ {warn}")
+            for disagree in critique.get("position_disagreements", []):
+                logger.info(
+                    f"    🔄 {disagree.get('name','?')}: "
+                    f"{disagree.get('original_action','')} → {disagree.get('my_suggestion','')}"
+                )
+        else:
+            logger.warning("  保守派审查解析失败")
+
+    _save_agent_local_sample("agent4b_critique", prompt_critique if proposal else "", critique_raw, critique)
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Step 5c: 仲裁者（Gemini云端）— 最终决策
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    logger.info("\n[Step 7/7] 仲裁者（云端模型）综合双方意见，最终裁决...")
+
+    if proposal and critique:
+        # 有辩论结果 → 仲裁模式
+        prompt_arbitrate = PROMPT_DEBATE_ARBITRATE.format(
+            proposal=json.dumps(proposal, ensure_ascii=False, indent=2),
+            critique=json.dumps(critique, ensure_ascii=False, indent=2),
+            portfolio=portfolio_json,
+            hot_picks=hot_picks_json,
+        )
+        if risk_alerts_text:
+            prompt_arbitrate = prompt_arbitrate + "\n" + risk_alerts_text
+        rebalance_raw = _call_cloud_llm(prompt_arbitrate, "Agent4c_仲裁")
+    else:
+        # 辩论失败 → 退回原来的单模型直接决策
+        logger.warning("  辩论未完成，退回单模型直接决策...")
+        prompt_fallback = PROMPT_REBALANCE_FINAL.format(
+            market_judge=json.dumps(market_judge, ensure_ascii=False, indent=2),
+            sector_judge=json.dumps(sector_judge, ensure_ascii=False, indent=2),
+            holdings_ratings=json.dumps(holdings_ratings, ensure_ascii=False, indent=2),
+            portfolio=portfolio_json,
+            hot_picks=hot_picks_json,
+        )
+        if risk_alerts_text:
+            prompt_fallback = prompt_fallback + risk_alerts_text
+        rebalance_raw = _call_cloud_llm(prompt_fallback, "Agent4_仲裁_fallback")
+
+    logger.info(f"[仲裁] 云端原始返回长度: {len(rebalance_raw)} 字符")
     rebalance = _parse_llm_json(rebalance_raw)
     if not rebalance:
-        logger.error(f"[Agent4] JSON解析失败！原始返回前500字:\n{rebalance_raw[:500]}")
+        logger.error(f"[仲裁] JSON解析失败！原始返回前500字:\n{rebalance_raw[:500]}")
 
-    # 保存蒸馏样本（云端模型的输出 = 本地模型未来的学习目标）
+    # 保存蒸馏样本
     _save_distillation_sample(
-        agent_name="agent4_rebalance_final",
-        prompt=prompt_final,
+        agent_name="agent4c_arbitrate",
+        prompt=prompt_arbitrate if (proposal and critique) else prompt_fallback,
         response=rebalance_raw,
         parsed_json=rebalance,
         metadata={
@@ -695,20 +906,10 @@ def run_rebalance_analysis(config: Config = None) -> dict:
             "holding_codes": holding_codes,
             "market_stage": market_judge.get("market_stage", ""),
             "hot_sectors": sector_judge.get("hot_sectors", []),
+            "debate_mode": bool(proposal and critique),
+            "debate_score": critique.get("overall_assessment", "N/A") if critique else "N/A",
         },
     )
-
-    # 同时也让本地模型回答同一个问题，保存对比数据
-    # （后续可用来评估蒸馏/微调效果）
-    try:
-        local_answer_raw = _call_local_llm(prompt_final, "Agent4_本地对照")
-        local_answer = _parse_llm_json(local_answer_raw)
-        _save_agent_local_sample(
-            "agent4_local_comparison", prompt_final, local_answer_raw, local_answer
-        )
-        logger.info("[蒸馏] 本地对照样本已保存（用于后续对比评估）")
-    except Exception:
-        pass  # 对照不影响主流程
 
     elapsed = round(time.time() - start_time, 1)
     logger.info(f"\n调仓分析完成！耗时 {elapsed} 秒")
@@ -720,7 +921,7 @@ def run_rebalance_analysis(config: Config = None) -> dict:
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "elapsed_seconds": elapsed,
         "holdings_count": len(holding_codes),
-        "agents_used": 4,
+        "agents_used": "4a+4b+4c (debate)" if (proposal and critique) else "4 (fallback)",
         "local_model": os.getenv("REBALANCE_LOCAL_MODEL", "unknown"),
         "cloud_model": cloud_model,
     }
