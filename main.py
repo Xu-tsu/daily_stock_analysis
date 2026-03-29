@@ -122,7 +122,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         '--schedule',
         action='store_true',
-        help='启用定时任务模式，每日定时执行'
+        help='启用定时任务模式（含日终主任务 + 10:15/12:30 盘中节点）'
     )
 
     parser.add_argument(
@@ -222,7 +222,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--all", action="store_true",
                         help="启动全部功能：Web + 定时分析 + 盘中监控")
     parser.add_argument("--monitor", action="store_true",
-                        help="启动盘中实时监控（含特朗普新闻源）")
+                        help="启动盘中实时监控（含集合竞价资金、异动与收盘调仓）")
     parser.add_argument("--interval", type=int, default=10,
                         help="监控检查间隔（分钟，默认10）")
     parser.add_argument("--rebalance", action="store_true",
@@ -465,6 +465,31 @@ def run_full_analysis(
         logger.exception(f"分析流程执行失败: {e}")
 
 
+def build_intraday_schedule_tasks(args: argparse.Namespace):
+    """Build fixed intraday checkpoint tasks for scheduler mode."""
+    from market_monitor import run_intraday_checkpoint
+
+    send_notification = not getattr(args, "no_notify", False)
+    return [
+        (
+            "10:15",
+            lambda: run_intraday_checkpoint(
+                checkpoint="morning_review",
+                send_notification=send_notification,
+            ),
+            "morning_review",
+        ),
+        (
+            "12:30",
+            lambda: run_intraday_checkpoint(
+                checkpoint="afternoon_review",
+                send_notification=send_notification,
+            ),
+            "afternoon_review",
+        ),
+    ]
+
+
 def start_api_server(host: str, port: int, config: Config) -> None:
     """
     在后台线程启动 FastAPI 服务
@@ -613,6 +638,7 @@ def main() -> int:
         # ━━━ 模式A: 全功能模式（Web + 定时 + 监控 + 调仓）━━━
         if getattr(args, 'all', False):
             logger.info("模式: 全功能（Web + 定时分析 + 盘中监控 + 调仓）")
+            logger.info("附加盘中节点: 10:15 早盘复判, 12:30 午后方向判断")
 
             # 强制跳过交易日检查（监控模块自己判断交易时间）
             args.force_run = True
@@ -663,6 +689,7 @@ def main() -> int:
                 task=lambda: run_full_analysis(config, args, stock_codes),
                 schedule_time=config.schedule_time,
                 run_immediately=False,  # 上面已经手动跑过了
+                extra_daily_tasks=build_intraday_schedule_tasks(args),
             )
             return 0
         # ━━━ 模式M: 盘中实时监控 ━━━
@@ -838,6 +865,7 @@ def main() -> int:
         if args.schedule or config.schedule_enabled:
             logger.info("模式: 定时任务")
             logger.info(f"每日执行时间: {config.schedule_time}")
+            logger.info("附加盘中节点: 10:15 早盘复判, 12:30 午后方向判断")
 
             # Determine whether to run immediately:
             # Command line arg --no-run-immediately overrides config if present.
@@ -856,7 +884,8 @@ def main() -> int:
             run_with_schedule(
                 task=scheduled_task,
                 schedule_time=config.schedule_time,
-                run_immediately=should_run_immediately
+                run_immediately=should_run_immediately,
+                extra_daily_tasks=build_intraday_schedule_tasks(args),
             )
             return 0
 

@@ -60,28 +60,55 @@ def _fetch_tencent_quote(codes: list, timeout: int = 15) -> dict:
             fields = match.group(2).split("~")
             if len(fields) < 45:
                 continue
-            results[code] = {
+
+            def _field_float(idx: int) -> float:
+                try:
+                    return float(fields[idx]) if fields[idx] else 0.0
+                except (ValueError, TypeError, IndexError):
+                    return 0.0
+
+            def _field_int(idx: int) -> int:
+                try:
+                    return int(float(fields[idx])) if fields[idx] else 0
+                except (ValueError, TypeError, IndexError):
+                    return 0
+
+            quote = {
                 "market": fields[0],         # 1=沪 51=深
                 "name": fields[1],
                 "code": fields[2],
-                "price": float(fields[3]) if fields[3] else 0,
-                "prev_close": float(fields[4]) if fields[4] else 0,
-                "open": float(fields[5]) if fields[5] else 0,
-                "volume": int(fields[6]) if fields[6] else 0,     # 手
-                "buy_volume": int(fields[7]) if fields[7] else 0,
-                "sell_volume": int(fields[8]) if fields[8] else 0,
-                "bid1_price": float(fields[9]) if fields[9] else 0,
-                "change_amount": float(fields[31]) if fields[31] else 0,
-                "change_pct": float(fields[32]) if fields[32] else 0,
-                "high": float(fields[33]) if fields[33] else 0,
-                "low": float(fields[34]) if fields[34] else 0,
-                "amount": float(fields[37]) if fields[37] else 0,  # 万元
-                "turnover_rate": float(fields[38]) if fields[38] else 0,
-                "pe_ratio": float(fields[39]) if fields[39] else 0,
-                "amplitude": float(fields[43]) if fields[43] else 0,
-                "market_cap": float(fields[44]) if fields[44] else 0,  # 亿
+                "price": _field_float(3),
+                "prev_close": _field_float(4),
+                "open": _field_float(5),
+                "volume": _field_int(6),     # 手
+                # 历史兼容：原字段名保留，同时补充更明确的 outer/inner 命名
+                "buy_volume": _field_int(7),
+                "sell_volume": _field_int(8),
+                "outer_volume": _field_int(7),
+                "inner_volume": _field_int(8),
+                "bid1_price": _field_float(9),
+                "bid1_volume": _field_int(10),
+                "change_amount": _field_float(31),
+                "change_pct": _field_float(32),
+                "high": _field_float(33),
+                "low": _field_float(34),
+                "amount": _field_float(37),  # 万元
+                "turnover_rate": _field_float(38),
+                "pe_ratio": _field_float(39),
+                "amplitude": _field_float(43),
+                "market_cap": _field_float(44),  # 亿
                 "timestamp": fields[30],
             }
+            for level in range(1, 6):
+                bid_price_idx = 9 + (level - 1) * 2
+                bid_volume_idx = bid_price_idx + 1
+                ask_price_idx = 19 + (level - 1) * 2
+                ask_volume_idx = ask_price_idx + 1
+                quote[f"bid{level}_price"] = _field_float(bid_price_idx)
+                quote[f"bid{level}_volume"] = _field_int(bid_volume_idx)
+                quote[f"ask{level}_price"] = _field_float(ask_price_idx)
+                quote[f"ask{level}_volume"] = _field_int(ask_volume_idx)
+            results[code] = quote
     except Exception as e:
         logger.error(f"腾讯行情请求失败: {e}")
     return results

@@ -177,11 +177,14 @@ def check_buy_permission(
     total_asset: float = 0,
     buy_amount: float = 0,
     current_change_pct: float = 0,
+    allow_averaging_down: bool = False,
 ) -> Dict[str, Any]:
     """检查是否允许买入。
 
     Args:
         current_change_pct: 该股票当日涨跌幅(%)，用于T+1追高检查
+        allow_averaging_down: 仅供上层策略在更严格前置条件下调用；
+            默认仍然禁止对亏损股补仓
 
     Returns:
         {"allowed": True/False, "reasons": ["原因1", ...], "warnings": ["警告1", ...]}
@@ -211,7 +214,7 @@ def check_buy_permission(
             )
 
     # 1. 禁止补仓亏损股
-    if FORBID_AVERAGING_DOWN:
+    if FORBID_AVERAGING_DOWN and not allow_averaging_down:
         for h in holdings:
             if h.get("code") == code:
                 pnl_pct = h.get("pnl_pct", 0)

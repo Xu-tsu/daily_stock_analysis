@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### 新功能
 
 - 📱 **Social Sentiment Intelligence (US stocks)** — 新增 Reddit / X (Twitter) / Polymarket 社交媒体情绪数据源，为美股分析提供实时社交舆情情报。数据来自 api.adanos.org，包含 Buzz Score、情绪评分、提及量等指标。完全可选（需配置 `SOCIAL_SENTIMENT_API_KEY`），仅对美股生效，A 股 / 港股不受影响。
+- 🕘 **集合竞价资金监控** — `market_monitor.py` / `main.py --monitor` 新增 `09:15-09:25` 竞价阶段轮询，基于腾讯行情的成交额与买卖盘队列跟踪盘前候选股和当前持仓，在开盘前推送竞价偏强 / 偏弱摘要，辅助早盘判断。
+- ⏱️ **调度器新增盘中节点** — `src/scheduler.py` 支持同一日注册多个固定时点任务；`--schedule` / `SCHEDULE_ENABLED=true` 现在除了 `SCHEDULE_TIME` 的主分析外，还会在 `10:15` 进行早盘复判、在 `12:30` 做午后方向判断，并复用现有通知链路输出市场总览、持仓调仓动作、强势回踩加仓 / 板块回流型补仓 / 龙头错杀型补仓 / 弱转强切换 / 防守锁利标签和转仓候选。
 ### 文档
 
 - 新增云服务器 Web 界面部署与访问教程 (Fixes #686)

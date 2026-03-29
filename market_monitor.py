@@ -3,6 +3,7 @@ market_monitor.py — 盘中全功能监控系统
 
 一天的完整流程:
   09:15 开盘前 — 全市场扫描，输出今日候选股
+  09:15-09:25 — 集合竞价资金监控，观察候选股/持仓的竞价强弱
   09:30-11:30 / 13:00-15:00 — 每N分钟监控异动
   15:00-15:30 — 收盘后自动回测+调仓分析
   每天积累 — 资金流/板块数据存入SQLite，用于多日趋势判断
@@ -17,10 +18,18 @@ market_monitor.py — 盘中全功能监控系统
 import argparse, json, logging, os, time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 TZ_CN = timezone(timedelta(hours=8))
+AUCTION_POLL_SECONDS = 30
+AUCTION_WATCHLIST_LIMIT = 15
+AUCTION_ALERT_TOP_N = 3
+CN_INDEX_CODES = [
+    ("sh000001", "上证指数"),
+    ("sz399001", "深证成指"),
+    ("sz399006", "创业板指"),
+]
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -281,7 +290,910 @@ def format_scan_alert(candidates: list) -> str:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 5. 时间判断
+# 5. 集合竞价监控
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def build_opening_auction_watchlist(candidates: list) -> List[dict]:
+    """优先观察盘前候选股，同时兼顾当前持仓的竞价承接。"""
+    watchlist: List[dict] = []
+    seen = set()
+
+    def _add_stock(code: str, name: str, reason: str):
+        normalized = str(code or "").strip()
+        if not normalized or normalized in seen:
+            return
+        watchlist.append({
+            "code": normalized,
+            "name": str(name or "").strip(),
+            "reason": reason,
+        })
+        seen.add(normalized)
+
+    for stock in candidates[:AUCTION_WATCHLIST_LIMIT]:
+        _add_stock(stock.get("code"), stock.get("name"), "candidate")
+
+    for holding in _get_current_holdings():
+        _add_stock(holding.get("code"), holding.get("name"), "holding")
+
+    return watchlist[:AUCTION_WATCHLIST_LIMIT]
+
+
+def _extract_opening_auction_snapshot(stock: dict, quote: dict) -> Optional[dict]:
+    if not quote:
+        return None
+
+    bid_stack = sum(int(quote.get(f"bid{i}_volume", 0) or 0) for i in range(1, 6))
+    ask_stack = sum(int(quote.get(f"ask{i}_volume", 0) or 0) for i in range(1, 6))
+    auction_amount = float(quote.get("amount", 0) or 0)
+    auction_price = (
+        float(quote.get("price", 0) or 0)
+        or float(quote.get("bid1_price", 0) or 0)
+        or float(quote.get("open", 0) or 0)
+    )
+    prev_close = float(quote.get("prev_close", 0) or 0)
+    if auction_price <= 0 and auction_amount <= 0 and bid_stack <= 0 and ask_stack <= 0:
+        return None
+
+    total_stack = bid_stack + ask_stack
+    imbalance_pct = round((bid_stack - ask_stack) / total_stack * 100, 2) if total_stack > 0 else 0.0
+    change_pct = float(quote.get("change_pct", 0) or 0)
+    if change_pct == 0 and auction_price > 0 and prev_close > 0:
+        change_pct = round((auction_price / prev_close - 1) * 100, 2)
+
+    market_cap = float(quote.get("market_cap", 0) or 0)
+    amount_ratio_pct = (
+        round(auction_amount / (market_cap * 10000) * 100, 4)
+        if market_cap > 0 else 0.0
+    )
+
+    return {
+        "code": stock.get("code"),
+        "name": stock.get("name") or quote.get("name", ""),
+        "reason": stock.get("reason", ""),
+        "auction_price": round(auction_price, 2) if auction_price else 0.0,
+        "change_pct": round(change_pct, 2),
+        "auction_amount": round(auction_amount, 2),   # 万元
+        "bid_stack": bid_stack,
+        "ask_stack": ask_stack,
+        "imbalance_pct": imbalance_pct,
+        "amount_ratio_pct": amount_ratio_pct,
+    }
+
+
+def collect_opening_auction_sample(watchlist: list) -> Optional[dict]:
+    if not watchlist:
+        return None
+
+    from macro_data_collector import _fetch_tencent_quote, _stock_code_to_tencent
+
+    code_map = {
+        stock["code"]: _stock_code_to_tencent(stock["code"])
+        for stock in watchlist
+        if stock.get("code")
+    }
+    if not code_map:
+        return None
+
+    quotes = _fetch_tencent_quote(list(code_map.values()), timeout=8)
+    stocks = []
+    for stock in watchlist:
+        code = stock.get("code")
+        tc_code = code_map.get(code)
+        snapshot = _extract_opening_auction_snapshot(stock, quotes.get(tc_code, {}))
+        if snapshot:
+            stocks.append(snapshot)
+
+    if not stocks:
+        return None
+
+    stocks.sort(key=lambda item: (item["auction_amount"], abs(item["imbalance_pct"])), reverse=True)
+    return {
+        "timestamp": _now_cn().strftime("%Y-%m-%d %H:%M:%S"),
+        "stocks": stocks,
+    }
+
+
+def _should_poll_opening_auction(state: dict) -> bool:
+    if not state.get("watchlist") or not is_opening_auction_window():
+        return False
+    last_polled_at = state.get("last_polled_at")
+    if last_polled_at is None:
+        return True
+    return (_now_cn() - last_polled_at).total_seconds() >= AUCTION_POLL_SECONDS
+
+
+def maybe_record_opening_auction_sample(state: dict) -> Optional[dict]:
+    if not _should_poll_opening_auction(state):
+        return None
+
+    sample = collect_opening_auction_sample(state.get("watchlist", []))
+    state["last_polled_at"] = _now_cn()
+    if not sample:
+        return None
+
+    samples = state.setdefault("samples", [])
+    samples.append(sample)
+    if len(samples) > 32:
+        del samples[:-32]
+
+    top_stock = sample["stocks"][0]
+    logger.info(
+        "[竞价] 采样 %s 只，Top: %s %s 竞价额 %.0f万 盘口差 %+0.1f%%",
+        len(sample["stocks"]),
+        top_stock["code"],
+        top_stock["name"],
+        top_stock["auction_amount"],
+        top_stock["imbalance_pct"],
+    )
+    return sample
+
+
+def summarize_opening_auction_state(state: dict) -> dict:
+    samples = state.get("samples") or []
+    watchlist = state.get("watchlist") or []
+    summary = {
+        "timestamp": _now_cn().strftime("%Y-%m-%d %H:%M:%S"),
+        "sample_count": len(samples),
+        "watchlist_size": len(watchlist),
+        "strong": [],
+        "weak": [],
+        "stocks": [],
+    }
+    if not samples:
+        return summary
+
+    first_by_code: Dict[str, dict] = {}
+    latest_by_code: Dict[str, dict] = {}
+    for sample in samples:
+        for stock in sample.get("stocks", []):
+            code = stock.get("code")
+            if not code:
+                continue
+            first_by_code.setdefault(code, stock)
+            latest_by_code[code] = stock
+
+    ranked = []
+    for code, latest in latest_by_code.items():
+        first = first_by_code.get(code, latest)
+        amount_delta = round(float(latest.get("auction_amount", 0) or 0) - float(first.get("auction_amount", 0) or 0), 2)
+        imbalance_delta = round(float(latest.get("imbalance_pct", 0) or 0) - float(first.get("imbalance_pct", 0) or 0), 2)
+        change_pct = float(latest.get("change_pct", 0) or 0)
+        auction_amount = float(latest.get("auction_amount", 0) or 0)
+        amount_ratio_pct = float(latest.get("amount_ratio_pct", 0) or 0)
+        imbalance_pct = float(latest.get("imbalance_pct", 0) or 0)
+        flow_score = round(
+            change_pct * 1.2
+            + imbalance_pct * 0.10
+            + min(amount_ratio_pct * 20, 3)
+            + max(min(amount_delta / 1000, 2), -2),
+            2,
+        )
+        is_strong = (
+            (change_pct >= 0.5 and imbalance_pct >= 10 and (auction_amount >= 1000 or amount_ratio_pct >= 0.03))
+            or (len(samples) > 1 and change_pct >= 0 and imbalance_pct >= 5 and amount_delta >= 500 and imbalance_delta >= 5)
+        )
+        is_weak = (
+            (change_pct <= -0.5 and imbalance_pct <= -10 and (auction_amount >= 1000 or amount_ratio_pct >= 0.03))
+            or (len(samples) > 1 and change_pct <= 0 and imbalance_pct <= -5 and amount_delta >= 500 and imbalance_delta <= -5)
+        )
+        ranked.append({
+            **latest,
+            "amount_delta": amount_delta,
+            "imbalance_delta": imbalance_delta,
+            "flow_score": flow_score,
+            "is_strong": is_strong,
+            "is_weak": is_weak,
+        })
+
+    ranked.sort(key=lambda item: item["flow_score"], reverse=True)
+    summary["timestamp"] = samples[-1]["timestamp"]
+    summary["stocks"] = ranked
+    summary["strong"] = sorted(
+        [item for item in ranked if item["is_strong"]],
+        key=lambda item: (item["flow_score"], item["auction_amount"], item["imbalance_pct"]),
+        reverse=True,
+    )[:AUCTION_ALERT_TOP_N]
+    summary["weak"] = sorted(
+        [item for item in ranked if item["is_weak"]],
+        key=lambda item: (item["flow_score"], item["change_pct"], item["imbalance_pct"]),
+    )[:AUCTION_ALERT_TOP_N]
+    return summary
+
+
+def format_opening_auction_alert(summary: dict) -> Optional[str]:
+    strong = summary.get("strong") or []
+    weak = summary.get("weak") or []
+    if not strong and not weak:
+        return None
+
+    lines = [
+        "🕘 **集合竞价资金监控**",
+        f"⏰ {summary['timestamp']}",
+        f"📌 观察池 {summary.get('watchlist_size', 0)} 只 | 采样 {summary.get('sample_count', 0)} 次",
+        "",
+    ]
+
+    if strong:
+        lines.append("📈 竞价偏强:")
+        for stock in strong:
+            lines.append(
+                f"  {stock['code']} {stock['name']} {stock['change_pct']:+.2f}% "
+                f"| 竞价额:{stock['auction_amount']:.0f}万 "
+                f"| 盘口差:{stock['imbalance_pct']:+.0f}% "
+                f"| 增量:{stock['amount_delta']:+.0f}万"
+            )
+
+    if weak:
+        if strong:
+            lines.append("")
+        lines.append("📉 竞价偏弱:")
+        for stock in weak:
+            lines.append(
+                f"  {stock['code']} {stock['name']} {stock['change_pct']:+.2f}% "
+                f"| 竞价额:{stock['auction_amount']:.0f}万 "
+                f"| 盘口差:{stock['imbalance_pct']:+.0f}% "
+                f"| 增量:{stock['amount_delta']:+.0f}万"
+            )
+
+    lines.extend(["", "💡 竞价信号只用于开盘前过滤，仍需结合开盘承接与板块联动确认。"])
+    return "\n".join(lines)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 6. 日内节点判断
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def _get_intraday_checkpoint_meta(checkpoint: str) -> dict:
+    mapping = {
+        "morning_review": {
+            "title": "⏱️ **10:15 早盘复判**",
+            "positive": "上午偏强",
+            "neutral": "上午震荡",
+            "negative": "上午偏弱",
+            "advice": "重点看主线是否继续扩散、早盘拉升是否有承接。",
+        },
+        "afternoon_review": {
+            "title": "🧭 **12:30 午后方向判断**",
+            "positive": "午后偏强",
+            "neutral": "午后震荡",
+            "negative": "午后偏弱",
+            "advice": "重点看指数共振、资金回流方向，以及午后是否有二次分歧。",
+        },
+    }
+    if checkpoint not in mapping:
+        raise ValueError(f"unsupported checkpoint: {checkpoint}")
+    return mapping[checkpoint]
+
+
+def build_intraday_checkpoint_summary(
+    checkpoint: str,
+    index_quotes: dict,
+    sectors: list,
+    anomaly_result: Optional[dict] = None,
+) -> dict:
+    meta = _get_intraday_checkpoint_meta(checkpoint)
+    anomalies = (anomaly_result or {}).get("anomalies") or []
+
+    index_rows = []
+    changes = []
+    for tc_code, name in CN_INDEX_CODES:
+        quote = index_quotes.get(tc_code, {}) if isinstance(index_quotes, dict) else {}
+        change_pct = float(quote.get("change_pct", 0) or 0)
+        index_rows.append({
+            "code": tc_code,
+            "name": name,
+            "change_pct": round(change_pct, 2),
+        })
+        changes.append(change_pct)
+
+    avg_change = round(sum(changes) / len(changes), 2) if changes else 0.0
+    positive_indexes = sum(1 for change in changes if change >= 0.6)
+    negative_indexes = sum(1 for change in changes if change <= -0.6)
+
+    top_sectors = []
+    positive_sectors = 0
+    for sector in (sectors or [])[:3]:
+        main_net = float(sector.get("main_net", 0) or 0)
+        if main_net > 0:
+            positive_sectors += 1
+        top_sectors.append({
+            "name": sector.get("name", ""),
+            "change_pct": round(float(sector.get("change_pct", 0) or 0), 2),
+            "main_net": round(main_net, 2),
+        })
+
+    high_risk_count = sum(
+        1 for anomaly in anomalies
+        if anomaly.get("severity") in {"critical", "high"}
+    )
+
+    if (
+        high_risk_count > 0
+        or avg_change <= -0.8
+        or (negative_indexes >= 2 and positive_sectors == 0)
+    ):
+        bias = "negative"
+    elif (
+        avg_change >= 0.8
+        or (positive_indexes >= 2 and positive_sectors >= 2)
+    ):
+        bias = "positive"
+    else:
+        bias = "neutral"
+
+    return {
+        "checkpoint": checkpoint,
+        "timestamp": _now_cn().strftime("%Y-%m-%d %H:%M:%S"),
+        "title": meta["title"],
+        "bias": bias,
+        "bias_label": meta[bias],
+        "advice": meta["advice"],
+        "index_rows": index_rows,
+        "avg_change_pct": avg_change,
+        "top_sectors": top_sectors,
+        "high_risk_count": high_risk_count,
+        "anomalies": anomalies[:3],
+    }
+
+
+def build_intraday_portfolio_advice(
+    summary: dict,
+    portfolio: dict,
+    holding_quotes: dict,
+    sectors: list,
+    risk_alerts: list,
+    rotation_candidates: Optional[list] = None,
+) -> dict:
+    """Build lightweight portfolio actions from market bias + existing hard rules."""
+    from risk_control import (
+        MAX_SINGLE_POSITION_PCT,
+        TAKE_PROFIT_FULL_PCT,
+        TAKE_PROFIT_HALF_PCT,
+        check_buy_permission,
+        get_position_sizing,
+    )
+
+    holdings = portfolio.get("holdings", []) or []
+    if not holdings:
+        return {
+            "has_holdings": False,
+            "position_advice": "当前无持仓，暂无盘中调仓动作。",
+            "actions": [],
+            "rotation_candidates": [],
+        }
+
+    bias = summary.get("bias", "neutral")
+    range_map = {
+        "positive": (0.55, 0.75),
+        "neutral": (0.40, 0.60),
+        "negative": (0.20, 0.40),
+    }
+    lower, upper = range_map.get(bias, range_map["neutral"])
+    actual_ratio = float(portfolio.get("actual_position_ratio", 0) or 0)
+    cash = float(portfolio.get("cash", 0) or 0)
+    total_asset = float(portfolio.get("total_asset", 0) or 0)
+    market_strength = float(summary.get("avg_change_pct", 0) or 0)
+    high_risk_count = int(summary.get("high_risk_count", 0) or 0)
+    cash_ratio = (cash / total_asset) if total_asset > 0 else 0.0
+
+    if actual_ratio > upper:
+        position_advice = (
+            f"当前仓位 {actual_ratio * 100:.1f}% 偏高，高于{summary.get('bias_label', '当前环境')}"
+            f"建议区间 {lower * 100:.0f}%~{upper * 100:.0f}%，优先止盈减仓或转仓。"
+        )
+    elif actual_ratio < lower:
+        if bias == "positive":
+            position_advice = (
+                f"当前仓位 {actual_ratio * 100:.1f}% 偏低，市场偏强，优先寻找主线股的强势回踩加仓；"
+                f"只有在主线资金未散、并满足板块回流型或龙头错杀型条件时，"
+                f"才考虑小额深跌摊低成本。"
+            )
+        else:
+            position_advice = (
+                f"当前仓位 {actual_ratio * 100:.1f}% 偏低，但当前环境不支持主动追仓，"
+                f"保持现金等待更清晰信号。"
+            )
+    else:
+        position_advice = (
+            f"当前仓位 {actual_ratio * 100:.1f}% 处于建议区间 {lower * 100:.0f}%~{upper * 100:.0f}%，"
+            f"以结构优化为主。"
+        )
+
+    alert_priority = {"critical": 3, "warning": 2, "info": 1}
+    alert_by_code = {}
+    for alert in risk_alerts or []:
+        code = getattr(alert, "code", "")
+        if not code:
+            continue
+        prev = alert_by_code.get(code)
+        if prev is None or alert_priority.get(alert.level, 0) > alert_priority.get(prev.level, 0):
+            alert_by_code[code] = alert
+
+    actions = []
+    held_codes = {holding.get("code") for holding in holdings if holding.get("code")}
+    rotation_pool = [
+        candidate for candidate in (rotation_candidates or [])
+        if candidate.get("code") not in held_codes
+    ][:3]
+    has_rotation_pool = bool(rotation_pool)
+    sector_snapshot = {}
+    for rank, sector in enumerate(sectors or [], start=1):
+        sector_name = str(sector.get("name", "") or "").strip()
+        if not sector_name:
+            continue
+        sector_snapshot[sector_name] = {
+            "rank": rank,
+            "change_pct": float(sector.get("change_pct", 0) or 0),
+            "main_net": float(sector.get("main_net", 0) or 0),
+        }
+    top_sector_names = {
+        sector_name
+        for sector_name, info in sector_snapshot.items()
+        if info["rank"] <= 3 and info["main_net"] > 0
+    }
+    action_weight = {"sell": 4, "reduce": 3, "buy": 2, "hold": 1}
+
+    for holding in holdings:
+        code = holding.get("code", "")
+        name = holding.get("name", code)
+        quote = holding_quotes.get(code, {})
+        pnl_pct = float(holding.get("pnl_pct", 0) or 0)
+        change_pct = float(quote.get("change_pct", 0) or 0)
+        sellable = int(holding.get("sellable_shares", holding.get("shares", 0)) or 0)
+        sector_name = str(holding.get("sector", "") or "").strip()
+        holding_value = float(holding.get("market_value", 0) or 0)
+        position_pct = (holding_value / total_asset * 100) if total_asset > 0 else 0.0
+        alert = alert_by_code.get(code)
+        sector_info = sector_snapshot.get(sector_name, {})
+        sector_change_pct = float(sector_info.get("change_pct", 0) or 0)
+        sector_main_net = float(sector_info.get("main_net", 0) or 0)
+        in_hot_sector = sector_name in top_sector_names
+        sector_is_lagging = (
+            (not in_hot_sector)
+            and (
+                (not sector_name)
+                or sector_main_net <= 0
+                or sector_change_pct < 0.8
+            )
+        )
+        market_supports_add = bias == "positive" and high_risk_count <= 1
+        strong_pullback_ready = (
+            market_supports_add
+            and pnl_pct >= 1.5
+            and in_hot_sector
+            and sector_change_pct >= 0.5
+            and -3.5 <= change_pct <= -0.4
+            and cash > 0
+            and actual_ratio < upper
+            and position_pct < (MAX_SINGLE_POSITION_PCT - 3.0)
+        )
+        sector_reflow_average_down_ready = (
+            market_supports_add
+            and market_strength >= 0.3
+            and actual_ratio < lower
+            and cash_ratio >= 0.18
+            and -4.8 <= pnl_pct <= -2.0
+            and -6.5 <= change_pct <= -3.0
+            and in_hot_sector
+            and sector_change_pct >= 1.0
+            and sector_main_net >= 3000
+            and position_pct <= 8.0
+            and not alert
+        )
+        leader_mispricing_average_down_ready = (
+            market_supports_add
+            and market_strength >= 0.6
+            and actual_ratio < upper
+            and cash_ratio >= 0.12
+            and -2.8 <= pnl_pct <= -0.3
+            and -5.5 <= change_pct <= -2.2
+            and in_hot_sector
+            and sector_change_pct >= 1.6
+            and sector_main_net >= 5000
+            and position_pct <= 10.0
+            and not alert
+        )
+
+        action = "hold"
+        ratio = "维持"
+        reason = "暂无明确调仓触发条件，继续观察盘中承接。"
+        strategy = "watch"
+        strategy_label = "继续观察"
+
+        if alert and alert.level == "critical" and sellable > 0:
+            action = "sell"
+            ratio = "清仓"
+            reason = alert.message
+            strategy = "risk_exit"
+            strategy_label = "风控离场"
+        elif alert and alert.level == "warning" and sellable > 0:
+            if alert.action == "force_sell":
+                action = "sell"
+                ratio = "清仓"
+                strategy = "risk_exit"
+                strategy_label = "风控离场"
+            else:
+                action = "reduce"
+                ratio = "减仓50%"
+                strategy = "risk_reduce"
+                strategy_label = "风险减仓"
+            reason = alert.message
+        elif bias == "negative":
+            if pnl_pct >= TAKE_PROFIT_HALF_PCT and sellable > 0:
+                action = "reduce"
+                ratio = "减仓50%"
+                if sector_is_lagging and has_rotation_pool:
+                    strategy = "defensive_lock_profit"
+                    strategy_label = "防守锁利"
+                    reason = "市场偏弱，先把已有利润收回来，保留现金，等待更稳的切换时点。"
+                else:
+                    strategy = "defensive_take_profit"
+                    strategy_label = "防守止盈"
+                    reason = "市场偏弱，优先止盈锁利，避免盈利回撤。"
+            elif pnl_pct > 0 and change_pct < -1.5 and sellable > 0:
+                action = "reduce"
+                ratio = "减仓30%-50%"
+                strategy = "defensive_reduce"
+                strategy_label = "防守减仓"
+                reason = "市场偏弱且个股转弱，先降风险，再看是否转仓。"
+            elif pnl_pct < 0:
+                strategy = "wait_for_base"
+                strategy_label = "等待止跌"
+                reason = "市场偏弱且持仓仍亏损，禁止逆势补仓，等待止跌确认。"
+        elif bias == "positive":
+            if pnl_pct >= TAKE_PROFIT_FULL_PCT and sellable > 0:
+                action = "sell"
+                ratio = "止盈清仓"
+                if sector_is_lagging and has_rotation_pool:
+                    strategy = "weak_to_strong_rotation"
+                    strategy_label = "弱转强切换"
+                    reason = "短线利润已明显超额，且当前板块弱于主线，先兑现利润，再切向更强方向。"
+                else:
+                    strategy = "take_profit"
+                    strategy_label = "分批止盈"
+                    reason = "短线利润已明显超额，先兑现，再考虑切换更强主线。"
+            elif pnl_pct >= TAKE_PROFIT_HALF_PCT and sellable > 0:
+                action = "reduce"
+                ratio = "减仓50%"
+                if sector_is_lagging and has_rotation_pool:
+                    strategy = "weak_to_strong_rotation"
+                    strategy_label = "弱转强切换"
+                    reason = "已有利润但当前板块开始落后，可先止盈减仓，把仓位从弱线切向更强主线。"
+                else:
+                    strategy = "take_profit"
+                    strategy_label = "分批止盈"
+                    reason = "强市中也先锁一部分利润，剩余仓位继续跟随。"
+            elif strong_pullback_ready:
+                buy_amount = min(
+                    cash,
+                    get_position_sizing(
+                        total_asset=max(total_asset, cash),
+                        current_positions=len(holdings),
+                        signal_strength="strong",
+                    ),
+                )
+                permission = check_buy_permission(
+                    code=code,
+                    name=name,
+                    holdings=holdings,
+                    total_asset=max(total_asset, cash),
+                    buy_amount=buy_amount,
+                    current_change_pct=change_pct,
+                )
+                if permission["allowed"] and buy_amount >= 500:
+                    action = "buy"
+                    ratio = f"加仓约{int(buy_amount)}元"
+                    strategy = "strong_pullback_add"
+                    strategy_label = "强势回踩加仓"
+                    reason = "市场偏强，主线板块资金仍在，个股回踩但趋势未坏，可顺势分批低吸。"
+                    if permission["warnings"]:
+                        reason = f"{reason} 风险提示: {permission['warnings'][0]}"
+                elif permission["reasons"]:
+                    strategy = "wait_for_pullback"
+                    strategy_label = "等待更好买点"
+                    reason = permission["reasons"][0]
+                elif permission["warnings"]:
+                    strategy = "wait_for_pullback"
+                    strategy_label = "等待更好买点"
+                    reason = permission["warnings"][0]
+            elif leader_mispricing_average_down_ready:
+                leader_mispricing_budget = min(
+                    cash * 0.40,
+                    get_position_sizing(
+                        total_asset=max(total_asset, cash),
+                        current_positions=len(holdings),
+                        signal_strength="strong",
+                    ),
+                )
+                if total_asset > 0:
+                    leader_mispricing_budget = min(
+                        leader_mispricing_budget,
+                        max(total_asset * 0.11 - holding_value, 0),
+                    )
+                permission = check_buy_permission(
+                    code=code,
+                    name=name,
+                    holdings=holdings,
+                    total_asset=max(total_asset, cash),
+                    buy_amount=leader_mispricing_budget,
+                    current_change_pct=change_pct,
+                    allow_averaging_down=True,
+                )
+                if permission["allowed"] and leader_mispricing_budget >= 500:
+                    action = "buy"
+                    ratio = f"错杀补仓约{int(leader_mispricing_budget)}元"
+                    strategy = "leader_mispricing_average_down"
+                    strategy_label = "龙头错杀型补仓"
+                    reason = (
+                        "指数和主线板块都仍偏强，但个股被异常压低，"
+                        "可按龙头错杀处理，小额试探补仓，不宜一次打满。"
+                    )
+                    if permission["warnings"]:
+                        reason = f"{reason} 风险提示: {permission['warnings'][0]}"
+                elif permission["reasons"]:
+                    strategy = "wait_for_base"
+                    strategy_label = "等待止跌"
+                    reason = permission["reasons"][0]
+                elif permission["warnings"]:
+                    strategy = "wait_for_base"
+                    strategy_label = "等待止跌"
+                    reason = permission["warnings"][0]
+            elif sector_reflow_average_down_ready:
+                sector_reflow_budget = min(
+                    cash * 0.25,
+                    get_position_sizing(
+                        total_asset=max(total_asset, cash),
+                        current_positions=len(holdings),
+                        signal_strength="medium",
+                    ),
+                )
+                if total_asset > 0:
+                    sector_reflow_budget = min(
+                        sector_reflow_budget,
+                        max(total_asset * 0.09 - holding_value, 0),
+                    )
+                permission = check_buy_permission(
+                    code=code,
+                    name=name,
+                    holdings=holdings,
+                    total_asset=max(total_asset, cash),
+                    buy_amount=sector_reflow_budget,
+                    current_change_pct=change_pct,
+                    allow_averaging_down=True,
+                )
+                if permission["allowed"] and sector_reflow_budget >= 500:
+                    action = "buy"
+                    ratio = f"回流补仓约{int(sector_reflow_budget)}元"
+                    strategy = "sector_reflow_average_down"
+                    strategy_label = "板块回流型补仓"
+                    reason = (
+                        "主线板块资金重新回流，个股只是跟随性深跌，"
+                        "可更保守地做小额试探补仓。"
+                    )
+                    if permission["warnings"]:
+                        reason = f"{reason} 风险提示: {permission['warnings'][0]}"
+                elif permission["reasons"]:
+                    strategy = "wait_for_base"
+                    strategy_label = "等待止跌"
+                    reason = permission["reasons"][0]
+                elif permission["warnings"]:
+                    strategy = "wait_for_base"
+                    strategy_label = "等待止跌"
+                    reason = permission["warnings"][0]
+            elif pnl_pct < 0:
+                strategy = "wait_for_base"
+                strategy_label = "等待止跌"
+                reason = "虽然市场偏强，但当前持仓仍亏损，若不满足板块回流型或龙头错杀型条件，暂不补仓。"
+        else:
+            if pnl_pct >= TAKE_PROFIT_HALF_PCT and sellable > 0:
+                action = "reduce"
+                ratio = "减仓30%-50%"
+                if sector_is_lagging and has_rotation_pool:
+                    strategy = "defensive_lock_profit"
+                    strategy_label = "防守锁利"
+                    reason = "震荡市里先把利润锁住，资金先回笼，等更强方向确认后再切换。"
+                else:
+                    strategy = "take_profit"
+                    strategy_label = "分批止盈"
+                    reason = "震荡市先落袋一部分利润，保留机动仓位。"
+            elif pnl_pct < 0:
+                strategy = "wait_for_base"
+                strategy_label = "等待止跌"
+                reason = "震荡市不适合摊低成本，继续观察，不主动补仓。"
+
+        actions.append({
+            "code": code,
+            "name": name,
+            "action": action,
+            "strategy": strategy,
+            "strategy_label": strategy_label,
+            "ratio": ratio,
+            "reason": reason,
+            "pnl_pct": round(pnl_pct, 2),
+            "change_pct": round(change_pct, 2),
+            "sector": sector_name,
+            "sellable": sellable,
+            "position_pct": round(position_pct, 2),
+        })
+
+    actions.sort(
+        key=lambda item: (
+            action_weight.get(item["action"], 0),
+            abs(item["pnl_pct"]),
+            abs(item["change_pct"]),
+        ),
+        reverse=True,
+    )
+
+    return {
+        "has_holdings": True,
+        "position_advice": position_advice,
+        "actions": actions,
+        "rotation_candidates": rotation_pool,
+        "cash": round(cash, 2),
+        "total_asset": round(total_asset, 2),
+        "actual_position_ratio": round(actual_ratio * 100, 1),
+    }
+
+
+def collect_intraday_portfolio_advice(summary: dict, sectors: list) -> dict:
+    """Refresh holdings with realtime quotes, then derive intraday portfolio advice."""
+    from macro_data_collector import _fetch_tencent_quote, _stock_code_to_tencent
+    from portfolio_manager import (
+        load_portfolio, sync_portfolio_from_trades, update_current_prices,
+    )
+    from risk_control import check_stop_loss
+
+    portfolio = load_portfolio()
+    portfolio = sync_portfolio_from_trades(portfolio)
+    holding_codes = [holding.get("code") for holding in portfolio.get("holdings", []) if holding.get("code")]
+    if not holding_codes:
+        return {
+            "has_holdings": False,
+            "position_advice": "当前无持仓，暂无盘中调仓动作。",
+            "actions": [],
+            "rotation_candidates": [],
+        }
+
+    tc_codes = [_stock_code_to_tencent(code) for code in holding_codes]
+    quotes = _fetch_tencent_quote(tc_codes, timeout=8)
+    quote_by_code = {}
+    price_map = {}
+    for code in holding_codes:
+        tc_code = _stock_code_to_tencent(code)
+        quote = quotes.get(tc_code, {})
+        quote_by_code[code] = quote
+        price = float(quote.get("price", 0) or 0)
+        if price > 0:
+            price_map[code] = price
+
+    portfolio = update_current_prices(portfolio, price_map)
+    risk_alerts = check_stop_loss(portfolio.get("holdings", []))
+
+    rotation_candidates = []
+    if summary.get("bias") != "negative":
+        try:
+            from ths_scraper import fetch_hot_stocks_for_candidate
+
+            rotation_candidates = fetch_hot_stocks_for_candidate(max_price=15.0, top_n=5)
+        except Exception as e:
+            logger.debug("转仓候选获取失败，跳过: %s", e)
+
+    return build_intraday_portfolio_advice(
+        summary=summary,
+        portfolio=portfolio,
+        holding_quotes=quote_by_code,
+        sectors=sectors,
+        risk_alerts=risk_alerts,
+        rotation_candidates=rotation_candidates,
+    )
+
+
+def format_intraday_checkpoint_alert(summary: dict) -> str:
+    lines = [
+        summary["title"],
+        f"⏰ {summary['timestamp']}",
+        f"🎯 结论: {summary['bias_label']} (指数均值 {summary['avg_change_pct']:+.2f}%)",
+        "",
+    ]
+
+    index_rows = summary.get("index_rows") or []
+    if index_rows:
+        index_line = " | ".join(
+            f"{row['name']} {row['change_pct']:+.2f}%"
+            for row in index_rows
+        )
+        lines.append(f"📊 指数: {index_line}")
+
+    sectors = summary.get("top_sectors") or []
+    if sectors:
+        sector_line = " | ".join(
+            f"{sector['name']} {sector['change_pct']:+.2f}% / {sector['main_net']:.0f}万"
+            for sector in sectors
+        )
+        lines.append(f"🔥 热点: {sector_line}")
+
+    anomalies = summary.get("anomalies") or []
+    if anomalies:
+        lines.append("⚠️ 风险:")
+        for anomaly in anomalies[:2]:
+            lines.append(f"  - {anomaly.get('detail', '')}")
+
+    portfolio_advice = summary.get("portfolio_advice") or {}
+    if portfolio_advice.get("has_holdings"):
+        lines.extend([
+            "",
+            f"💼 仓位: {portfolio_advice.get('position_advice', '')}",
+        ])
+        action_items = portfolio_advice.get("actions") or []
+        if action_items:
+            lines.append("📋 调仓:")
+            for item in action_items[:4]:
+                emoji = {
+                    "buy": "🟢",
+                    "hold": "🟡",
+                    "reduce": "🟠",
+                    "sell": "🔴",
+                }.get(item.get("action", "hold"), "⚪")
+                strategy_label = item.get("strategy_label", "")
+                strategy_suffix = (
+                    f" [{strategy_label}]"
+                    if strategy_label and strategy_label != "继续观察"
+                    else ""
+                )
+                lines.append(
+                    f"  {emoji} {item.get('name','')}({item.get('code','')}) "
+                    f"{item.get('ratio','维持')}{strategy_suffix} | 当日{item.get('change_pct', 0):+.2f}% | "
+                    f"浮盈亏{item.get('pnl_pct', 0):+.2f}%"
+                )
+                lines.append(f"    {item.get('reason', '')}")
+
+        rotation_candidates = portfolio_advice.get("rotation_candidates") or []
+        if rotation_candidates:
+            lines.append("🔄 转仓候选:")
+            for candidate in rotation_candidates[:3]:
+                lines.append(
+                    f"  - {candidate.get('code','')} {candidate.get('name','')} "
+                    f"{float(candidate.get('price', 0) or 0):.2f}元 | "
+                    f"主力:{float(candidate.get('main_net', 0) or 0):.0f}万"
+                )
+
+    lines.extend(["", f"💡 {summary['advice']}"])
+    return "\n".join(lines)
+
+
+def run_intraday_checkpoint(checkpoint: str, send_notification: bool = True) -> Optional[dict]:
+    """执行 10:15 / 12:30 的轻量盘中判断。"""
+    try:
+        from src.core.trading_calendar import get_open_markets_today
+
+        open_markets = {m.lower() for m in get_open_markets_today()}
+        if "cn" not in open_markets:
+            logger.info("[%s] 今日 A 股非交易日，跳过盘中节点判断", checkpoint)
+            return None
+    except Exception as e:
+        logger.warning("[%s] 交易日判断失败，按 fail-open 继续: %s", checkpoint, e)
+
+    from macro_data_collector import _fetch_tencent_quote
+    from ths_scraper import fetch_sector_fund_flow_rank
+
+    quotes = _fetch_tencent_quote([code for code, _ in CN_INDEX_CODES], timeout=8)
+    sectors = fetch_sector_fund_flow_rank("hy", top_n=5)
+    anomaly_result = check_market_anomaly()
+    summary = build_intraday_checkpoint_summary(
+        checkpoint=checkpoint,
+        index_quotes=quotes,
+        sectors=sectors,
+        anomaly_result=anomaly_result,
+    )
+    summary["portfolio_advice"] = collect_intraday_portfolio_advice(summary, sectors)
+    alert = format_intraday_checkpoint_alert(summary)
+    logger.info("\n%s", alert)
+    if send_notification:
+        send_alert(alert)
+    return summary
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 7. 时间判断
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def _now_cn():
     return datetime.now(TZ_CN)
@@ -292,6 +1204,14 @@ def _time_cn():
 def is_pre_market():
     from datetime import time as dt
     return dt(9, 0) <= _time_cn() <= dt(9, 25)
+
+def is_opening_auction_window():
+    from datetime import time as dt
+    return dt(9, 15) <= _time_cn() <= dt(9, 25)
+
+def is_opening_auction_summary_time():
+    from datetime import time as dt
+    return dt(9, 24) <= _time_cn() <= dt(9, 25)
 
 def is_trading_time():
     from datetime import time as dt
@@ -307,7 +1227,7 @@ def is_weekday():
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 6. 主循环
+# 8. 主循环
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def run_monitor_loop(interval_minutes: int = 10, auto_rebalance: bool = True):
     from src.config import get_config
@@ -324,6 +1244,7 @@ def run_monitor_loop(interval_minutes: int = 10, auto_rebalance: bool = True):
 
     pre_market_done = set()   # 记录已执行盘前扫描的日期
     after_close_done = set()  # 记录已执行收盘任务的日期
+    auction_state = {"date": None, "watchlist": [], "samples": [], "alert_sent": False, "last_polled_at": None}
 
     while True:
         now = _now_cn()
@@ -333,21 +1254,60 @@ def run_monitor_loop(interval_minutes: int = 10, auto_rebalance: bool = True):
             time.sleep(300)
             continue
 
+        if auction_state.get("date") != today:
+            auction_state = {
+                "date": today,
+                "watchlist": [],
+                "samples": [],
+                "alert_sent": False,
+                "last_polled_at": None,
+            }
+
         # ── 盘前扫描 09:00-09:25 ──
-        if is_pre_market() and today not in pre_market_done:
-            logger.info(f"\n[{now.strftime('%H:%M')}] 执行盘前扫描...")
-            try:
-                candidates = run_pre_market_scan()
-                if candidates:
-                    alert = format_scan_alert(candidates)
-                    send_alert(alert)
+        if is_pre_market():
+            if today not in pre_market_done:
+                logger.info(f"\n[{now.strftime('%H:%M')}] 执行盘前扫描...")
+                candidates = []
+                try:
+                    candidates = run_pre_market_scan()
+                    if candidates:
+                        alert = format_scan_alert(candidates)
+                        send_alert(alert)
 
-                # 主线板块分析
-                analyze_mainline()
+                    # 主线板块分析
+                    analyze_mainline()
+                except Exception as e:
+                    logger.error(f"盘前扫描失败: {e}")
 
-            except Exception as e:
-                logger.error(f"盘前扫描失败: {e}")
-            pre_market_done.add(today)
+                auction_state["watchlist"] = build_opening_auction_watchlist(candidates)
+                if auction_state["watchlist"]:
+                    logger.info(
+                        "[竞价] 已建立观察池 %s 只: %s",
+                        len(auction_state["watchlist"]),
+                        ",".join(stock["code"] for stock in auction_state["watchlist"][:8]),
+                    )
+                pre_market_done.add(today)
+
+            if not auction_state.get("watchlist"):
+                auction_state["watchlist"] = build_opening_auction_watchlist([])
+
+            if is_opening_auction_window():
+                try:
+                    maybe_record_opening_auction_sample(auction_state)
+                    if is_opening_auction_summary_time() and not auction_state.get("alert_sent"):
+                        auction_summary = summarize_opening_auction_state(auction_state)
+                        enough_samples = auction_summary.get("sample_count", 0) >= 2
+                        reached_auction_end = _time_cn().strftime("%H:%M") >= "09:25"
+                        if enough_samples or reached_auction_end:
+                            auction_alert = format_opening_auction_alert(auction_summary)
+                            if auction_alert:
+                                logger.warning(f"竞价信号！\n{auction_alert}")
+                                send_alert(auction_alert)
+                            else:
+                                logger.info("[竞价] 未发现明显强弱分化")
+                            auction_state["alert_sent"] = True
+                except Exception as e:
+                    logger.error(f"竞价监控失败: {e}")
 
         # ── 盘中监控 09:30-15:00 ──
         elif is_trading_time():
@@ -440,7 +1400,10 @@ def run_monitor_loop(interval_minutes: int = 10, auto_rebalance: bool = True):
 
             after_close_done.add(today)
 
-        time.sleep(interval_minutes * 60)
+        sleep_seconds = max(1, interval_minutes) * 60
+        if is_opening_auction_window():
+            sleep_seconds = min(sleep_seconds, AUCTION_POLL_SECONDS)
+        time.sleep(sleep_seconds)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

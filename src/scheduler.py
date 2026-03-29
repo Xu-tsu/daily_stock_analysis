@@ -19,7 +19,7 @@ import sys
 import time
 import threading
 from datetime import datetime
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +81,42 @@ class Scheduler:
         self.shutdown_handler = GracefulShutdown()
         self._task_callback: Optional[Callable] = None
         self._running = False
+
+    def set_daily_tasks(
+        self,
+        tasks: Sequence[Tuple[str, Callable, str]],
+        run_immediately: bool = False,
+        immediate_task_names: Optional[Sequence[str]] = None,
+    ):
+        """
+        设置多个每日定时任务。
+
+        Args:
+            tasks: [(time_str, callback, task_name), ...]
+            run_immediately: 是否执行 immediate_task_names 中的任务
+            immediate_task_names: 启动时立即执行的任务名列表；为空时默认执行首个任务
+        """
+        if not tasks:
+            return
+
+        self._task_callback = tasks[0][1]
+        immediate_names = list(immediate_task_names or [])
+        if run_immediately and not immediate_names:
+            immediate_names = [tasks[0][2]]
+
+        for time_str, task, task_name in tasks:
+            self.schedule.every().day.at(time_str).do(
+                self._safe_run_task,
+                task_name=task_name,
+                task_callback=task,
+            )
+            logger.info(f"已设置每日定时任务 [{task_name}]，执行时间: {time_str}")
+
+        if run_immediately:
+            for _, task, task_name in tasks:
+                if task_name in immediate_names:
+                    logger.info(f"立即执行任务 [{task_name}]...")
+                    self._safe_run_task(task_name=task_name, task_callback=task)
         
     def set_daily_task(self, task: Callable, run_immediately: bool = True):
         """
@@ -90,32 +126,39 @@ class Scheduler:
             task: 要执行的任务函数（无参数）
             run_immediately: 是否在设置后立即执行一次
         """
-        self._task_callback = task
-        
-        # 设置每日定时任务
-        self.schedule.every().day.at(self.schedule_time).do(self._safe_run_task)
-        logger.info(f"已设置每日定时任务，执行时间: {self.schedule_time}")
-        
-        if run_immediately:
-            logger.info("立即执行一次任务...")
-            self._safe_run_task()
+        self.set_daily_tasks(
+            tasks=[(self.schedule_time, task, "daily_task")],
+            run_immediately=run_immediately,
+            immediate_task_names=["daily_task"],
+        )
     
-    def _safe_run_task(self):
+    def _safe_run_task(
+        self,
+        task_name: str = "daily_task",
+        task_callback: Optional[Callable] = None,
+    ):
         """安全执行任务（带异常捕获）"""
-        if self._task_callback is None:
+        callback = task_callback or self._task_callback
+        if callback is None:
             return
         
         try:
             logger.info("=" * 50)
-            logger.info(f"定时任务开始执行 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info(
+                f"定时任务开始执行 [{task_name}] - "
+                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            )
             logger.info("=" * 50)
             
-            self._task_callback()
+            callback()
             
-            logger.info(f"定时任务执行完成 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info(
+                f"定时任务执行完成 [{task_name}] - "
+                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            )
             
         except Exception as e:
-            logger.exception(f"定时任务执行失败: {e}")
+            logger.exception(f"定时任务执行失败 [{task_name}]: {e}")
     
     def run(self):
         """
@@ -153,7 +196,8 @@ class Scheduler:
 def run_with_schedule(
     task: Callable,
     schedule_time: str = "18:00",
-    run_immediately: bool = True
+    run_immediately: bool = True,
+    extra_daily_tasks: Optional[Sequence[Tuple[str, Callable, str]]] = None,
 ):
     """
     便捷函数：使用定时调度运行任务
@@ -162,9 +206,17 @@ def run_with_schedule(
         task: 要执行的任务函数
         schedule_time: 每日执行时间
         run_immediately: 是否立即执行一次
+        extra_daily_tasks: 额外的日内任务 [(time_str, callback, task_name), ...]
     """
     scheduler = Scheduler(schedule_time=schedule_time)
-    scheduler.set_daily_task(task, run_immediately=run_immediately)
+    if extra_daily_tasks:
+        scheduler.set_daily_tasks(
+            tasks=[(schedule_time, task, "daily_analysis"), *list(extra_daily_tasks)],
+            run_immediately=run_immediately,
+            immediate_task_names=["daily_analysis"],
+        )
+    else:
+        scheduler.set_daily_task(task, run_immediately=run_immediately)
     scheduler.run()
 
 
