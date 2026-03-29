@@ -156,6 +156,16 @@ def _is_non_retriable_tool_result(result: Any) -> bool:
     )
 
 
+def _is_cacheable_tool(tool_registry: ToolRegistry, tool_name: str) -> bool:
+    """Return True when repeated identical tool calls can safely reuse cached output."""
+    tool_def = tool_registry.get(tool_name)
+    if tool_def is None and ":" in tool_name:
+        tool_def = tool_registry.get(tool_name.split(":", 1)[-1])
+    if tool_def is None:
+        return False
+    return tool_def.category != "action"
+
+
 def parse_dashboard_json(content: str) -> Optional[Dict[str, Any]]:
     """Extract and parse a Decision Dashboard JSON from agent text.
 
@@ -326,6 +336,7 @@ def run_agent_loop(
     start_time = time.time()
     tool_calls_log: List[Dict[str, Any]] = []
     non_retriable_tool_results: Dict[str, str] = {}
+    successful_tool_results: Dict[str, str] = {}
     total_tokens = 0
     provider_used = ""
     models_used: List[str] = []
@@ -388,6 +399,7 @@ def run_agent_loop(
                 progress_callback,
                 tool_calls_log,
                 non_retriable_tool_results,
+                successful_tool_results,
             )
 
             # Append tool results preserving original call order
@@ -455,6 +467,7 @@ def _execute_tools(
     progress_callback: Optional[Callable],
     tool_calls_log: List[Dict[str, Any]],
     non_retriable_tool_results: Optional[Dict[str, str]] = None,
+    successful_tool_results: Optional[Dict[str, str]] = None,
 ) -> List[Dict[str, Any]]:
     """Execute one or more tool calls, returning ordered result dicts.
 
@@ -464,6 +477,16 @@ def _execute_tools(
     def _exec_single(tc_item):
         t0 = time.time()
         cache_key = _build_tool_cache_key(tc_item.name, tc_item.arguments)
+        cacheable = bool(cache_key) and _is_cacheable_tool(tool_registry, tc_item.name)
+
+        if cacheable and successful_tool_results is not None and cache_key in successful_tool_results:
+            dur = round(time.time() - t0, 2)
+            logger.info(
+                "Tool '%s' reused cached success result for arguments=%s",
+                tc_item.name,
+                tc_item.arguments,
+            )
+            return tc_item, successful_tool_results[cache_key], True, dur, True
 
         if cache_key and non_retriable_tool_results is not None and cache_key in non_retriable_tool_results:
             dur = round(time.time() - t0, 2)
@@ -478,6 +501,8 @@ def _execute_tools(
             res = tool_registry.execute(tc_item.name, **tc_item.arguments)
             res_str = serialize_tool_result(res)
             ok = True
+            if cacheable and successful_tool_results is not None:
+                successful_tool_results[cache_key] = res_str
             if cache_key and non_retriable_tool_results is not None and _is_non_retriable_tool_result(res):
                 non_retriable_tool_results[cache_key] = res_str
         except Exception as e:

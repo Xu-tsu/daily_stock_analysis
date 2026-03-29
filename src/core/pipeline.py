@@ -11,6 +11,7 @@ A股自选股智能分析系统 - 核心分析流水线
 4. 提供股票分析的核心功能
 """
 
+import atexit
 import logging
 import time
 import uuid
@@ -38,6 +39,27 @@ from bot.models import BotMessage
 
 
 logger = logging.getLogger(__name__)
+_BACKGROUND_IO_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="pipeline-io")
+
+
+def _dispatch_nonblocking_io(func, *args, **kwargs):
+    """Submit non-critical persistence to a background pool without blocking analysis."""
+    if func is None:
+        return None
+
+    future = _BACKGROUND_IO_EXECUTOR.submit(func, *args, **kwargs)
+
+    def _log_failure(done_future):
+        try:
+            done_future.result()
+        except Exception as exc:
+            logger.debug("Background pipeline IO task failed: %s", exc)
+
+    future.add_done_callback(_log_failure)
+    return future
+
+
+atexit.register(lambda: _BACKGROUND_IO_EXECUTOR.shutdown(wait=False))
 
 
 class StockAnalysisPipeline:
@@ -259,7 +281,8 @@ class StockAnalysisPipeline:
 
             # P0: write-only snapshot, fail-open, no read dependency on this table.
             try:
-                self.db.save_fundamental_snapshot(
+                _dispatch_nonblocking_io(
+                    self.db.save_fundamental_snapshot,
                     query_id=query_id,
                     code=code,
                     payload=fundamental_context,
@@ -325,7 +348,8 @@ class StockAnalysisPipeline:
                         query_context = self._build_query_context(query_id=query_id)
                         for dim_name, response in intel_results.items():
                             if response and response.success and response.results:
-                                self.db.save_news_intel(
+                                _dispatch_nonblocking_io(
+                                    self.db.save_news_intel,
                                     code=code,
                                     name=stock_name,
                                     dimension=dim_name,
@@ -402,7 +426,8 @@ class StockAnalysisPipeline:
                         realtime_quote=realtime_quote,
                         chip_data=chip_data
                     )
-                    self.db.save_analysis_history(
+                    _dispatch_nonblocking_io(
+                        self.db.save_analysis_history,
                         result=result,
                         query_id=query_id,
                         report_type=report_type.value,
@@ -734,7 +759,8 @@ class StockAnalysisPipeline:
                     )
                     if news_response.success and news_response.results:
                         query_context = self._build_query_context(query_id=query_id)
-                        self.db.save_news_intel(
+                        _dispatch_nonblocking_io(
+                            self.db.save_news_intel,
                             code=code,
                             name=resolved_stock_name,
                             dimension="latest_news",
@@ -750,7 +776,8 @@ class StockAnalysisPipeline:
             if result:
                 try:
                     initial_context["stock_name"] = resolved_stock_name
-                    self.db.save_analysis_history(
+                    _dispatch_nonblocking_io(
+                        self.db.save_analysis_history,
                         result=result,
                         query_id=query_id,
                         report_type=report_type.value,

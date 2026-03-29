@@ -507,7 +507,8 @@ class TestAnalyzeWithAgentStockName(unittest.TestCase):
              patch('src.core.pipeline.GeminiAnalyzer'), \
              patch('src.core.pipeline.NotificationService'), \
              patch('src.core.pipeline.SearchService'), \
-             patch('src.agent.factory.build_agent_executor') as mock_build_executor:
+             patch('src.agent.factory.build_agent_executor') as mock_build_executor, \
+             patch('src.core.pipeline._dispatch_nonblocking_io', side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)):
 
             mock_cfg = MagicMock()
             mock_cfg.max_workers = 2

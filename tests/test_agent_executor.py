@@ -321,6 +321,57 @@ class TestAgentExecutor(unittest.TestCase):
         self.assertFalse(result.tool_calls_log[0]["cached"])
         self.assertTrue(result.tool_calls_log[1]["cached"])
 
+    def test_successful_tool_result_is_reused_for_identical_arguments(self):
+        """Repeated read-only tool calls with identical args should reuse the cached result."""
+        calls = []
+
+        def _echo(message):
+            calls.append(message)
+            return {"echo": message, "len": len(message)}
+
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                name="echo",
+                description="Echoes back the input",
+                parameters=[
+                    ToolParameter(name="message", type="string", description="Message to echo"),
+                ],
+                handler=_echo,
+                category="data",
+            )
+        )
+        adapter = _make_mock_adapter()
+        adapter.call_with_tools.side_effect = [
+            LLMResponse(
+                content="",
+                tool_calls=[ToolCall(id="c1", name="echo", arguments={"message": "repeat"})],
+                usage={"total_tokens": 10},
+                provider="openai",
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[ToolCall(id="c2", name="echo", arguments={"message": "repeat"})],
+                usage={"total_tokens": 10},
+                provider="openai",
+            ),
+            LLMResponse(
+                content=json.dumps(SAMPLE_DASHBOARD, ensure_ascii=False),
+                tool_calls=[],
+                usage={"total_tokens": 10},
+                provider="openai",
+            ),
+        ]
+
+        executor = AgentExecutor(registry, adapter, max_steps=5)
+        result = executor.run("Analyze repeat")
+
+        self.assertTrue(result.success)
+        self.assertEqual(calls, ["repeat"])
+        self.assertEqual(len(result.tool_calls_log), 2)
+        self.assertFalse(result.tool_calls_log[0]["cached"])
+        self.assertTrue(result.tool_calls_log[1]["cached"])
+
     def test_model_trace_deduplicates_and_keeps_order(self):
         """Model trace should keep call order and de-duplicate repeated models."""
         registry = _make_registry_with_echo()
