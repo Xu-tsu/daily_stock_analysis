@@ -310,6 +310,8 @@ def run_agent_loop(
     max_steps: int = 10,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     thinking_labels: Optional[Dict[str, str]] = None,
+    model_override: Optional[str] = None,
+    fallback_models_override: Optional[List[str]] = None,
 ) -> RunLoopResult:
     """Execute the ReAct LLM ↔ tool loop.
 
@@ -355,7 +357,12 @@ def run_agent_loop(
             progress_callback({"type": "thinking", "step": step + 1, "message": thinking_msg})
 
         # --- LLM call ---
-        response = llm_adapter.call_with_tools(messages, tool_decls)
+        response = llm_adapter.call_with_tools(
+            messages,
+            tool_decls,
+            model_override=model_override,
+            fallback_models_override=fallback_models_override,
+        )
         provider_used = response.provider
         total_tokens += (response.usage or {}).get("total_tokens", 0)
         m = getattr(response, "model", "") or response.provider

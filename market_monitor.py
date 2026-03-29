@@ -1069,6 +1069,7 @@ def build_intraday_portfolio_advice(
         check_buy_permission,
         get_position_sizing,
     )
+    from src.services.trade_sizing_service import annotate_a_share_trade_suggestions
 
     holdings = portfolio.get("holdings", []) or []
     if not holdings:
@@ -1442,6 +1443,15 @@ def build_intraday_portfolio_advice(
         reverse=True,
     )
 
+    actions, rotation_pool, _execution_profile = annotate_a_share_trade_suggestions(
+        actions=actions,
+        holdings=holdings,
+        cash=cash,
+        total_asset=total_asset,
+        candidates=rotation_pool,
+        max_single_position_pct=MAX_SINGLE_POSITION_PCT,
+    )
+
     return {
         "has_holdings": True,
         "position_advice": position_advice,
@@ -1523,6 +1533,29 @@ def collect_intraday_portfolio_advice(summary: dict, sectors: list) -> dict:
     )
 
 
+def _format_intraday_execution_line(item: dict) -> Optional[str]:
+    shares = int(item.get("suggested_shares", 0) or 0)
+    lots = int(item.get("suggested_lots", 0) or 0)
+    reference_price = float(item.get("reference_price", 0) or 0)
+    quantity_reason = item.get("quantity_reason", "")
+
+    if shares > 0:
+        parts = [f"建议 {shares}股"]
+        if lots > 0:
+            parts.append(f"{lots}手")
+        if reference_price > 0:
+            parts.append(f"参考价 {reference_price:.3f}元")
+        if item.get("action") == "buy" or "estimated_cash_out" in item:
+            parts.append(f"总支出 {float(item.get('estimated_cash_out', 0) or 0):.2f}元")
+        elif "estimated_net_cash" in item:
+            parts.append(f"预计到账 {float(item.get('estimated_net_cash', 0) or 0):.2f}元")
+        return " | ".join(parts)
+
+    if quantity_reason:
+        return f"数量约束: {quantity_reason}"
+    return None
+
+
 def format_intraday_checkpoint_alert(summary: dict) -> str:
     lines = [
         summary["title"],
@@ -1581,6 +1614,9 @@ def format_intraday_checkpoint_alert(summary: dict) -> str:
                     f"浮盈亏{item.get('pnl_pct', 0):+.2f}%"
                 )
                 lines.append(f"    {item.get('reason', '')}")
+                execution_line = _format_intraday_execution_line(item)
+                if execution_line:
+                    lines.append(f"    {execution_line}")
 
         rotation_candidates = portfolio_advice.get("rotation_candidates") or []
         if rotation_candidates:
@@ -1591,6 +1627,9 @@ def format_intraday_checkpoint_alert(summary: dict) -> str:
                     f"{float(candidate.get('price', 0) or 0):.2f}元 | "
                     f"主力:{float(candidate.get('main_net', 0) or 0):.0f}万"
                 )
+                execution_line = _format_intraday_execution_line(candidate)
+                if execution_line:
+                    lines.append(f"    {execution_line}")
 
     lines.extend(["", f"💡 {summary['advice']}"])
     return "\n".join(lines)

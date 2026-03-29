@@ -11,9 +11,10 @@ runner, and structured opinion output.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from src.agent.llm_adapter import LLMToolAdapter
 from src.agent.memory import AgentMemory
@@ -79,6 +80,65 @@ class BaseAgent(ABC):
         """
         return None
 
+    def resolve_model_route(self, ctx: AgentContext) -> Tuple[Optional[str], List[str]]:
+        """Resolve primary/fallback models for this stage.
+
+        Default behaviour keeps backward compatibility:
+        - Technical / Intel / Strategy stages prefer the local Ollama model when configured
+        - Risk prefers the local debate / critique model when configured
+        - Decision prefers the cloud arbiter model when configured
+        - Global ``LITELLM_MODEL`` remains the generic fallback chain
+        """
+        del ctx  # reserved for future context-aware routing
+
+        config = getattr(self.llm_adapter, "_config", None)
+        default_model = (getattr(config, "litellm_model", "") or "").strip()
+        default_fallbacks = [
+            str(model).strip()
+            for model in (getattr(config, "litellm_fallback_models", None) or [])
+            if str(model).strip()
+        ]
+
+        local_model = os.getenv("REBALANCE_LOCAL_MODEL", "").strip()
+        debate_model = os.getenv("REBALANCE_DEBATE_MODEL", "").strip()
+        cloud_model = os.getenv("REBALANCE_CLOUD_MODEL", "").strip()
+        cloud_fallback = os.getenv("REBALANCE_CLOUD_FALLBACK", "").strip()
+
+        def _dedupe(models: List[str], primary: str = "") -> List[str]:
+            seen = {primary} if primary else set()
+            ordered: List[str] = []
+            for model in models:
+                candidate = str(model or "").strip()
+                if not candidate or candidate in seen:
+                    continue
+                seen.add(candidate)
+                ordered.append(candidate)
+            return ordered
+
+        stage_name = self.agent_name or ""
+        if stage_name == "decision":
+            primary = cloud_model or default_model
+            fallbacks = _dedupe(
+                [cloud_fallback, default_model, *default_fallbacks, debate_model, local_model],
+                primary=primary,
+            )
+            return (primary or None), fallbacks
+
+        if stage_name == "risk":
+            primary = debate_model or local_model or default_model
+            fallbacks = _dedupe(
+                [local_model, default_model, *default_fallbacks, cloud_model, cloud_fallback],
+                primary=primary,
+            )
+            return (primary or None), fallbacks
+
+        primary = local_model or default_model
+        fallbacks = _dedupe(
+            [debate_model, default_model, *default_fallbacks, cloud_model, cloud_fallback],
+            primary=primary,
+        )
+        return (primary or None), fallbacks
+
     # -----------------------------------------------------------------
     # Execution
     # -----------------------------------------------------------------
@@ -102,6 +162,14 @@ class BaseAgent(ABC):
 
         try:
             messages = self._build_messages(ctx)
+            model_override, fallback_models_override = self.resolve_model_route(ctx)
+            if model_override:
+                logger.info(
+                    "[%s] model route -> primary=%s fallbacks=%s",
+                    self.agent_name,
+                    model_override,
+                    fallback_models_override,
+                )
 
             # Restrict tools if the agent declares a subset
             registry = self._filtered_registry()
@@ -112,6 +180,8 @@ class BaseAgent(ABC):
                 llm_adapter=self.llm_adapter,
                 max_steps=self.max_steps,
                 progress_callback=progress_callback,
+                model_override=model_override,
+                fallback_models_override=fallback_models_override,
             )
 
             result.tokens_used = loop_result.total_tokens
@@ -119,6 +189,10 @@ class BaseAgent(ABC):
             result.meta["raw_text"] = loop_result.content
             result.meta["models_used"] = loop_result.models_used
             result.meta["tool_calls_log"] = loop_result.tool_calls_log
+            result.meta["model_route"] = {
+                "primary": model_override,
+                "fallbacks": fallback_models_override,
+            }
 
             if not loop_result.success:
                 result.status = StageStatus.FAILED

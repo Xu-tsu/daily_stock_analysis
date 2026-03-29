@@ -251,6 +251,10 @@ LITELLM_MODEL=openai/deepseek-chat
 python main.py --monitor --interval 5
 ```
 
+持仓相关的风控、调仓建议、交易日志与 PDF 导入中的 `hold_days` 现已统一按 A 股交易日计算，周末和休市日不会再被计入持仓天数。
+
+调仓建议、盘中做 T 建议和换股候选现在也会统一按 A 股 `100股=1手` 生成建议数量；程序会优先复用你导入交割单里的真实手续费 / 印花税 / 过户费样本估算买卖成本，没有历史样本时再回退到默认费率模型。
+
 该模式会保留原有盘前扫描、盘中异动和收盘调仓流程，并在 `09:15-09:25` 额外跟踪候选股/持仓的集合竞价成交额与盘口差，开盘前推送一条竞价强弱摘要。
 
 > Docker 部署、定时任务配置请参考 [完整指南](docs/full-guide.md)
@@ -363,6 +367,7 @@ python main.py --monitor --interval 5
 - **Bot 命令**：`/ask` 策略分析（支持多股对比）、`/chat` 自由对话
 - **自定义策略**：在 `strategies/` 目录下新建 YAML 文件即可添加策略，无需写代码
 - **多 Agent 架构**（实验性）：设置 `AGENT_ARCH=multi` 启用 Technical → Intel → Risk → Strategy → Decision 多 Agent 级联编排，通过 `AGENT_ORCHESTRATOR_MODE` 控制深度（quick/standard/full/strategy）。超时或中间阶段 JSON 解析失败时，系统会优先保留已完成阶段结果并降级生成最小可用仪表盘，避免整份报告直接退回默认占位。详见 [完整配置指南](docs/full-guide.md)
+- **分阶段模型路由**：当 `.env` 中已配置 `REBALANCE_LOCAL_MODEL` / `REBALANCE_DEBATE_MODEL` / `REBALANCE_CLOUD_MODEL` 时，主分析 Multi-Agent 也会自动继承这套分工：Technical / Intel / Strategy 优先走本地模型，Risk 优先走本地辩论模型，Decision 优先走云端仲裁模型；`LITELLM_MODEL` 退回通用默认 / 兜底角色。
 - **市场总览约束**：多 Agent 模式现在会把市场总览直接注入到各阶段，包括特朗普/关税等突发、`09:15-09:25` 集合竞价方向、热门题材滚动资金、游资试板强弱、量化砸盘压力、当前持仓与板块强确认。
 - **自适应风控**：`-5%` 现在默认视为“风险复核线”而不是机械清仓线；只有在市场偏弱、板块不确认、宏观突发或量化压力偏高时才优先清仓。若市场偏强且主线资金、板块确认和仓位结构都支持，系统才会建议减仓后保留底仓做T。
 

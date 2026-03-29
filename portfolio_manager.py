@@ -186,6 +186,38 @@ def update_current_prices(portfolio: dict, price_map: dict) -> dict:
 # ──────────────────────────────────────────────
 # 2. 调仓建议格式化（给通知模块用）
 # ──────────────────────────────────────────────
+def _append_execution_plan(lines: list, item: dict, indent: str = "   ") -> None:
+    shares = int(item.get("suggested_shares", 0) or 0)
+    lots = int(item.get("suggested_lots", 0) or 0)
+    reference_price = float(item.get("reference_price", 0) or 0)
+    quantity_reason = item.get("quantity_reason", "")
+
+    if shares > 0:
+        plan = f"{indent}📐 建议数量: {shares}股"
+        if lots > 0:
+            plan += f" ({lots}手)"
+        if reference_price > 0:
+            plan += f" @ {reference_price:.3f}元"
+        lines.append(plan)
+
+        fee = float(item.get("estimated_fee", 0) or 0)
+        tax = float(item.get("estimated_tax", 0) or 0)
+        if item.get("action") == "buy" or "estimated_cash_out" in item:
+            amount = float(item.get("estimated_amount", 0) or 0)
+            cash_out = float(item.get("estimated_cash_out", 0) or 0)
+            lines.append(
+                f"{indent}💰 预计成交额 {amount:.2f}元 | 手续费 {fee:.2f}元 | 税费 {tax:.2f}元 | 总支出 {cash_out:.2f}元"
+            )
+        elif "estimated_net_cash" in item:
+            amount = float(item.get("estimated_amount", 0) or 0)
+            net_cash = float(item.get("estimated_net_cash", 0) or 0)
+            lines.append(
+                f"{indent}💰 预计成交额 {amount:.2f}元 | 手续费 {fee:.2f}元 | 印花税 {tax:.2f}元 | 预计到账 {net_cash:.2f}元"
+            )
+    elif quantity_reason:
+        lines.append(f"{indent}📐 数量约束: {quantity_reason}")
+
+
 def format_rebalance_report(rebalance: dict) -> str:
     """把 LLM 返回的调仓 JSON 格式化为推送文本"""
     lines = []
@@ -236,6 +268,7 @@ def format_rebalance_report(rebalance: dict) -> str:
                 lines.append(f"   {a['detail']}")
             if a.get("reason"):
                 lines.append(f"   💡 {a['reason']}")
+            _append_execution_plan(lines, a)
             # 卖点/止损价
             tp = a.get("target_sell_price")
             sl = a.get("stop_loss_price")
@@ -270,6 +303,7 @@ def format_rebalance_report(rebalance: dict) -> str:
                     prices.append(f"止损:{sl}")
                 line += f"\n    🎯 {' | '.join(prices)}"
             lines.append(line)
+            _append_execution_plan(lines, c, indent="    ")
         lines.append("")
 
     # 风险提示

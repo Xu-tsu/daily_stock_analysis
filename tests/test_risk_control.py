@@ -4,6 +4,7 @@
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -33,6 +34,26 @@ def _market_context(*, confirmed: bool, bias: str = "positive", macro: str = "lo
 
 
 class TestAdaptiveStopLoss(unittest.TestCase):
+    @patch("risk_control.count_stock_trading_days", return_value=1)
+    def test_weekend_gap_does_not_trigger_hold_day_warning(self, _mock_count) -> None:
+        holdings = [
+            {
+                "code": "600011",
+                "name": "Huanneng",
+                "sector": "Power",
+                "cost_price": 10.0,
+                "current_price": 10.1,
+                "buy_date": "2026-03-27",
+            }
+        ]
+
+        alerts = check_stop_loss(
+            holdings,
+            market_context=_market_context(confirmed=True),
+        )
+
+        self.assertEqual(alerts, [])
+
     def test_loss_review_line_can_keep_base_when_market_and_sector_confirm(self) -> None:
         holdings = [
             {

@@ -17,6 +17,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
+from src.core.trading_calendar import count_stock_trading_days
+
 logger = logging.getLogger(__name__)
 
 DB_PATH = os.getenv("SCANNER_DB_PATH", "data/scanner_history.db")
@@ -43,6 +45,8 @@ def init_trade_tables():
         shares INTEGER,
         price REAL,
         amount REAL,
+        fee REAL DEFAULT 0,
+        tax REAL DEFAULT 0,
         -- 买入时的技术指标（卖出时从买入记录复制）
         ma_trend TEXT,
         macd_signal TEXT,
@@ -112,6 +116,15 @@ def init_trade_tables():
     );
     CREATE INDEX IF NOT EXISTS idx_ctx_trade ON trade_market_context(trade_log_id);
     """)
+    columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(trade_log)").fetchall()
+    }
+    if "fee" not in columns:
+        conn.execute("ALTER TABLE trade_log ADD COLUMN fee REAL DEFAULT 0")
+    if "tax" not in columns:
+        conn.execute("ALTER TABLE trade_log ADD COLUMN tax REAL DEFAULT 0")
+    conn.commit()
     conn.close()
 
 
@@ -131,9 +144,9 @@ def record_buy(code: str, name: str, shares: int, price: float,
     conn = _conn()
     conn.execute("""
         INSERT INTO trade_log
-        (trade_date, trade_type, code, name, shares, price, amount,
+        (trade_date, trade_type, code, name, shares, price, amount, fee, tax,
          ma_trend, macd_signal, rsi, vol_pattern, tech_score, sector, source, note)
-        VALUES (?, 'buy', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, 'buy', ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         datetime.now().strftime("%Y-%m-%d"),
         code, name, shares, price, round(shares * price, 2),
@@ -178,9 +191,16 @@ def record_sell(code: str, name: str, shares: int, price: float,
         if buy_price == 0:
             buy_price = buy_record["price"]
         try:
-            buy_date = datetime.strptime(buy_record["trade_date"], "%Y-%m-%d")
-            hold_days = (datetime.now() - buy_date).days
-        except:
+            hold_days = (
+                count_stock_trading_days(
+                    code,
+                    buy_record["trade_date"],
+                    datetime.now(),
+                    default_market="cn",
+                )
+                or 0
+            )
+        except Exception:
             pass
         ma_trend = buy_record["ma_trend"]
         macd_signal = buy_record["macd_signal"]
@@ -194,10 +214,10 @@ def record_sell(code: str, name: str, shares: int, price: float,
 
     conn.execute("""
         INSERT INTO trade_log
-        (trade_date, trade_type, code, name, shares, price, amount,
+        (trade_date, trade_type, code, name, shares, price, amount, fee, tax,
          buy_price, pnl, pnl_pct, hold_days,
          ma_trend, macd_signal, rsi, vol_pattern, tech_score, sector, source, note)
-        VALUES (?, 'sell', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, 'sell', ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         datetime.now().strftime("%Y-%m-%d"),
         code, name, shares, price, round(shares * price, 2),
@@ -530,7 +550,7 @@ def format_performance(stats: dict) -> str:
         f"盈利: {stats['win_trades']}笔 | 亏损: {stats['lose_trades']}笔",
         f"总盈亏: {'🟢' if stats['total_pnl']>=0 else '🔴'} {stats['total_pnl']}元",
         f"平均收益: {stats['avg_pnl_pct']}%",
-        f"平均持仓: {stats['avg_hold_days']}天",
+        f"平均持仓: {stats['avg_hold_days']}个交易日",
     ]
     if stats.get("best_trade"):
         lines.append(f"最佳: {stats['best_trade']}")
@@ -604,6 +624,8 @@ _COL_ALIASES = {
     "price": ["成交均价", "成交价格", "价格", "price", "成交价"],
     "shares": ["成交数量", "成交股数", "数量", "shares", "volume", "qty"],
     "amount": ["成交金额", "发生金额", "金额", "amount"],
+    "fee": ["手续费", "佣金", "交易费", "规费", "过户费", "fee", "commission"],
+    "tax": ["印花税", "税费", "tax", "stamp_tax"],
 }
 
 _BUY_KEYWORDS = {"买入", "买", "buy", "b", "证券买入", "担保品买入", "融资买入"}
@@ -715,6 +737,8 @@ def import_trades_from_file(file_path: str, source: str = "import") -> dict:
     col_shares = _find_column(df.columns, "shares")
     col_name = _find_column(df.columns, "name")
     col_amount = _find_column(df.columns, "amount")
+    col_fee = _find_column(df.columns, "fee")
+    col_tax = _find_column(df.columns, "tax")
 
     missing = []
     if not col_date: missing.append("日期")
@@ -757,13 +781,23 @@ def import_trades_from_file(file_path: str, source: str = "import") -> dict:
             name = str(row[col_name]).strip() if col_name and pd.notna(row.get(col_name)) else ""
             amount = float(str(row[col_amount]).replace(",", "")) if col_amount and pd.notna(row.get(col_amount)) else round(price * shares, 2)
             amount = abs(amount)
+            fee = (
+                abs(float(str(row[col_fee]).replace(",", "")))
+                if col_fee and pd.notna(row.get(col_fee))
+                else 0.0
+            )
+            tax = (
+                abs(float(str(row[col_tax]).replace(",", "")))
+                if col_tax and pd.notna(row.get(col_tax))
+                else 0.0
+            )
 
             if trade_type == "buy":
                 conn.execute("""
                     INSERT INTO trade_log
-                    (trade_date, trade_type, code, name, shares, price, amount, source)
-                    VALUES (?, 'buy', ?, ?, ?, ?, ?, ?)
-                """, (trade_date, code, name, shares, price, amount, source))
+                    (trade_date, trade_type, code, name, shares, price, amount, fee, tax, source)
+                    VALUES (?, 'buy', ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (trade_date, code, name, shares, price, amount, fee, tax, source))
             else:
                 # 卖出：查找对应买入记录算盈亏
                 buy_rec = conn.execute("""
@@ -776,9 +810,15 @@ def import_trades_from_file(file_path: str, source: str = "import") -> dict:
                 hold_days = 0
                 if buy_rec:
                     try:
-                        bd = datetime.strptime(buy_rec["trade_date"], "%Y-%m-%d")
-                        sd = datetime.strptime(trade_date, "%Y-%m-%d")
-                        hold_days = (sd - bd).days
+                        hold_days = (
+                            count_stock_trading_days(
+                                code,
+                                buy_rec["trade_date"],
+                                trade_date,
+                                default_market="cn",
+                            )
+                            or 0
+                        )
                     except Exception:
                         pass
 
@@ -787,11 +827,11 @@ def import_trades_from_file(file_path: str, source: str = "import") -> dict:
 
                 conn.execute("""
                     INSERT INTO trade_log
-                    (trade_date, trade_type, code, name, shares, price, amount,
+                    (trade_date, trade_type, code, name, shares, price, amount, fee, tax,
                      buy_price, pnl, pnl_pct, hold_days, source)
-                    VALUES (?, 'sell', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, 'sell', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (trade_date, code, name, shares, price, amount,
-                      buy_price, pnl, pnl_pct, hold_days, source))
+                      fee, tax, buy_price, pnl, pnl_pct, hold_days, source))
 
             imported += 1
         except Exception as e:
@@ -866,7 +906,7 @@ def format_recent_trades(trades: list) -> str:
             lines.append(
                 f"  {emoji} {t['trade_date']} 卖出 {t['name']}({t['code']}) "
                 f"{t['shares']}股 {t['price']}元 "
-                f"盈亏:{pnl}元({t.get('pnl_pct',0)}%) 持{t.get('hold_days',0)}天"
+                f"盈亏:{pnl}元({t.get('pnl_pct',0)}%) 持{t.get('hold_days',0)}个交易日"
             )
     return "\n".join(lines)
 

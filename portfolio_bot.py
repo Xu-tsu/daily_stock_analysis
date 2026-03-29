@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 from portfolio_manager import load_portfolio, save_portfolio
+from src.services.trade_sizing_service import is_valid_a_share_lot
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +124,8 @@ def _handle_buy(text: str) -> str:
     code = m.group(1)
     shares = int(m.group(2))
     price = float(m.group(3))
+    if not is_valid_a_share_lot(code, shares):
+        return "❌ A股买入数量必须是100股整数倍（1手=100股），例如 100股、200股。"
     name = _get_stock_name(code)
 
     portfolio = load_portfolio()
@@ -199,6 +202,8 @@ def _handle_sell(text: str) -> str:
     code = m.group(1)
     shares = int(m.group(2))
     price = float(m.group(3))
+    if not is_valid_a_share_lot(code, shares):
+        return "❌ A股卖出数量必须是100股整数倍（1手=100股），例如 100股、200股。"
 
     portfolio = load_portfolio()
     holdings = portfolio.get("holdings", [])

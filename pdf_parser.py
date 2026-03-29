@@ -21,6 +21,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from src.core.trading_calendar import count_stock_trading_days
+
 logger = logging.getLogger(__name__)
 
 
@@ -544,13 +546,15 @@ def import_pdf_to_trade_journal(file_path: str) -> Dict[str, Any]:
 
     for t in parsed["trades"]:
         try:
+            fee = round(float(t.get("fee", 0) or 0) + float(t.get("transfer_fee", 0) or 0), 2)
+            tax = round(float(t.get("stamp_tax", 0) or 0), 2)
             if t["direction"] == "buy":
                 conn.execute("""
                     INSERT INTO trade_log
-                    (trade_date, trade_type, code, name, shares, price, amount, source)
-                    VALUES (?, 'buy', ?, ?, ?, ?, ?, 'pdf')
+                    (trade_date, trade_type, code, name, shares, price, amount, fee, tax, source)
+                    VALUES (?, 'buy', ?, ?, ?, ?, ?, ?, ?, 'pdf')
                 """, (t["date"], t["code"], t["name"], t["shares"],
-                      t["price"], t["amount"]))
+                      t["price"], t["amount"], fee, tax))
             else:
                 # 查找买入记录算盈亏
                 buy = conn.execute("""
@@ -563,10 +567,15 @@ def import_pdf_to_trade_journal(file_path: str) -> Dict[str, Any]:
                 hold_days = 0
                 if buy:
                     try:
-                        from datetime import datetime as _dt
-                        bd = _dt.strptime(buy["trade_date"], "%Y-%m-%d")
-                        sd = _dt.strptime(t["date"], "%Y-%m-%d")
-                        hold_days = (sd - bd).days
+                        hold_days = (
+                            count_stock_trading_days(
+                                t["code"],
+                                buy["trade_date"],
+                                t["date"],
+                                default_market="cn",
+                            )
+                            or 0
+                        )
                     except Exception:
                         pass
 
@@ -575,11 +584,11 @@ def import_pdf_to_trade_journal(file_path: str) -> Dict[str, Any]:
 
                 conn.execute("""
                     INSERT INTO trade_log
-                    (trade_date, trade_type, code, name, shares, price, amount,
+                    (trade_date, trade_type, code, name, shares, price, amount, fee, tax,
                      buy_price, pnl, pnl_pct, hold_days, source)
-                    VALUES (?, 'sell', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pdf')
+                    VALUES (?, 'sell', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pdf')
                 """, (t["date"], t["code"], t["name"], t["shares"],
-                      t["price"], t["amount"], buy_price, pnl, pnl_pct, hold_days))
+                      t["price"], t["amount"], fee, tax, buy_price, pnl, pnl_pct, hold_days))
 
             imported += 1
         except Exception as e:

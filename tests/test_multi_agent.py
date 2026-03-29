@@ -1052,6 +1052,95 @@ class TestBaseAgentMemoryIntegration(unittest.TestCase):
         )
 
 
+class TestBaseAgentModelRouting(unittest.TestCase):
+    """Test stage-specific model routing for the multi-agent pipeline."""
+
+    @staticmethod
+    def _make_config():
+        return SimpleNamespace(
+            litellm_model="gemini/gemini-2.5-flash",
+            litellm_fallback_models=["gemini/gemini-2.5-flash-lite"],
+        )
+
+    @staticmethod
+    def _make_agent(agent_name: str):
+        from src.agent.agents.base_agent import BaseAgent
+
+        class DummyAgent(BaseAgent):
+            def system_prompt(self, ctx):
+                return "system"
+
+            def build_user_message(self, ctx):
+                return "user"
+
+            def post_process(self, ctx, raw_text):
+                return AgentOpinion(agent_name=self.agent_name, signal="hold", confidence=0.5, reasoning=raw_text)
+
+        DummyAgent.agent_name = agent_name
+        adapter = MagicMock()
+        adapter._config = TestBaseAgentModelRouting._make_config()
+        with patch("src.agent.agents.base_agent.AgentMemory.from_config", return_value=MagicMock(enabled=False)):
+            return DummyAgent(tool_registry=MagicMock(), llm_adapter=adapter)
+
+    @patch.dict(os.environ, {
+        "REBALANCE_LOCAL_MODEL": "ollama/qwen2.5:14b-instruct-q4_K_M",
+        "REBALANCE_DEBATE_MODEL": "ollama/deepseek-r1:14b",
+        "REBALANCE_CLOUD_MODEL": "azure/gpt-5.4-nano",
+        "REBALANCE_CLOUD_FALLBACK": "gemini/gemini-2.5-flash",
+    }, clear=False)
+    def test_stage_specific_model_routes_follow_local_cloud_split(self):
+        ctx = AgentContext(query="test")
+
+        technical = self._make_agent("technical")
+        risk = self._make_agent("risk")
+        decision = self._make_agent("decision")
+
+        tech_primary, tech_fallbacks = technical.resolve_model_route(ctx)
+        risk_primary, risk_fallbacks = risk.resolve_model_route(ctx)
+        decision_primary, decision_fallbacks = decision.resolve_model_route(ctx)
+
+        self.assertEqual(tech_primary, "ollama/qwen2.5:14b-instruct-q4_K_M")
+        self.assertEqual(tech_fallbacks[:2], ["ollama/deepseek-r1:14b", "gemini/gemini-2.5-flash"])
+
+        self.assertEqual(risk_primary, "ollama/deepseek-r1:14b")
+        self.assertIn("ollama/qwen2.5:14b-instruct-q4_K_M", risk_fallbacks)
+
+        self.assertEqual(decision_primary, "azure/gpt-5.4-nano")
+        self.assertEqual(decision_fallbacks[0], "gemini/gemini-2.5-flash")
+        self.assertIn("ollama/deepseek-r1:14b", decision_fallbacks)
+
+    @patch.dict(os.environ, {
+        "REBALANCE_LOCAL_MODEL": "ollama/qwen2.5:14b-instruct-q4_K_M",
+        "REBALANCE_DEBATE_MODEL": "ollama/deepseek-r1:14b",
+        "REBALANCE_CLOUD_MODEL": "azure/gpt-5.4-nano",
+        "REBALANCE_CLOUD_FALLBACK": "gemini/gemini-2.5-flash",
+    }, clear=False)
+    def test_run_passes_model_route_to_runner(self):
+        agent = self._make_agent("technical")
+        ctx = AgentContext(query="test", stock_code="600519")
+
+        loop_result = SimpleNamespace(
+            success=True,
+            content='{"signal":"hold","confidence":0.5,"reasoning":"ok"}',
+            total_tokens=12,
+            tool_calls_log=[],
+            models_used=["ollama/qwen2.5:14b-instruct-q4_K_M"],
+        )
+
+        with patch("src.agent.agents.base_agent.run_agent_loop", return_value=loop_result) as mock_run:
+            result = agent.run(ctx)
+
+        self.assertTrue(result.success)
+        self.assertEqual(
+            mock_run.call_args.kwargs["model_override"],
+            "ollama/qwen2.5:14b-instruct-q4_K_M",
+        )
+        self.assertIn(
+            "ollama/deepseek-r1:14b",
+            mock_run.call_args.kwargs["fallback_models_override"],
+        )
+
+
 class TestRiskOverride(unittest.TestCase):
     """Test orchestrator-level risk override integration."""
 

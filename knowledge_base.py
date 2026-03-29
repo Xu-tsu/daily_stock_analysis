@@ -213,7 +213,7 @@ def sync_trades_to_knowledge_base() -> Dict[str, Any]:
             f"交易记录: {s['trade_date']} {result_label}",
             f"股票: {s['name']}({s['code']})",
             f"买入价: {s['buy_price']}, 卖出价: {s['price']}",
-            f"盈亏: {s['pnl']}元({s['pnl_pct']}%), 持仓{s['hold_days']}天",
+            f"盈亏: {s['pnl']}元({s['pnl_pct']}%), 持仓{s['hold_days']}个交易日",
         ]
 
         if s.get("ma_trend"):

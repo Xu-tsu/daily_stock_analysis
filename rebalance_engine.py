@@ -22,10 +22,12 @@ logger = logging.getLogger(__name__)
 
 # ── 导入项目已有模块 ──
 from src.config import Config, get_config
+from src.core.trading_calendar import count_stock_trading_days
 from macro_data_collector import collect_full_macro_data
 from portfolio_manager import (
     load_portfolio, update_current_prices, format_rebalance_report,
 )
+from src.services.trade_sizing_service import annotate_a_share_trade_suggestions
 
 # 蒸馏数据保存目录
 DISTILL_DIR = Path("data/distillation")
@@ -359,13 +361,16 @@ def _generate_rules_only_advice(portfolio: dict) -> dict:
         sellable = h.get("sellable_shares", h.get("shares", 0))
 
         # 计算持仓天数
-        hold_days = 0
-        if h.get("buy_date"):
-            try:
-                bd = datetime.strptime(h["buy_date"][:10], "%Y-%m-%d")
-                hold_days = (today - bd).days
-            except (ValueError, TypeError):
-                pass
+        hold_days = (
+            count_stock_trading_days(
+                h.get("code", ""),
+                h.get("buy_date", ""),
+                today,
+                default_market="cn",
+            )
+            if h.get("buy_date")
+            else 0
+        ) or 0
 
         action_item = {
             "code": code, "name": name,
@@ -388,13 +393,13 @@ def _generate_rules_only_advice(portfolio: dict) -> dict:
         elif hold_days >= 7 and pnl < 5.0 and sellable > 0:
             action_item.update({
                 "action": "sell", "ratio": "清仓",
-                "detail": f"超期清仓: 持仓{hold_days}天，盈利{pnl:.1f}%不足5%，可卖{sellable}股",
+                "detail": f"超期清仓: 持仓{hold_days}个交易日，盈利{pnl:.1f}%不足5%，可卖{sellable}股",
                 "reason": "所有模型不可用，纯规则引擎：超7天+盈利不足清仓",
             })
         else:
             action_item.update({
                 "action": "hold", "ratio": "维持",
-                "detail": f"持仓{hold_days}天，盈亏{pnl:.1f}%，暂无触发条件",
+                "detail": f"持仓{hold_days}个交易日，盈亏{pnl:.1f}%，暂无触发条件",
                 "reason": "所有模型不可用，无触发止损/超期规则，默认持有",
             })
         actions.append(action_item)
@@ -699,7 +704,7 @@ PROMPT_REBALANCE_FINAL = """你是一位经验丰富的A股短线交易员，擅
 5. **每只股票必须给出 target_sell_price（目标卖出价）和 stop_loss_price（止损价）**
 6. **每只股票必须给出 sell_timing（什么条件下卖出）**，如"盈利5%或跌破MA5卖出"
 7. 标注风险等级
-8. 持仓天数必须严格按照 buy_date 字段计算到今天的日历天数，不要编造
+8. 持仓天数必须严格按照 buy_date 字段计算到今天的交易日数，不要编造
 9. 如果大盘极弱，可以建议空仓等待，但一旦有板块异动要给出抄底候选
 
 请严格按以下 JSON 格式回复：
@@ -943,29 +948,42 @@ def run_rebalance_analysis(config: Config = None) -> dict:
     hot_picks = filtered_hot[:10]
 
     # 构建持仓JSON（三步辩论共用）
+    portfolio_holdings = []
+    now = datetime.now()
+    for hh in portfolio.get("holdings", []):
+        hold_days = None
+        if hh.get("buy_date"):
+            hold_days = count_stock_trading_days(
+                hh.get("code", ""),
+                hh.get("buy_date", ""),
+                now,
+                default_market="cn",
+            )
+        portfolio_holdings.append(
+            {
+                "code": hh["code"],
+                "name": hh.get("name", ""),
+                "shares": hh.get("shares", 0),
+                "sellable_shares": hh.get("sellable_shares", hh.get("shares", 0)),
+                "cost_price": hh.get("cost_price", 0),
+                "current_price": hh.get("current_price", 0),
+                "pnl_pct": hh.get("pnl_pct", 0),
+                "sector": hh.get("sector", ""),
+                "buy_date": hh.get("buy_date", ""),
+                "hold_days": hold_days if hold_days is not None else "未知",
+            }
+        )
+
     portfolio_json = json.dumps(
         {
             "cash": portfolio.get("cash", 0),
             "total_asset": portfolio.get("total_asset", 0),
             "actual_position_ratio": portfolio.get("actual_position_ratio", 0),
-            "today": datetime.now().strftime("%Y-%m-%d"),
-            "holdings": [
-                {
-                    "code": hh["code"],
-                    "name": hh.get("name", ""),
-                    "shares": hh.get("shares", 0),
-                    "sellable_shares": hh.get("sellable_shares", hh.get("shares", 0)),
-                    "cost_price": hh.get("cost_price", 0),
-                    "current_price": hh.get("current_price", 0),
-                    "pnl_pct": hh.get("pnl_pct", 0),
-                    "sector": hh.get("sector", ""),
-                    "buy_date": hh.get("buy_date", ""),
-                    "hold_days": (datetime.now() - datetime.strptime(hh["buy_date"], "%Y-%m-%d")).days if hh.get("buy_date") else "未知",
-                }
-                for hh in portfolio.get("holdings", [])
-            ],
+            "today": now.strftime("%Y-%m-%d"),
+            "holdings": portfolio_holdings,
         },
-        ensure_ascii=False, indent=2,
+        ensure_ascii=False,
+        indent=2,
     )
     hot_picks_json = json.dumps(hot_picks[:10], ensure_ascii=False, indent=2)
 
@@ -1117,6 +1135,25 @@ def run_rebalance_analysis(config: Config = None) -> dict:
         f"总仓位建议: {rebalance.get('overall_position_advice', 'N/A')}"
     )
 
+    try:
+        from risk_control import MAX_SINGLE_POSITION_PCT
+
+        annotated_actions, annotated_candidates, execution_profile = annotate_a_share_trade_suggestions(
+            actions=rebalance.get("actions", []),
+            holdings=portfolio.get("holdings", []),
+            cash=portfolio.get("cash", 0),
+            total_asset=portfolio.get("total_asset", 0),
+            candidates=rebalance.get("new_candidates", []),
+            max_single_position_pct=MAX_SINGLE_POSITION_PCT,
+        )
+        rebalance["actions"] = annotated_actions
+        rebalance["new_candidates"] = annotated_candidates
+        rebalance.setdefault("_meta", {})
+        rebalance["_meta"]["execution_profile_source"] = execution_profile.source
+        rebalance["_meta"]["execution_profile_samples"] = execution_profile.sample_size
+    except Exception as e:
+        logger.warning("[执行数量规划] 生成整手数量失败，保留原始建议: %s", e)
+
     rebalance["_meta"] = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "elapsed_seconds": elapsed,
@@ -1124,6 +1161,7 @@ def run_rebalance_analysis(config: Config = None) -> dict:
         "agents_used": debate_mode,
         "local_model": os.getenv("REBALANCE_LOCAL_MODEL", "unknown"),
         "cloud_model": cloud_model,
+        **rebalance.get("_meta", {}),
     }
 
     return rebalance

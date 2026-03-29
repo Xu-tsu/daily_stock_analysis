@@ -158,6 +158,10 @@ class TestOpeningAuctionMonitor(unittest.TestCase):
                     "name": "宁德时代",
                     "action": "buy",
                     "ratio": "加仓约3000元",
+                    "suggested_shares": 200,
+                    "suggested_lots": 2,
+                    "reference_price": 14.8,
+                    "estimated_cash_out": 2965.92,
                     "change_pct": -1.2,
                     "pnl_pct": 2.4,
                     "strategy_label": "强势回踩加仓",
@@ -175,6 +179,8 @@ class TestOpeningAuctionMonitor(unittest.TestCase):
         self.assertIn("午后偏强", alert)
         self.assertIn("机器人", alert)
         self.assertIn("[强势回踩加仓]", alert)
+        self.assertIn("建议 200股", alert)
+        self.assertIn("总支出 2965.92元", alert)
 
     def test_build_intraday_portfolio_advice_adds_winner_and_blocks_averaging_down(self) -> None:
         summary = {
@@ -254,6 +260,55 @@ class TestOpeningAuctionMonitor(unittest.TestCase):
         self.assertEqual(action_by_code["000001"]["action"], "hold")
         self.assertEqual(action_by_code["000001"]["strategy"], "wait_for_base")
         self.assertEqual(advice["rotation_candidates"][0]["code"], "002594")
+
+    def test_build_intraday_portfolio_advice_generates_round_lot_quantity(self) -> None:
+        summary = {
+            "bias": "positive",
+            "bias_label": "午后偏强",
+            "avg_change_pct": 0.88,
+            "high_risk_count": 0,
+        }
+        portfolio = {
+            "cash": 8000,
+            "total_asset": 80000,
+            "actual_position_ratio": 0.44,
+            "holdings": [
+                {
+                    "code": "600011",
+                    "name": "华能国际",
+                    "sector": "电力",
+                    "shares": 200,
+                    "sellable_shares": 200,
+                    "cost_price": 9.8,
+                    "current_price": 10.1,
+                    "market_value": 2020.0,
+                    "pnl_pct": 3.06,
+                }
+            ],
+        }
+        holding_quotes = {
+            "600011": {"change_pct": -1.1},
+        }
+        sectors = [
+            {"name": "电力", "change_pct": 2.0, "main_net": 8600},
+            {"name": "算力", "change_pct": 1.5, "main_net": 5200},
+            {"name": "CPO", "change_pct": 1.2, "main_net": 4100},
+        ]
+
+        advice = build_intraday_portfolio_advice(
+            summary=summary,
+            portfolio=portfolio,
+            holding_quotes=holding_quotes,
+            sectors=sectors,
+            risk_alerts=[],
+            rotation_candidates=[],
+        )
+
+        action = {item["code"]: item for item in advice["actions"]}["600011"]
+        self.assertEqual(action["action"], "buy")
+        self.assertGreater(action["suggested_shares"], 0)
+        self.assertEqual(action["suggested_shares"] % 100, 0)
+        self.assertIn("estimated_cash_out", action)
 
     def test_build_intraday_portfolio_advice_allows_sector_reflow_average_down(self) -> None:
         summary = {

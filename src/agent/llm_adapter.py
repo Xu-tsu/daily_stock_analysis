@@ -200,6 +200,8 @@ class LLMToolAdapter:
         messages: List[Dict[str, Any]],
         tools: List[dict],
         provider: Optional[str] = None,
+        model_override: Optional[str] = None,
+        fallback_models_override: Optional[List[str]] = None,
     ) -> LLMResponse:
         """Send messages + tool declarations to LLM, return normalized response.
 
@@ -212,7 +214,13 @@ class LLMToolAdapter:
         Returns:
             LLMResponse with either content (final answer) or tool_calls.
         """
-        return self.call_completion(messages, tools=tools, provider=provider)
+        return self.call_completion(
+            messages,
+            tools=tools,
+            provider=provider,
+            model_override=model_override,
+            fallback_models_override=fallback_models_override,
+        )
 
     def call_text(
         self,
@@ -222,6 +230,8 @@ class LLMToolAdapter:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
+        model_override: Optional[str] = None,
+        fallback_models_override: Optional[List[str]] = None,
     ) -> LLMResponse:
         """Send a text-only completion through the shared routing stack."""
         return self.call_completion(
@@ -231,6 +241,8 @@ class LLMToolAdapter:
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            model_override=model_override,
+            fallback_models_override=fallback_models_override,
         )
 
     def call_completion(
@@ -242,11 +254,21 @@ class LLMToolAdapter:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
+        model_override: Optional[str] = None,
+        fallback_models_override: Optional[List[str]] = None,
     ) -> LLMResponse:
         """Shared completion path for both tool and text-only calls."""
         config = self._config
-        models_to_try = [config.litellm_model] + (config.litellm_fallback_models or [])
+        if model_override or fallback_models_override is not None:
+            primary_model = model_override or config.litellm_model
+            fallback_models = fallback_models_override or []
+        else:
+            primary_model = config.litellm_model
+            fallback_models = config.litellm_fallback_models or []
+
+        models_to_try = [primary_model] + list(fallback_models)
         models_to_try = [m for m in models_to_try if m]
+        models_to_try = list(dict.fromkeys(models_to_try))
 
         last_error = None
         _skip_providers: set = set()

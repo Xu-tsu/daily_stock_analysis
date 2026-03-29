@@ -18,6 +18,8 @@ import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from src.core.trading_calendar import count_stock_trading_days
+
 logger = logging.getLogger(__name__)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -97,11 +99,12 @@ def _get_hold_days(holding: Dict[str, Any], today: datetime) -> Optional[int]:
     buy_date_str = holding.get("buy_date", "")
     if not buy_date_str:
         return None
-    try:
-        buy_date = datetime.strptime(str(buy_date_str)[:10], "%Y-%m-%d")
-        return (today - buy_date).days
-    except (ValueError, TypeError):
-        return None
+    return count_stock_trading_days(
+        str(holding.get("code", "") or ""),
+        buy_date_str,
+        today,
+        default_market="cn",
+    )
 
 
 def _extract_sector_confirmation(
@@ -196,7 +199,7 @@ def _market_supports_base_position(
     if auction_direction == "weak":
         blockers.append("集合竞价偏弱")
     if hold_days is not None and hold_days >= HOLD_DAYS_WARNING:
-        blockers.append(f"持仓{hold_days}天，已超短线优势窗口")
+        blockers.append(f"持仓{hold_days}个交易日，已超短线优势窗口")
 
     return len(blockers) == 0, blockers, sector_confirmation
 
@@ -330,7 +333,7 @@ def check_stop_loss(
                     "critical",
                     code,
                     name,
-                    f"持仓{hold_days}天且盈利不足5%，已超短线效率边界，优先退出。",
+                    f"持仓{hold_days}个交易日且盈利不足5%，已超短线效率边界，优先退出。",
                     "force_sell",
                 )
             )
@@ -340,7 +343,7 @@ def check_stop_loss(
                     "warning",
                     code,
                     name,
-                    f"持仓{hold_days}天，必须复盘是否继续持有。",
+                    f"持仓{hold_days}个交易日，必须复盘是否继续持有。",
                     "review",
                 )
             )
@@ -350,7 +353,7 @@ def check_stop_loss(
                     "info",
                     code,
                     name,
-                    f"持仓{hold_days}天，短线胜率开始衰减，注意别把短线做成长线。",
+                    f"持仓{hold_days}个交易日，短线胜率开始衰减，注意别把短线做成长线。",
                     "review",
                 )
             )
@@ -599,4 +602,3 @@ def build_adaptive_trading_rules(
 
 
 TRADING_RULES_FOR_LLM = build_adaptive_trading_rules()
-

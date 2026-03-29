@@ -13,8 +13,8 @@
 """
 
 import logging
-from datetime import date, datetime
-from typing import Optional, Set
+from datetime import date, datetime, timedelta
+from typing import Optional, Set, Union
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +38,15 @@ MARKET_TIMEZONE = {
     "hk": "Asia/Hong_Kong",
     "us": "America/New_York",
 }
+
+DateLike = Union[date, datetime, str]
+
+
+def _weekday_fallback(market: Optional[str], check_date: date) -> bool:
+    """Fallback session check when exchange calendars are unavailable/outdated."""
+    if market in {"cn", "hk", "us"}:
+        return check_date.weekday() < 5
+    return True
 
 
 def get_market_for_stock(code: str) -> Optional[str]:
@@ -77,17 +86,89 @@ def is_market_open(market: str, check_date: date) -> bool:
         True if trading day (or fail-open), False otherwise
     """
     if not _XCALS_AVAILABLE:
-        return True
+        return _weekday_fallback(market, check_date)
     ex = MARKET_EXCHANGE.get(market)
     if not ex:
         return True
     try:
         cal = xcals.get_calendar(ex)
+        if check_date < cal.first_session.date() or check_date > cal.last_session.date():
+            return _weekday_fallback(market, check_date)
         session = datetime(check_date.year, check_date.month, check_date.day)
         return cal.is_session(session)
     except Exception as e:
         logger.warning("trading_calendar.is_market_open fail-open: %s", e)
-        return True
+        return _weekday_fallback(market, check_date)
+
+
+def _coerce_date(value: DateLike) -> Optional[date]:
+    """Convert common date-like inputs to ``date``."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return datetime.strptime(text[:10], "%Y-%m-%d").date()
+        except ValueError:
+            return None
+    return None
+
+
+def count_trading_days(
+    start_date: DateLike,
+    end_date: DateLike,
+    market: str = "cn",
+    *,
+    include_start: bool = False,
+    include_end: bool = True,
+) -> Optional[int]:
+    """Count trading sessions between two dates.
+
+    The default holding-period convention is:
+    - exclude the buy/open date
+    - include the current/sell date when it is a trading session
+
+    This keeps same-day positions at ``0`` while avoiding weekends/holidays.
+    """
+    start = _coerce_date(start_date)
+    end = _coerce_date(end_date)
+    if start is None or end is None:
+        return None
+    if end < start:
+        return 0
+
+    current = start
+    sessions = 0
+    while current <= end:
+        if (current != start or include_start) and (current != end or include_end):
+            if is_market_open(market, current):
+                sessions += 1
+        current += timedelta(days=1)
+    return sessions
+
+
+def count_stock_trading_days(
+    stock_code: str,
+    start_date: DateLike,
+    end_date: DateLike,
+    *,
+    default_market: str = "cn",
+    include_start: bool = False,
+    include_end: bool = True,
+) -> Optional[int]:
+    """Count trading days using the stock's market, defaulting to A-shares."""
+    market = get_market_for_stock(stock_code) or default_market
+    return count_trading_days(
+        start_date,
+        end_date,
+        market=market,
+        include_start=include_start,
+        include_end=include_end,
+    )
 
 
 def get_open_markets_today() -> Set[str]:
