@@ -363,6 +363,8 @@ python main.py --monitor --interval 5
 - **Bot 命令**：`/ask` 策略分析（支持多股对比）、`/chat` 自由对话
 - **自定义策略**：在 `strategies/` 目录下新建 YAML 文件即可添加策略，无需写代码
 - **多 Agent 架构**（实验性）：设置 `AGENT_ARCH=multi` 启用 Technical → Intel → Risk → Strategy → Decision 多 Agent 级联编排，通过 `AGENT_ORCHESTRATOR_MODE` 控制深度（quick/standard/full/strategy）。超时或中间阶段 JSON 解析失败时，系统会优先保留已完成阶段结果并降级生成最小可用仪表盘，避免整份报告直接退回默认占位。详见 [完整配置指南](docs/full-guide.md)
+- **市场总览约束**：多 Agent 模式现在会把市场总览直接注入到各阶段，包括特朗普/关税等突发、`09:15-09:25` 集合竞价方向、热门题材滚动资金、游资试板强弱、量化砸盘压力、当前持仓与板块强确认。
+- **自适应风控**：`-5%` 现在默认视为“风险复核线”而不是机械清仓线；只有在市场偏弱、板块不确认、宏观突发或量化压力偏高时才优先清仓。若市场偏强且主线资金、板块确认和仓位结构都支持，系统才会建议减仓后保留底仓做T。
 
 > **注意**：配置了任意 AI API Key 后，Agent 对话功能自动可用，无需手动设置 `AGENT_MODE=true`。如需显式关闭可设置 `AGENT_MODE=false`。每次对话会产生 LLM API 调用费用。若你手动修改了 `.env` 中的模型主备配置（如 `LITELLM_MODEL` / `LITELLM_FALLBACK_MODELS` / `LLM_CHANNELS`），需要重启服务或触发配置重载后，新进程才会按新模型生效。
 

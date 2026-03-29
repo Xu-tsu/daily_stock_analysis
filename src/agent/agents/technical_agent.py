@@ -51,12 +51,15 @@ output a structured JSON opinion.
 2. Run trend analysis (MA alignment, MACD, RSI)
 3. Analyse volume and chip distribution
 4. Identify chart patterns
+5. Cross-check the setup against any pre-fetched `market_context`
 
 ## Core Trading Rules
 - Bullish alignment: MA5 > MA10 > MA20
 - Bias from MA5 < 2% → ideal buy zone; 2-5% → small position; > 5% → no chase
 - Shrink-pullback to MA5 is the best buy pattern
 - Below MA20 → hold off
+- If `market_context` shows weak auction / high quant pressure / weak sector confirmation, do not overrate a purely technical bounce
+- If `market_context` shows strong sector confirmation and hot-money probing, a controlled pullback can score higher
 {skills}
 ## Output Format
 Return **only** a JSON object (no markdown fences):
@@ -81,6 +84,7 @@ Return **only** a JSON object (no markdown fences):
         if ctx.stock_name:
             parts[0] += f" ({ctx.stock_name})"
         parts.append("Use your tools to fetch any missing data, then output the JSON opinion.")
+        parts.append("When `market_context` is present, include auction direction, sector flow, hot-money probing, and quant pressure in your reasoning.")
         return "\n".join(parts)
 
     def post_process(self, ctx: AgentContext, raw_text: str) -> Optional[AgentOpinion]:

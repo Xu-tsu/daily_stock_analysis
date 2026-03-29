@@ -5,14 +5,19 @@ macro_data_collector.py — 海外可用版数据采集
 适用场景：在日本/海外环境无法访问东方财富API时使用
 所有函数返回结构化 dict，不消耗 LLM token
 """
+import copy
 import logging, os, re, time
 from datetime import datetime, timedelta
+from threading import Lock
 from typing import List, Optional
 
 import requests
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+_SEARXNG_CACHE = {}
+_SEARXNG_CACHE_LOCK = Lock()
+_SEARXNG_CACHE_TTL_SECONDS = 45.0
 
 # Tushare（可选，有 Token 时启用更多数据）
 TUSHARE_TOKEN = os.getenv("TUSHARE_TOKEN", "")
@@ -502,6 +507,12 @@ SENSITIVE_KEYWORDS = [
 
 def _searxng_search(query: str, max_results: int = 10) -> list:
     """通用 SearXNG 搜索"""
+    cache_key = (str(query).strip(), int(max_results))
+    now = time.time()
+    with _SEARXNG_CACHE_LOCK:
+        entry = _SEARXNG_CACHE.get(cache_key)
+        if entry and (now - entry["ts"]) <= _SEARXNG_CACHE_TTL_SECONDS:
+            return copy.deepcopy(entry["value"])
     try:
         r = requests.get(
             f"{SEARXNG_URL}/search",
@@ -518,6 +529,8 @@ def _searxng_search(query: str, max_results: int = 10) -> list:
                     "content": item.get("content", "")[:300],
                     "engine": item.get("engine", ""),
                 })
+            with _SEARXNG_CACHE_LOCK:
+                _SEARXNG_CACHE[cache_key] = {"ts": time.time(), "value": copy.deepcopy(results)}
             return results
     except Exception as e:
         logger.warning(f"SearXNG 搜索失败: {e}")

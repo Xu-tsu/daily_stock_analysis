@@ -15,9 +15,11 @@ market_monitor.py — 盘中全功能监控系统
   python market_monitor.py --backtest       # 手动回测
   python market_monitor.py --mainline       # 查看当前主线板块
 """
-import argparse, json, logging, os, time
+import argparse, copy, json, logging, os, time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Lock
 from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -30,6 +32,93 @@ CN_INDEX_CODES = [
     ("sz399001", "深证成指"),
     ("sz399006", "创业板指"),
 ]
+
+_RUNTIME_CACHE: Dict[str, dict] = {}
+_RUNTIME_CACHE_LOCK = Lock()
+
+
+def _cache_key(*parts: object) -> str:
+    normalized = []
+    for part in parts:
+        if isinstance(part, (list, tuple, set)):
+            normalized.append(tuple(str(item) for item in part))
+        else:
+            normalized.append(part)
+    return repr(tuple(normalized))
+
+
+def _get_or_load_cached(cache_key: str, ttl_seconds: float, loader):
+    now = time.time()
+    with _RUNTIME_CACHE_LOCK:
+        entry = _RUNTIME_CACHE.get(cache_key)
+        if entry and (now - entry["ts"]) <= ttl_seconds:
+            return copy.deepcopy(entry["value"])
+
+    value = loader()
+    with _RUNTIME_CACHE_LOCK:
+        _RUNTIME_CACHE[cache_key] = {"ts": time.time(), "value": copy.deepcopy(value)}
+    return value
+
+
+def _fetch_quotes_cached(tc_codes: list, timeout: int = 8, ttl_seconds: float = 5.0) -> dict:
+    from macro_data_collector import _fetch_tencent_quote
+
+    normalized_codes = tuple(sorted(str(code) for code in tc_codes if code))
+    if not normalized_codes:
+        return {}
+    return _get_or_load_cached(
+        _cache_key("quotes", normalized_codes, timeout),
+        ttl_seconds,
+        lambda: _fetch_tencent_quote(list(normalized_codes), timeout=timeout),
+    )
+
+
+def _fetch_sector_flow_cached(
+    sector_type: str = "hy",
+    top_n: int = 5,
+    ttl_seconds: float = 20.0,
+) -> list:
+    from ths_scraper import fetch_sector_fund_flow_rank
+
+    return _get_or_load_cached(
+        _cache_key("sector_flow", sector_type, top_n),
+        ttl_seconds,
+        lambda: fetch_sector_fund_flow_rank(sector_type, top_n=top_n),
+    )
+
+
+def _fetch_hot_candidates_cached(
+    max_price: float = 15.0,
+    top_n: int = 5,
+    ttl_seconds: float = 20.0,
+) -> list:
+    from ths_scraper import fetch_hot_stocks_for_candidate
+
+    return _get_or_load_cached(
+        _cache_key("hot_candidates", max_price, top_n),
+        ttl_seconds,
+        lambda: fetch_hot_stocks_for_candidate(max_price=max_price, top_n=top_n),
+    )
+
+
+def _fetch_financial_news_cached(ttl_seconds: float = 45.0) -> dict:
+    from macro_data_collector import fetch_financial_news
+
+    return _get_or_load_cached(
+        _cache_key("financial_news"),
+        ttl_seconds,
+        fetch_financial_news,
+    )
+
+
+def _fetch_trump_news_cached(ttl_seconds: float = 45.0) -> list:
+    from macro_data_collector import fetch_trump_news
+
+    return _get_or_load_cached(
+        _cache_key("trump_news"),
+        ttl_seconds,
+        fetch_trump_news,
+    )
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -136,14 +225,21 @@ def analyze_mainline() -> dict:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 3. 盘中异动检测
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def check_market_anomaly() -> dict:
+def check_market_anomaly(
+    index_quotes: Optional[dict] = None,
+    holdings: Optional[list] = None,
+    trump_news: Optional[list] = None,
+) -> dict:
     """检测指数/持仓/新闻异动"""
     anomalies = []
 
     # 指数异动
     try:
-        from macro_data_collector import _fetch_tencent_quote
-        quotes = _fetch_tencent_quote(["sh000001", "sz399001", "sz399006"])
+        quotes = index_quotes if isinstance(index_quotes, dict) else _fetch_quotes_cached(
+            [code for code, _ in CN_INDEX_CODES],
+            timeout=8,
+            ttl_seconds=5.0,
+        )
         for tc, name in [("sh000001", "上证指数"), ("sz399001", "深证成指"), ("sz399006", "创业板指")]:
             q = quotes.get(tc, {})
             chg = q.get("change_pct", 0)
@@ -163,13 +259,15 @@ def check_market_anomaly() -> dict:
 
     # 持仓股异动
     try:
-        from portfolio_manager import load_portfolio
-        from macro_data_collector import _fetch_tencent_quote, _stock_code_to_tencent
-        portfolio = load_portfolio()
-        holdings = portfolio.get("holdings", [])
+        from macro_data_collector import _stock_code_to_tencent
+        if holdings is None:
+            from portfolio_manager import load_portfolio
+
+            portfolio = load_portfolio()
+            holdings = portfolio.get("holdings", [])
         if holdings:
-            tc_codes = [_stock_code_to_tencent(h["code"]) for h in holdings]
-            quotes = _fetch_tencent_quote(tc_codes)
+            tc_codes = [_stock_code_to_tencent(h["code"]) for h in holdings if h.get("code")]
+            quotes = _fetch_quotes_cached(tc_codes, timeout=8, ttl_seconds=5.0)
             for h in holdings:
                 tc = _stock_code_to_tencent(h["code"])
                 q = quotes.get(tc, {})
@@ -191,9 +289,9 @@ def check_market_anomaly() -> dict:
 
     # 特朗普新闻
     try:
-        from macro_data_collector import fetch_trump_news as _trump
-        trump_news = _trump()
-    except:
+        if trump_news is None:
+            trump_news = _fetch_trump_news_cached(ttl_seconds=45.0)
+    except Exception:
         trump_news = []
     sensitive = [n for n in trump_news if n.get("is_sensitive")]
     if sensitive:
@@ -363,7 +461,9 @@ def collect_opening_auction_sample(watchlist: list) -> Optional[dict]:
     if not watchlist:
         return None
 
-    from macro_data_collector import _fetch_tencent_quote, _stock_code_to_tencent
+    from macro_data_collector import (
+        _stock_code_to_tencent,
+    )
 
     code_map = {
         stock["code"]: _stock_code_to_tencent(stock["code"])
@@ -373,7 +473,7 @@ def collect_opening_auction_sample(watchlist: list) -> Optional[dict]:
     if not code_map:
         return None
 
-    quotes = _fetch_tencent_quote(list(code_map.values()), timeout=8)
+    quotes = _fetch_quotes_cached(list(code_map.values()), timeout=8, ttl_seconds=5.0)
     stocks = []
     for stock in watchlist:
         code = stock.get("code")
@@ -632,6 +732,325 @@ def build_intraday_checkpoint_summary(
         "high_risk_count": high_risk_count,
         "anomalies": anomalies[:3],
     }
+
+
+def compose_market_decision_context(
+    summary: dict,
+    sectors: list,
+    anomaly_result: Optional[dict] = None,
+    hot_candidates: Optional[list] = None,
+    auction_summary: Optional[dict] = None,
+    financial_news: Optional[dict] = None,
+    stock_code: str = "",
+    stock_name: str = "",
+    stock_sector: str = "",
+) -> dict:
+    """Compose a reusable market context for agent prompts and adaptive rules."""
+
+    anomalies = list((anomaly_result or {}).get("anomalies") or summary.get("anomalies") or [])
+    trump_news = list((anomaly_result or {}).get("trump_news") or [])
+    sensitive_trump_news = [item for item in trump_news if item.get("is_sensitive")]
+    sensitive_financial_news = list((financial_news or {}).get("sensitive") or [])
+
+    top_sectors = []
+    for rank, sector in enumerate(sectors or [], start=1):
+        top_sectors.append({
+            "name": str(sector.get("name", "") or "").strip(),
+            "rank": rank,
+            "change_pct": round(float(sector.get("change_pct", 0) or 0), 2),
+            "main_net": round(float(sector.get("main_net", 0) or 0), 2),
+        })
+
+    bias = str(summary.get("bias", "neutral") or "neutral").strip().lower()
+    avg_change_pct = float(summary.get("avg_change_pct", 0) or 0)
+    high_risk_count = int(summary.get("high_risk_count", 0) or 0)
+    positive_sector_count = sum(1 for sector in top_sectors if float(sector.get("main_net", 0) or 0) > 0)
+
+    headline_pressure = len(sensitive_trump_news) * 2 + len(sensitive_financial_news)
+    if headline_pressure >= 4:
+        macro_risk_level = "high"
+    elif headline_pressure >= 2:
+        macro_risk_level = "medium"
+    else:
+        macro_risk_level = "low"
+
+    hot_money_targets = []
+    for candidate in hot_candidates or []:
+        change_pct = float(candidate.get("change_pct", 0) or 0)
+        main_net = float(candidate.get("main_net", 0) or 0)
+        if main_net <= 0:
+            continue
+        hot_money_targets.append({
+            "code": str(candidate.get("code", "") or "").strip(),
+            "name": str(candidate.get("name", "") or "").strip(),
+            "change_pct": round(change_pct, 2),
+            "main_net": round(main_net, 2),
+        })
+
+    active_probe_targets = [
+        target
+        for target in hot_money_targets
+        if 1.0 <= float(target.get("change_pct", 0) or 0) <= 9.5
+        and float(target.get("main_net", 0) or 0) >= 2000
+    ]
+    if len(active_probe_targets) >= 2:
+        hot_money_signal = "active"
+    elif len(active_probe_targets) == 1:
+        hot_money_signal = "constructive"
+    else:
+        hot_money_signal = "quiet"
+
+    quant_pressure_score = 0
+    if bias == "negative":
+        quant_pressure_score += 2
+    if avg_change_pct <= -0.8:
+        quant_pressure_score += 1
+    if high_risk_count >= 2:
+        quant_pressure_score += 1
+    if positive_sector_count > 0 and avg_change_pct < -0.5:
+        quant_pressure_score += 1
+    if headline_pressure >= 4:
+        quant_pressure_score += 1
+    quant_signal = "high" if quant_pressure_score >= 4 else "medium" if quant_pressure_score >= 2 else "low"
+
+    market_score = (
+        {"positive": 0.9, "neutral": 0.0, "negative": -0.9}.get(bias, 0.0)
+        + max(min(avg_change_pct / 1.2, 1.2), -1.2)
+        + min(positive_sector_count * 0.15, 0.45)
+        - min(high_risk_count * 0.35, 1.05)
+        - (0.45 if macro_risk_level == "high" else 0.2 if macro_risk_level == "medium" else 0.0)
+        - (0.35 if quant_signal == "high" else 0.12 if quant_signal == "medium" else 0.0)
+    )
+    market_score = round(max(min(market_score, 2.5), -2.5), 2)
+
+    stock_sector_name = str(stock_sector or "").strip()
+    sector_confirmation = {
+        "code": stock_code,
+        "name": stock_name,
+        "sector": stock_sector_name,
+        "confirmed": False,
+        "strength": "weak",
+        "rank": None,
+        "change_pct": 0.0,
+        "main_net": 0.0,
+        "reason": "未找到对应板块确认",
+    }
+    if stock_sector_name:
+        for sector in top_sectors:
+            if sector.get("name") != stock_sector_name:
+                continue
+            confirmed = (
+                float(sector.get("main_net", 0) or 0) > 0
+                and float(sector.get("change_pct", 0) or 0) >= 0.8
+                and bias != "negative"
+            )
+            strength = (
+                "strong"
+                if confirmed and int(sector.get("rank") or 99) <= 3 and float(sector.get("main_net", 0) or 0) >= 5000
+                else "medium"
+                if confirmed
+                else "weak"
+            )
+            reason = (
+                f"{stock_sector_name} 排名 {sector.get('rank')}，涨跌 {float(sector.get('change_pct', 0) or 0):+.2f}%，"
+                f"主力净流入 {float(sector.get('main_net', 0) or 0):.0f} 万"
+            )
+            sector_confirmation = {
+                **sector_confirmation,
+                "confirmed": confirmed,
+                "strength": strength,
+                "rank": sector.get("rank"),
+                "change_pct": sector.get("change_pct"),
+                "main_net": sector.get("main_net"),
+                "reason": reason,
+            }
+            break
+
+    opening_auction = {
+        "status": "out_of_window",
+        "direction": "unavailable",
+        "watchlist_size": 0,
+        "strong_count": 0,
+        "weak_count": 0,
+        "focus_stock": None,
+    }
+    if auction_summary:
+        focus_stock = None
+        for item in auction_summary.get("stocks") or []:
+            if item.get("code") == stock_code:
+                focus_stock = {
+                    "code": item.get("code"),
+                    "name": item.get("name"),
+                    "change_pct": round(float(item.get("change_pct", 0) or 0), 2),
+                    "auction_amount": round(float(item.get("auction_amount", 0) or 0), 2),
+                    "imbalance_pct": round(float(item.get("imbalance_pct", 0) or 0), 2),
+                    "flow_score": round(float(item.get("flow_score", 0) or 0), 2),
+                }
+                break
+        strong_count = len(auction_summary.get("strong") or [])
+        weak_count = len(auction_summary.get("weak") or [])
+        direction = "neutral"
+        if focus_stock:
+            if focus_stock["change_pct"] >= 0.5 and focus_stock["imbalance_pct"] >= 8:
+                direction = "strong"
+            elif focus_stock["change_pct"] <= -0.5 and focus_stock["imbalance_pct"] <= -8:
+                direction = "weak"
+        elif strong_count > weak_count:
+            direction = "strong"
+        elif weak_count > strong_count:
+            direction = "weak"
+        opening_auction = {
+            "status": "available",
+            "direction": direction,
+            "watchlist_size": int(auction_summary.get("watchlist_size", 0) or 0),
+            "strong_count": strong_count,
+            "weak_count": weak_count,
+            "focus_stock": focus_stock,
+        }
+
+    headline_sentiment = "neutral"
+    if macro_risk_level == "high":
+        headline_sentiment = "risk_off"
+    elif hot_money_signal == "active" and bias == "positive":
+        headline_sentiment = "risk_on"
+
+    return {
+        "timestamp": summary.get("timestamp") or _now_cn().strftime("%Y-%m-%d %H:%M:%S"),
+        "bias": bias,
+        "bias_label": summary.get("bias_label", ""),
+        "avg_change_pct": round(avg_change_pct, 2),
+        "market_score": market_score,
+        "high_risk_count": high_risk_count,
+        "headline_sentiment": headline_sentiment,
+        "macro_risk_level": macro_risk_level,
+        "decision_basis": [
+            "先看特朗普/关税等外部突发是否引发 risk-off",
+            "再看集合竞价与指数承接是否同步",
+            "再看主线题材资金是否持续回流",
+            "再看游资试板是否获得板块跟随",
+            "最后看量化砸盘压力与个股盈亏位置",
+        ],
+        "top_sectors": top_sectors[:5],
+        "sector_confirmation": sector_confirmation,
+        "opening_auction": opening_auction,
+        "hot_money_probe": {
+            "signal": hot_money_signal,
+            "targets": active_probe_targets[:3],
+        },
+        "quant_pressure": {
+            "signal": quant_signal,
+            "score": quant_pressure_score,
+        },
+        "headline_risk": {
+            "trump_sensitive_count": len(sensitive_trump_news),
+            "telegraph_sensitive_count": len(sensitive_financial_news),
+            "top_trump_news": sensitive_trump_news[:2],
+            "top_financial_news": sensitive_financial_news[:2],
+        },
+        "anomalies": anomalies[:3],
+    }
+
+
+def _select_market_context_checkpoint() -> str:
+    current_time = _time_cn()
+    if current_time.strftime("%H:%M") < "12:00":
+        return "morning_review"
+    return "afternoon_review"
+
+
+def build_agent_market_context(
+    stock_code: str = "",
+    stock_name: str = "",
+    stock_sector: str = "",
+) -> dict:
+    """Build a live market overview for multi-agent analysis."""
+
+    checkpoint = _select_market_context_checkpoint()
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures = {
+            "quotes": pool.submit(
+                _fetch_quotes_cached,
+                [code for code, _ in CN_INDEX_CODES],
+                8,
+                5.0,
+            ),
+            "sectors": pool.submit(_fetch_sector_flow_cached, "hy", 5, 20.0),
+            "hot_candidates": pool.submit(_fetch_hot_candidates_cached, 15.0, 5, 20.0),
+            "financial_news": pool.submit(_fetch_financial_news_cached, 45.0),
+            "trump_news": pool.submit(_fetch_trump_news_cached, 45.0),
+        }
+
+        quotes = futures["quotes"].result()
+        sectors = futures["sectors"].result()
+        try:
+            hot_candidates = futures["hot_candidates"].result()
+        except Exception as exc:
+            logger.debug("build_agent_market_context hot candidates failed: %s", exc)
+            hot_candidates = []
+        try:
+            financial_news = futures["financial_news"].result()
+        except Exception as exc:
+            logger.debug("build_agent_market_context financial news failed: %s", exc)
+            financial_news = {"all": [], "sensitive": []}
+        try:
+            trump_news = futures["trump_news"].result()
+        except Exception as exc:
+            logger.debug("build_agent_market_context trump news failed: %s", exc)
+            trump_news = []
+
+    anomaly_result = check_market_anomaly(index_quotes=quotes, trump_news=trump_news)
+    summary = build_intraday_checkpoint_summary(
+        checkpoint=checkpoint,
+        index_quotes=quotes,
+        sectors=sectors,
+        anomaly_result=anomaly_result,
+    )
+
+    auction_summary = None
+    if stock_code and is_opening_auction_window():
+        watchlist = [{"code": stock_code, "name": stock_name, "reason": "analysis"}]
+        sample = collect_opening_auction_sample(watchlist)
+        if sample:
+            auction_summary = summarize_opening_auction_state({
+                "watchlist": watchlist,
+                "samples": [sample],
+            })
+
+    return compose_market_decision_context(
+        summary=summary,
+        sectors=sectors,
+        anomaly_result=anomaly_result,
+        hot_candidates=hot_candidates,
+        auction_summary=auction_summary,
+        financial_news=financial_news,
+        stock_code=stock_code,
+        stock_name=stock_name,
+        stock_sector=stock_sector,
+    )
+
+    try:
+        hot_candidates = fetch_hot_stocks_for_candidate(max_price=15.0, top_n=5)
+    except Exception as exc:
+        logger.debug("构建 agent 市场上下文时获取热门资金失败: %s", exc)
+        hot_candidates = []
+
+    try:
+        financial_news = fetch_financial_news()
+    except Exception as exc:
+        logger.debug("构建 agent 市场上下文时获取财经快讯失败: %s", exc)
+        financial_news = {"all": [], "sensitive": []}
+
+    return compose_market_decision_context(
+        summary=summary,
+        sectors=sectors,
+        anomaly_result=anomaly_result,
+        hot_candidates=hot_candidates,
+        auction_summary=auction_summary,
+        financial_news=financial_news,
+        stock_code=stock_code,
+        stock_name=stock_name,
+        stock_sector=stock_sector,
+    )
 
 
 def build_intraday_portfolio_advice(
@@ -1036,7 +1455,7 @@ def build_intraday_portfolio_advice(
 
 def collect_intraday_portfolio_advice(summary: dict, sectors: list) -> dict:
     """Refresh holdings with realtime quotes, then derive intraday portfolio advice."""
-    from macro_data_collector import _fetch_tencent_quote, _stock_code_to_tencent
+    from macro_data_collector import _stock_code_to_tencent
     from portfolio_manager import (
         load_portfolio, sync_portfolio_from_trades, update_current_prices,
     )
@@ -1054,7 +1473,7 @@ def collect_intraday_portfolio_advice(summary: dict, sectors: list) -> dict:
         }
 
     tc_codes = [_stock_code_to_tencent(code) for code in holding_codes]
-    quotes = _fetch_tencent_quote(tc_codes, timeout=8)
+    quotes = _fetch_quotes_cached(tc_codes, timeout=8, ttl_seconds=5.0)
     quote_by_code = {}
     price_map = {}
     for code in holding_codes:
@@ -1066,16 +1485,33 @@ def collect_intraday_portfolio_advice(summary: dict, sectors: list) -> dict:
             price_map[code] = price
 
     portfolio = update_current_prices(portfolio, price_map)
-    risk_alerts = check_stop_loss(portfolio.get("holdings", []))
 
     rotation_candidates = []
     if summary.get("bias") != "negative":
         try:
-            from ths_scraper import fetch_hot_stocks_for_candidate
+            # Use cached hot-candidate snapshot to avoid duplicate network fetches.
 
-            rotation_candidates = fetch_hot_stocks_for_candidate(max_price=15.0, top_n=5)
+            rotation_candidates = _fetch_hot_candidates_cached(max_price=15.0, top_n=5, ttl_seconds=20.0)
         except Exception as e:
             logger.debug("转仓候选获取失败，跳过: %s", e)
+
+    try:
+        financial_news = _fetch_financial_news_cached(ttl_seconds=45.0)
+    except Exception as e:
+        logger.debug("盘中调仓获取财经快讯失败，跳过: %s", e)
+        financial_news = {"all": [], "sensitive": []}
+
+    market_context = compose_market_decision_context(
+        summary=summary,
+        sectors=sectors,
+        anomaly_result={
+            "anomalies": summary.get("anomalies") or [],
+            "trump_news": [],
+        },
+        hot_candidates=rotation_candidates,
+        financial_news=financial_news,
+    )
+    risk_alerts = check_stop_loss(portfolio.get("holdings", []), market_context=market_context)
 
     return build_intraday_portfolio_advice(
         summary=summary,

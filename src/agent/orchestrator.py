@@ -508,10 +508,28 @@ class AgentOrchestrator:
             ctx.meta["strategies_requested"] = context.get("strategies", [])
 
             # Pre-populate data fields that the caller already has
-            for data_key in ("realtime_quote", "daily_history", "chip_distribution",
-                             "trend_result", "news_context"):
+            for data_key in (
+                "realtime_quote",
+                "daily_history",
+                "chip_distribution",
+                "trend_result",
+                "news_context",
+                "market_context",
+                "current_holding",
+                "adaptive_trading_rules",
+                "fundamental_context",
+            ):
                 if context.get(data_key):
                     ctx.set_data(data_key, context[data_key])
+
+            market_context = context.get("market_context") or {}
+            if isinstance(market_context, dict):
+                ctx.meta["market_bias"] = market_context.get("bias", "")
+                ctx.meta["quant_pressure_signal"] = (
+                    (market_context.get("quant_pressure") or {}).get("signal", "")
+                )
+                sector_confirmation = market_context.get("sector_confirmation") or {}
+                ctx.meta["sector_hot"] = bool(sector_confirmation.get("confirmed"))
 
         # Try to extract stock code from the query text
         if not ctx.stock_code:
@@ -619,6 +637,9 @@ class AgentOrchestrator:
             "news_context",
             "intel_opinion",
             "fundamental_context",
+            "market_context",
+            "current_holding",
+            "adaptive_trading_rules",
         )
         has_meaningful_context = any(ctx.get_data(key) is not None for key in meaningful_data_keys)
         if not payload and not ctx.opinions and not has_meaningful_context:

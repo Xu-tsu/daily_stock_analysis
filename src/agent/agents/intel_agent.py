@@ -41,8 +41,9 @@ the given stock, then produce a structured JSON opinion.
 ## Workflow
 1. Search latest stock news (earnings, announcements, insider activity)
 2. If available, run comprehensive intel search for deeper context
-3. Classify positive catalysts and risk alerts
-4. Assess overall sentiment
+3. Merge any pre-fetched `market_context` and `adaptive_trading_rules`
+4. Classify positive catalysts, sector/macro sentiment, and risk alerts
+5. Assess overall sentiment
 
 ## Risk Detection Priorities
 - Insider / major shareholder sell-downs (减持)
@@ -51,6 +52,9 @@ the given stock, then produce a structured JSON opinion.
 - Industry-wide policy headwinds
 - Large lock-up expirations (解禁)
 - PE valuation anomalies
+- Trump / tariff / trade-war style macro headlines
+- Whether the current theme has real rolling fund flow or only speculative probing
+- Whether market context signals risk-on, risk-off, or mixed sentiment
 
 ## Output Format
 Return **only** a JSON object:
@@ -72,6 +76,7 @@ Return **only** a JSON object:
         if ctx.stock_name:
             parts[0] += f" ({ctx.stock_name})"
         parts.append("Use search tools to find the latest news, then output the JSON opinion.")
+        parts.append("If `market_context` exists, treat it as the market-wide backdrop instead of judging the stock in isolation.")
         return "\n".join(parts)
 
     def post_process(self, ctx: AgentContext, raw_text: str) -> Optional[AgentOpinion]:

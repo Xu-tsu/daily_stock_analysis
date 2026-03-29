@@ -324,12 +324,21 @@ def _apply_hard_rules(proposal: dict, portfolio: dict) -> dict:
         sellable = holding.get("sellable_shares", holding.get("shares", 0))
 
         # 硬规则1：亏损>5%必须清仓
-        if pnl <= -5.0 and action.get("action") not in ("sell",):
+        if pnl <= -8.0 and action.get("action") not in ("sell",):
             action["action"] = "sell"
             action["detail"] = f"硬规则风控: 亏损{pnl}%超5%止损线，强制清仓"
             action["reason"] = "止损5%硬规则触发"
 
         # 硬规则2：卖出数不能超过可卖余额
+            action["detail"] = f"自适应风控: 亏损{pnl}%已跌破-8%强制退出线，执行清仓"
+            action["reason"] = "深度亏损超出容错区间，优先保护本金"
+        elif pnl <= -5.0 and action.get("action") in ("buy", "hold"):
+            action["action"] = "reduce"
+            action["detail"] = f"自适应风控: 亏损{pnl}%已到风险复核线，先降到观察仓"
+            action["reason"] = "5%亏损先降风险，再看是否有板块回流确认"
+
+            action["detail"] = f"自适应风控: 亏损{pnl}%已到-5%风险复核线，先降到观察仓"
+            action["reason"] = "先降风险，再观察是否出现板块回流和资金承接"
         if action.get("action") in ("sell", "reduce") and sellable == 0:
             action["action"] = "hold"
             action["detail"] = f"T+1约束: 今天无可卖余额（全部为今日买入），只能明天操作"
@@ -364,11 +373,17 @@ def _generate_rules_only_advice(portfolio: dict) -> dict:
             "sell_timing": "模型不可用，仅硬规则判断",
         }
 
-        if pnl <= -5.0 and sellable > 0:
+        if pnl <= -8.0 and sellable > 0:
             action_item.update({
                 "action": "sell", "ratio": "清仓",
                 "detail": f"硬止损触发: 亏损{pnl:.1f}%超5%，可卖{sellable}股",
                 "reason": "所有模型不可用，纯规则引擎：止损5%强制清仓",
+            })
+        elif pnl <= -5.0 and sellable > 0:
+            action_item.update({
+                "action": "reduce", "ratio": "减仓50%",
+                "detail": f"风险复核线触发: 亏损{pnl:.1f}%已到5%附近，可卖{sellable}股",
+                "reason": "所有模型不可用，纯规则引擎：先降到观察仓，不再机械一刀切",
             })
         elif hold_days >= 7 and pnl < 5.0 and sellable > 0:
             action_item.update({

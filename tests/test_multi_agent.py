@@ -505,6 +505,27 @@ class TestOrchestratorModes(unittest.TestCase):
         self.assertEqual(ctx.stock_name, "贵州茅台")
         self.assertEqual(ctx.meta["strategies_requested"], ["bull_trend"])
 
+    def test_build_context_copies_market_context_meta(self):
+        orch = self._make_orchestrator()
+        ctx = orch._build_context(
+            "Analyze 600519",
+            context={
+                "stock_code": "600519",
+                "stock_name": "Maotai",
+                "market_context": {
+                    "bias": "positive",
+                    "quant_pressure": {"signal": "low"},
+                    "sector_confirmation": {"confirmed": True},
+                },
+                "adaptive_trading_rules": "rules",
+            },
+        )
+
+        self.assertEqual(ctx.meta["market_bias"], "positive")
+        self.assertEqual(ctx.meta["quant_pressure_signal"], "low")
+        self.assertTrue(ctx.meta["sector_hot"])
+        self.assertEqual(ctx.get_data("adaptive_trading_rules"), "rules")
+
     def test_build_context_extracts_code_from_query(self):
         orch = self._make_orchestrator()
         ctx = orch._build_context("分析600519的走势")

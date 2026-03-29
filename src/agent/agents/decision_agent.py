@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-DecisionAgent — final synthesis and decision-making specialist.
+DecisionAgent - final synthesis and decision-making specialist.
 
 Responsible for:
 - Aggregating opinions from technical + intel + risk + strategy agents
@@ -24,8 +24,8 @@ class DecisionAgent(BaseAgent):
     """Synthesise prior agent opinions into the final dashboard."""
 
     agent_name = "decision"
-    max_steps = 3  # pure synthesis, should not need many tool calls
-    tool_names: Optional[List[str]] = []  # no tool access — works from context only
+    max_steps = 3
+    tool_names: Optional[List[str]] = []
 
     @staticmethod
     def _is_chat_mode(ctx: AgentContext) -> bool:
@@ -45,6 +45,7 @@ Requirements:
 - Use Markdown when helpful
 - Keep the response practical and specific
 - Highlight the main signal, key reasoning, and major risks
+- Respect any pre-fetched `market_context`, `current_holding`, and `adaptive_trading_rules`
 - Do NOT output JSON or code fences unless the user explicitly asks for them
 """
 
@@ -53,29 +54,33 @@ Requirements:
             skills = f"\n## Active Trading Strategies\n\n{self.skill_instructions}\n"
 
         return f"""\
-You are a **Decision Synthesis Agent** that produces the final investment \
+You are a **Decision Synthesis Agent** that produces the final investment
 Decision Dashboard.
 
 You will receive:
 1. Structured opinions from a Technical Agent and an Intel Agent
 2. Any risk flags raised by a Risk Agent
 3. Strategy evaluation results (if applicable)
+4. Pre-fetched `market_context`, `current_holding`, and `adaptive_trading_rules` when available
 
 Your task: synthesise all inputs into a single, actionable Decision Dashboard.
 {skills}
 ## Core Principles
-1. **Core conclusion first** — one sentence, ≤30 chars
-2. **Split advice** — different for no-position vs has-position
-3. **Precise sniper levels** — concrete price numbers, no hedging
-4. **Checklist visual** — ✅⚠️❌ for each checkpoint
-5. **Risk priority** — risk alerts must be prominent. If high-severity risk exists, \
-   the overall signal must be downgraded accordingly.
+1. **Core conclusion first** - one sentence, <= 40 chars
+2. **Split advice** - different for no-position vs has-position
+3. **Precise sniper levels** - concrete price numbers, no hedging
+4. **Checklist visual** - make the critical checkpoints obvious
+5. **Risk priority** - risk alerts and adaptive trading rules must be prominent
+6. **Market first** - opening auction, macro shock, rolling sector flow, hot-money probing,
+   and quant pressure can cap an otherwise attractive stock setup
 
 ## Signal Weighting Guidelines
 - Technical opinion weight: ~40%
 - Intel / sentiment weight: ~30%
 - Risk flags weight: ~30% (negative override: any high-severity risk caps signal at "hold")
 - If a strategy opinion is present, blend it at 20% weight (reducing others proportionally)
+- If `market_context` is clearly risk-off, cap aggressive buy conclusions even when technicals look strong
+- If the current holding is already in loss and lacks sector confirmation, prefer exit / reduce over "hope and hold"
 
 ## Scoring
 - 80-100: buy (all conditions met, high conviction)
@@ -85,15 +90,15 @@ Your task: synthesise all inputs into a single, actionable Decision Dashboard.
 - 0-19: sell (major risk + bearish)
 
 ## Output Format
-Return a valid JSON object following the Decision Dashboard schema.  The JSON \
+Return a valid JSON object following the Decision Dashboard schema. The JSON
 must include at minimum these top-level keys:
   stock_name, sentiment_score, trend_prediction, operation_advice,
   decision_type, confidence_level, dashboard, analysis_summary,
   key_points, risk_warning
 
-Important: ``decision_type`` must stay within the existing enum
-``buy|hold|sell``. Express stronger conviction via ``confidence_level``,
-``sentiment_score``, and the natural-language fields instead of inventing
+Important: `decision_type` must stay within the existing enum
+`buy|hold|sell`. Express stronger conviction via `confidence_level`,
+`sentiment_score`, and the natural-language fields instead of inventing
 new decision_type values.
 """
 
@@ -113,32 +118,52 @@ new decision_type values.
                 "",
             ]
 
-        # Feed prior opinions
         if ctx.opinions:
             parts.append("## Agent Opinions")
-            for op in ctx.opinions:
-                parts.append(f"\n### {op.agent_name}")
-                parts.append(f"Signal: {op.signal} | Confidence: {op.confidence:.2f}")
-                parts.append(f"Reasoning: {op.reasoning}")
-                if op.key_levels:
-                    parts.append(f"Key levels: {json.dumps(op.key_levels)}")
-                if op.raw_data:
-                    extra_keys = {k: v for k, v in op.raw_data.items()
-                                  if k not in ("signal", "confidence", "reasoning", "key_levels")}
+            for opinion in ctx.opinions:
+                parts.append(f"\n### {opinion.agent_name}")
+                parts.append(f"Signal: {opinion.signal} | Confidence: {opinion.confidence:.2f}")
+                parts.append(f"Reasoning: {opinion.reasoning}")
+                if opinion.key_levels:
+                    parts.append(f"Key levels: {json.dumps(opinion.key_levels)}")
+                if opinion.raw_data:
+                    extra_keys = {
+                        key: value
+                        for key, value in opinion.raw_data.items()
+                        if key not in ("signal", "confidence", "reasoning", "key_levels")
+                    }
                     if extra_keys:
-                        parts.append(f"Extra data: {json.dumps(extra_keys, ensure_ascii=False, default=str)}")
+                        parts.append(
+                            f"Extra data: {json.dumps(extra_keys, ensure_ascii=False, default=str)}"
+                        )
                 parts.append("")
 
-        # Feed risk flags
         if ctx.risk_flags:
             parts.append("## Risk Flags")
-            for rf in ctx.risk_flags:
-                parts.append(f"- [{rf.get('severity', 'medium')}] {rf.get('category', '')}: {rf.get('description', '')}")
+            for risk_flag in ctx.risk_flags:
+                parts.append(
+                    f"- [{risk_flag.get('severity', 'medium')}] "
+                    f"{risk_flag.get('category', '')}: {risk_flag.get('description', '')}"
+                )
             parts.append("")
 
-        # Strategy meta
         if ctx.meta.get("strategies_requested"):
             parts.append(f"## Strategies: {', '.join(ctx.meta['strategies_requested'])}")
+            parts.append("")
+
+        if ctx.get_data("market_context"):
+            parts.append("## Market Context")
+            parts.append(json.dumps(ctx.get_data("market_context"), ensure_ascii=False, default=str))
+            parts.append("")
+
+        if ctx.get_data("current_holding"):
+            parts.append("## Current Holding")
+            parts.append(json.dumps(ctx.get_data("current_holding"), ensure_ascii=False, default=str))
+            parts.append("")
+
+        if ctx.get_data("adaptive_trading_rules"):
+            parts.append("## Adaptive Trading Rules")
+            parts.append(str(ctx.get_data("adaptive_trading_rules")))
             parts.append("")
 
         if self._is_chat_mode(ctx):
@@ -176,19 +201,19 @@ new decision_type values.
             )
             ctx.set_data("final_dashboard", dashboard)
             try:
-                _raw_score = dashboard.get("sentiment_score", 50) or 50
-                _score = float(_raw_score)
+                raw_score = dashboard.get("sentiment_score", 50) or 50
+                score = float(raw_score)
             except (TypeError, ValueError):
-                _score = 50.0
+                score = 50.0
             return AgentOpinion(
                 agent_name=self.agent_name,
                 signal=dashboard.get("decision_type", "hold"),
-                confidence=min(1.0, _score / 100.0),
+                confidence=min(1.0, score / 100.0),
                 reasoning=dashboard.get("analysis_summary", ""),
                 raw_data=dashboard,
             )
-        else:
-            # Even if JSON parsing fails, store the raw text for downstream use
-            ctx.set_data("final_dashboard_raw", raw_text)
-            logger.warning("[DecisionAgent] failed to parse dashboard JSON")
-            return None
+
+        ctx.set_data("final_dashboard_raw", raw_text)
+        logger.warning("[DecisionAgent] failed to parse dashboard JSON")
+        return None
+

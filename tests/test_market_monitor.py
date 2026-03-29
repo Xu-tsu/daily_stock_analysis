@@ -12,6 +12,7 @@ from market_monitor import (
     build_intraday_checkpoint_summary,
     build_intraday_portfolio_advice,
     build_opening_auction_watchlist,
+    compose_market_decision_context,
     format_intraday_checkpoint_alert,
     format_opening_auction_alert,
     summarize_opening_auction_state,
@@ -412,6 +413,66 @@ class TestOpeningAuctionMonitor(unittest.TestCase):
         self.assertEqual(action_by_code["600519"]["action"], "reduce")
         self.assertEqual(action_by_code["600519"]["strategy"], "defensive_lock_profit")
         self.assertIn("先把利润锁住", action_by_code["600519"]["reason"])
+
+
+    def test_compose_market_decision_context_merges_macro_flow_and_auction_signals(self) -> None:
+        summary = {
+            "timestamp": "2026-03-30 10:15:00",
+            "bias": "positive",
+            "bias_label": "上午偏强",
+            "avg_change_pct": 0.96,
+            "high_risk_count": 0,
+            "anomalies": [],
+        }
+        sectors = [
+            {"name": "Power", "change_pct": 2.3, "main_net": 6800},
+            {"name": "AI", "change_pct": 1.9, "main_net": 6200},
+        ]
+        anomaly_result = {
+            "anomalies": [],
+            "trump_news": [
+                {"title": "Tariff headline", "is_sensitive": True},
+                {"title": "Trade-war headline", "is_sensitive": True},
+            ],
+        }
+        hot_candidates = [
+            {"code": "600001", "name": "Power A", "change_pct": 4.2, "main_net": 3600},
+            {"code": "600002", "name": "Power B", "change_pct": 3.1, "main_net": 2800},
+        ]
+        auction_summary = {
+            "watchlist_size": 1,
+            "strong": [{"code": "600011"}],
+            "weak": [],
+            "stocks": [
+                {
+                    "code": "600011",
+                    "name": "Huanneng",
+                    "change_pct": 1.4,
+                    "auction_amount": 3200,
+                    "imbalance_pct": 26.0,
+                    "flow_score": 4.6,
+                }
+            ],
+        }
+        financial_news = {"sensitive": [{"title": "Macro policy headline"}]}
+
+        context = compose_market_decision_context(
+            summary=summary,
+            sectors=sectors,
+            anomaly_result=anomaly_result,
+            hot_candidates=hot_candidates,
+            auction_summary=auction_summary,
+            financial_news=financial_news,
+            stock_code="600011",
+            stock_name="Huanneng",
+            stock_sector="Power",
+        )
+
+        self.assertEqual(context["macro_risk_level"], "high")
+        self.assertEqual(context["hot_money_probe"]["signal"], "active")
+        self.assertEqual(context["opening_auction"]["direction"], "strong")
+        self.assertTrue(context["sector_confirmation"]["confirmed"])
+        self.assertEqual(context["sector_confirmation"]["strength"], "strong")
 
 
 if __name__ == "__main__":

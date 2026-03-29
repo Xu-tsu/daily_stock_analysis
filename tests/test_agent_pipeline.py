@@ -426,6 +426,79 @@ class TestPipelineRouting(unittest.TestCase):
 class TestAnalyzeWithAgentStockName(unittest.TestCase):
     """Test stock-name handling in _analyze_with_agent."""
 
+    def test_analyze_with_agent_injects_market_context_and_adaptive_rules(self):
+        with patch('src.core.pipeline.get_config') as mock_config, \
+             patch('src.core.pipeline.get_db'), \
+             patch('src.core.pipeline.DataFetcherManager'), \
+             patch('src.core.pipeline.GeminiAnalyzer'), \
+             patch('src.core.pipeline.NotificationService'), \
+             patch('src.core.pipeline.SearchService'), \
+             patch('src.agent.factory.build_agent_executor') as mock_build_executor, \
+             patch('portfolio_manager.load_portfolio', return_value={"holdings": [{"code": "600519", "sector": "Liquor", "pnl_pct": -2.4}]}), \
+             patch('portfolio_manager.sync_portfolio_from_trades', side_effect=lambda p: p), \
+             patch('market_monitor.build_agent_market_context', return_value={
+                 "bias": "positive",
+                 "quant_pressure": {"signal": "low"},
+                 "sector_confirmation": {"confirmed": True},
+             }), \
+             patch('risk_control.build_adaptive_trading_rules', return_value="adaptive-rules"):
+
+            mock_cfg = MagicMock()
+            mock_cfg.max_workers = 2
+            mock_cfg.agent_mode = True
+            mock_cfg.agent_max_steps = 10
+            mock_cfg.agent_skills = []
+            mock_cfg.bocha_api_keys = []
+            mock_cfg.tavily_api_keys = []
+            mock_cfg.brave_api_keys = []
+            mock_cfg.serpapi_keys = []
+            mock_cfg.searxng_base_urls = []
+            mock_cfg.news_max_age_days = 7
+            mock_cfg.enable_realtime_quote = True
+            mock_cfg.enable_chip_distribution = True
+            mock_cfg.realtime_source_priority = []
+            mock_cfg.save_context_snapshot = False
+            mock_config.return_value = mock_cfg
+
+            from src.core.pipeline import StockAnalysisPipeline
+            from src.agent.executor import AgentResult
+            from src.enums import ReportType
+
+            pipeline = StockAnalysisPipeline(config=mock_cfg)
+            pipeline.search_service.is_available = False
+
+            agent_result = AgentResult(
+                success=True,
+                content="{}",
+                dashboard={
+                    "stock_name": "Maotai",
+                    "sentiment_score": 78,
+                    "trend_prediction": "Strong",
+                    "operation_advice": "Hold",
+                    "decision_type": "hold",
+                },
+                provider="gemini",
+            )
+            mock_executor = MagicMock()
+            mock_executor.run.return_value = agent_result
+            mock_build_executor.return_value = mock_executor
+
+            result = pipeline._analyze_with_agent(
+                code="600519",
+                report_type=ReportType.SIMPLE,
+                query_id="q-market-context",
+                stock_name="Maotai",
+                realtime_quote=None,
+                chip_data=None,
+                fundamental_context={"industry": "Liquor"},
+            )
+
+            self.assertIsNotNone(result)
+            passed_context = mock_executor.run.call_args.kwargs["context"]
+            self.assertEqual(passed_context["current_holding"]["sector"], "Liquor")
+            self.assertEqual(passed_context["market_context"]["bias"], "positive")
+            self.assertEqual(passed_context["adaptive_trading_rules"], "adaptive-rules")
+
     def test_analyze_with_agent_uses_resolved_name_for_news_persistence(self):
         """Should use resolved stock name from dashboard for search and DB persistence."""
         with patch('src.core.pipeline.get_config') as mock_config, \

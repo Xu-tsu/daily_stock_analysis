@@ -1,171 +1,359 @@
 # -*- coding: utf-8 -*-
 """
-risk_control.py — 交易风控模块
+risk_control.py - 交易风控模块
 
-基于用户真实交割单数据分析得出的核心规则：
-  诊断: 胜率60.2%但盈亏比0.40（赚5%就跑，亏12%还扛）
-  致命模式: 短线赚钱→拿成长线亏钱 / 亏损股反复补仓 / 没有止损
+基于用户近几个月真实交割单的特征，这个模块不再把
+“亏损 5% 必须无条件清仓”当作唯一答案，而是把它降级为
+高优先级风险复核线：
 
-规则:
-  1. 硬止损 5% — 任何持仓亏损超5%立即发出清仓信号
-  2. 止盈阶梯 — 盈利3%移动止损至成本价，盈利8%止盈一半
-  3. 持仓天数预警 — 超过3天的持仓自动降级
-  4. 禁止补仓亏损股 — 亏损中的股票禁止再买入
-  5. 单只仓位上限 — 不超过总资产15%
-  6. 日交易频率限制 — 每日买入不超过3只新股
-
-飞书指令:
-  风控        → 查看当前持仓风控状态
-  止损        → 查看需要止损的持仓
+1. A 股 T+1 追高依旧严格限制
+2. 亏损 5% 进入强复核，不再自动一刀切
+3. 只有市场、板块、资金和仓位都支持时，才允许保留底仓做 T
+4. 深度亏损、弱势板块、宏观突发、量化砸盘环境下仍以退出为先
 """
 
+from __future__ import annotations
+
 import logging
-import os
-import sqlite3
-from datetime import datetime, timedelta
-from pathlib import Path
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 风控参数（基于交割单数据优化）
+# 核心参数
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# 止损/止盈
-HARD_STOP_LOSS_PCT = -5.0        # 硬止损线：亏5%必须卖
-TRAILING_STOP_TRIGGER = 3.0      # 盈利3%后启动移动止损
-TRAILING_STOP_PCT = 0.0          # 移动止损线=成本价（保本出）
-TAKE_PROFIT_HALF_PCT = 8.0       # 盈利8%减仓一半
-TAKE_PROFIT_FULL_PCT = 15.0      # 盈利15%全部止盈
+# 止损 / 止盈
+HARD_STOP_LOSS_PCT = -5.0          # 高优先级风险复核线，不再代表无条件清仓
+FORCE_EXIT_LOSS_PCT = -8.0         # 强制退出线，原则上不再保留底仓
+TRAILING_STOP_TRIGGER = 3.0        # 盈利 3% 后进入保本保护
+TRAILING_STOP_PCT = 0.0            # 移动止损线 = 成本价（保本出）
+TAKE_PROFIT_HALF_PCT = 8.0         # 盈利 8% 减仓一半
+TAKE_PROFIT_FULL_PCT = 15.0        # 盈利 15% 全部止盈
 
-# 持仓天数（你的数据: 0-1天胜率93%, 2-3天72%, 4+天开始亏）
-HOLD_DAYS_WARNING = 3            # 超过3天发出预警
-HOLD_DAYS_FORCE_REVIEW = 5       # 超过5天强制复盘
-HOLD_DAYS_MAX = 7                # 超过7天建议清仓（除非趋势极强）
+# 持仓天数
+HOLD_DAYS_WARNING = 3              # 超过 3 天开始降级看待
+HOLD_DAYS_FORCE_REVIEW = 5         # 超过 5 天必须复盘
+HOLD_DAYS_MAX = 7                  # 超过 7 天且没有明显利润，优先退出
 
 # 仓位管理
-MAX_SINGLE_POSITION_PCT = 15.0   # 单只股票最大仓位比例
-MAX_POSITIONS = 5                # 同时持有股票数上限
-MAX_DAILY_NEW_BUYS = 3           # 每日新买入股票数上限
+MAX_SINGLE_POSITION_PCT = 15.0     # 单只股票最大仓位
+MAX_POSITIONS = 5                  # 同时持有股票数量上限
+MAX_DAILY_NEW_BUYS = 3             # 每日新增标的上限
 
-# 补仓禁令
-FORBID_AVERAGING_DOWN = True     # 禁止对亏损股补仓
-MAX_SAME_STOCK_TRADES = 3        # 同一只股票30天内最大交易次数
+# 补仓约束
+FORBID_AVERAGING_DOWN = True       # 默认禁止对亏损股补仓
+MAX_SAME_STOCK_TRADES = 3          # 同一只股票 30 天内最大交易次数
 
 # 交易频率
-MAX_DAILY_TRADES = 8             # 每日最大交易笔数
+MAX_DAILY_TRADES = 8
 
-# T+1 追高风控（A股核心风险：今天买明天才能卖）
-CHASE_HIGH_WARN_PCT = 3.0        # 当日涨幅超3%即为追高警告
-CHASE_HIGH_BLOCK_PCT = 5.0       # 当日涨幅超5%禁止买入
-CHASE_HIGH_PENALTY = -20         # 追高股票打分惩罚（-20分）
-# 尾盘追高更危险：14:30后买涨幅>3%的股票几乎必亏
-LATE_SESSION_CHASE_BLOCK = True  # 14:30后禁止买入当日涨幅>3%的股
+# T+1 追高风控
+CHASE_HIGH_WARN_PCT = 3.0
+CHASE_HIGH_BLOCK_PCT = 5.0
+CHASE_HIGH_PENALTY = -20
+LATE_SESSION_CHASE_BLOCK = True
 
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 风控检查
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class RiskAlert:
-    """单条风控警报"""
+    """单条风控警报。"""
+
     def __init__(self, level: str, code: str, name: str, message: str, action: str):
-        self.level = level    # critical / warning / info
+        self.level = level  # critical / warning / info
         self.code = code
         self.name = name
         self.message = message
         self.action = action  # force_sell / reduce_half / review / hold
 
-    def __repr__(self):
-        return f"[{self.level}] {self.name}({self.code}): {self.message} → {self.action}"
+    def __repr__(self) -> str:
+        return f"[{self.level}] {self.name}({self.code}): {self.message} -> {self.action}"
 
-    def to_dict(self):
+    def to_dict(self) -> Dict[str, Any]:
         return {
-            "level": self.level, "code": self.code, "name": self.name,
-            "message": self.message, "action": self.action,
+            "level": self.level,
+            "code": self.code,
+            "name": self.name,
+            "message": self.message,
+            "action": self.action,
         }
 
 
-def check_stop_loss(holdings: List[Dict]) -> List[RiskAlert]:
-    """检查所有持仓的止损/止盈/持仓天数。
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
-    Args:
-        holdings: [{"code", "name", "cost_price", "current_price",
-                     "shares", "buy_date", "pnl_pct", "market_value"}, ...]
 
-    Returns:
-        风控警报列表
-    """
-    alerts = []
+def _normalize_label(value: Any, default: str = "neutral") -> str:
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    return text or default
+
+
+def _get_hold_days(holding: Dict[str, Any], today: datetime) -> Optional[int]:
+    buy_date_str = holding.get("buy_date", "")
+    if not buy_date_str:
+        return None
+    try:
+        buy_date = datetime.strptime(str(buy_date_str)[:10], "%Y-%m-%d")
+        return (today - buy_date).days
+    except (ValueError, TypeError):
+        return None
+
+
+def _extract_sector_confirmation(
+    holding: Dict[str, Any],
+    market_context: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    sector_name = str(holding.get("sector", "") or "").strip()
+    default = {
+        "sector": sector_name,
+        "confirmed": False,
+        "strength": "weak",
+        "rank": None,
+        "change_pct": 0.0,
+        "main_net": 0.0,
+    }
+    if not market_context:
+        return default
+
+    sector_confirmation = market_context.get("sector_confirmation")
+    if isinstance(sector_confirmation, dict):
+        confirmed_sector = str(sector_confirmation.get("sector", "") or "").strip()
+        if sector_name and confirmed_sector == sector_name:
+            return {
+                "sector": confirmed_sector,
+                "confirmed": bool(sector_confirmation.get("confirmed")),
+                "strength": _normalize_label(sector_confirmation.get("strength"), "weak"),
+                "rank": sector_confirmation.get("rank"),
+                "change_pct": _safe_float(sector_confirmation.get("change_pct")),
+                "main_net": _safe_float(sector_confirmation.get("main_net")),
+            }
+
+    for rank, sector in enumerate(market_context.get("top_sectors") or [], start=1):
+        name = str(sector.get("name", "") or "").strip()
+        if not sector_name or name != sector_name:
+            continue
+        change_pct = _safe_float(sector.get("change_pct"))
+        main_net = _safe_float(sector.get("main_net"))
+        confirmed = main_net > 0 and change_pct >= 0.8
+        strength = "strong" if confirmed and rank <= 3 and main_net >= 5000 else "medium" if confirmed else "weak"
+        return {
+            "sector": name,
+            "confirmed": confirmed,
+            "strength": strength,
+            "rank": rank,
+            "change_pct": change_pct,
+            "main_net": main_net,
+        }
+
+    return default
+
+
+def _market_supports_base_position(
+    holding: Dict[str, Any],
+    market_context: Optional[Dict[str, Any]],
+    hold_days: Optional[int],
+) -> tuple[bool, List[str], Dict[str, Any]]:
+    blockers: List[str] = []
+    sector_confirmation = _extract_sector_confirmation(holding, market_context)
+
+    if not market_context:
+        blockers.append("缺少市场总览确认")
+        return False, blockers, sector_confirmation
+
+    market_bias = _normalize_label(market_context.get("bias"), "neutral")
+    market_score = _safe_float(market_context.get("market_score"))
+    macro_risk = _normalize_label(market_context.get("macro_risk_level"), "medium")
+    quant_pressure = _normalize_label(
+        (market_context.get("quant_pressure") or {}).get("signal"),
+        "medium",
+    )
+    hot_money_signal = _normalize_label(
+        (market_context.get("hot_money_probe") or {}).get("signal"),
+        "quiet",
+    )
+    auction_direction = _normalize_label(
+        (market_context.get("opening_auction") or {}).get("direction"),
+        "unavailable",
+    )
+
+    if market_bias != "positive":
+        blockers.append(f"市场偏{market_bias}")
+    if market_score < 0.4:
+        blockers.append(f"市场分值不足({market_score:.2f})")
+    if macro_risk != "low":
+        blockers.append(f"宏观/消息风险偏{macro_risk}")
+    if quant_pressure == "high":
+        blockers.append("量化砸盘压力偏高")
+    if not sector_confirmation.get("confirmed"):
+        blockers.append("所属板块缺少强确认")
+    if hot_money_signal not in {"active", "constructive"}:
+        blockers.append("题材试板资金不够明确")
+    if auction_direction == "weak":
+        blockers.append("集合竞价偏弱")
+    if hold_days is not None and hold_days >= HOLD_DAYS_WARNING:
+        blockers.append(f"持仓{hold_days}天，已超短线优势窗口")
+
+    return len(blockers) == 0, blockers, sector_confirmation
+
+
+def _build_loss_alert(
+    holding: Dict[str, Any],
+    pnl_pct: float,
+    hold_days: Optional[int],
+    market_context: Optional[Dict[str, Any]],
+) -> Optional[RiskAlert]:
+    if pnl_pct > HARD_STOP_LOSS_PCT:
+        return None
+
+    code = holding.get("code", "")
+    name = holding.get("name", "")
+
+    if pnl_pct <= FORCE_EXIT_LOSS_PCT:
+        return RiskAlert(
+            "critical",
+            code,
+            name,
+            f"亏损{pnl_pct:.1f}%，已超过强制退出线({FORCE_EXIT_LOSS_PCT}%)，不再保留底仓博弈。",
+            "force_sell",
+        )
+
+    allow_base, blockers, sector_confirmation = _market_supports_base_position(
+        holding=holding,
+        market_context=market_context,
+        hold_days=hold_days,
+    )
+
+    if allow_base:
+        sector_name = sector_confirmation.get("sector") or "所属板块"
+        return RiskAlert(
+            "warning",
+            code,
+            name,
+            f"亏损{pnl_pct:.1f}%，到达风险复核线({HARD_STOP_LOSS_PCT}%)，"
+            f"但市场偏强且{sector_name}仍有确认，可减仓后保留底仓做T，禁止继续放大风险。",
+            "review",
+        )
+
+    market_bias = _normalize_label((market_context or {}).get("bias"), "neutral")
+    macro_risk = _normalize_label((market_context or {}).get("macro_risk_level"), "medium")
+    quant_pressure = _normalize_label(
+        ((market_context or {}).get("quant_pressure") or {}).get("signal"),
+        "medium",
+    )
+    level = (
+        "critical"
+        if pnl_pct <= -6.5 or market_bias == "negative" or macro_risk == "high" or quant_pressure == "high"
+        else "warning"
+    )
+    reason_text = "；".join(blockers[:3]) if blockers else "市场与板块未形成强确认"
+    return RiskAlert(
+        level,
+        code,
+        name,
+        f"亏损{pnl_pct:.1f}%，且{reason_text}，优先退出或至少大幅降仓，不保留幻想仓位。",
+        "force_sell",
+    )
+
+
+def check_stop_loss(
+    holdings: List[Dict[str, Any]],
+    market_context: Optional[Dict[str, Any]] = None,
+) -> List[RiskAlert]:
+    """检查所有持仓的止损 / 止盈 / 持仓天数。"""
+
+    alerts: List[RiskAlert] = []
     today = datetime.now()
 
-    for h in holdings:
-        code = h.get("code", "")
-        name = h.get("name", "")
-        cost = h.get("cost_price", 0)
-        current = h.get("current_price", 0)
-        pnl_pct = h.get("pnl_pct", 0)
+    for holding in holdings:
+        code = holding.get("code", "")
+        name = holding.get("name", "")
+        cost = _safe_float(holding.get("cost_price"))
+        current = _safe_float(holding.get("current_price"))
+        pnl_pct = _safe_float(holding.get("pnl_pct"))
 
         if cost > 0 and current > 0:
             pnl_pct = (current - cost) / cost * 100
 
-        # 1. 硬止损
-        if pnl_pct <= HARD_STOP_LOSS_PCT:
-            alerts.append(RiskAlert(
-                "critical", code, name,
-                f"亏损{pnl_pct:.1f}%，触发硬止损线({HARD_STOP_LOSS_PCT}%)",
-                "force_sell"
-            ))
+        hold_days = _get_hold_days(holding, today)
+
+        loss_alert = _build_loss_alert(
+            holding=holding,
+            pnl_pct=pnl_pct,
+            hold_days=hold_days,
+            market_context=market_context,
+        )
+        if loss_alert is not None:
+            alerts.append(loss_alert)
             continue
 
-        # 2. 止盈
         if pnl_pct >= TAKE_PROFIT_FULL_PCT:
-            alerts.append(RiskAlert(
-                "warning", code, name,
-                f"盈利{pnl_pct:.1f}%，建议全部止盈",
-                "force_sell"
-            ))
+            alerts.append(
+                RiskAlert(
+                    "warning",
+                    code,
+                    name,
+                    f"盈利{pnl_pct:.1f}%，建议分批兑现，避免高位利润回吐。",
+                    "force_sell",
+                )
+            )
         elif pnl_pct >= TAKE_PROFIT_HALF_PCT:
-            alerts.append(RiskAlert(
-                "warning", code, name,
-                f"盈利{pnl_pct:.1f}%，建议减仓一半锁定利润",
-                "reduce_half"
-            ))
+            alerts.append(
+                RiskAlert(
+                    "warning",
+                    code,
+                    name,
+                    f"盈利{pnl_pct:.1f}%，建议至少减仓一半锁定利润。",
+                    "reduce_half",
+                )
+            )
         elif pnl_pct >= TRAILING_STOP_TRIGGER:
-            # 移动止损：盈利3%后如果回落到成本价附近，保本出
-            alerts.append(RiskAlert(
-                "info", code, name,
-                f"盈利{pnl_pct:.1f}%，已启动移动止损(保本线)",
-                "hold"
-            ))
+            alerts.append(
+                RiskAlert(
+                    "info",
+                    code,
+                    name,
+                    f"盈利{pnl_pct:.1f}%，已进入保本保护区，回落到成本附近要果断收手。",
+                    "hold",
+                )
+            )
 
-        # 3. 持仓天数
-        buy_date_str = h.get("buy_date", "")
-        if buy_date_str:
-            try:
-                buy_date = datetime.strptime(str(buy_date_str)[:10], "%Y-%m-%d")
-                hold_days = (today - buy_date).days
-                if hold_days >= HOLD_DAYS_MAX and pnl_pct < 5:
-                    alerts.append(RiskAlert(
-                        "critical", code, name,
-                        f"持仓{hold_days}天（超{HOLD_DAYS_MAX}天上限），盈利不足5%",
-                        "force_sell"
-                    ))
-                elif hold_days >= HOLD_DAYS_FORCE_REVIEW:
-                    alerts.append(RiskAlert(
-                        "warning", code, name,
-                        f"持仓{hold_days}天，需要强制复盘决定去留",
-                        "review"
-                    ))
-                elif hold_days >= HOLD_DAYS_WARNING:
-                    alerts.append(RiskAlert(
-                        "info", code, name,
-                        f"持仓{hold_days}天，接近持仓上限，注意控制",
-                        "review"
-                    ))
-            except (ValueError, TypeError):
-                pass
+        if hold_days is None:
+            continue
+        if hold_days >= HOLD_DAYS_MAX and pnl_pct < 5:
+            alerts.append(
+                RiskAlert(
+                    "critical",
+                    code,
+                    name,
+                    f"持仓{hold_days}天且盈利不足5%，已超短线效率边界，优先退出。",
+                    "force_sell",
+                )
+            )
+        elif hold_days >= HOLD_DAYS_FORCE_REVIEW:
+            alerts.append(
+                RiskAlert(
+                    "warning",
+                    code,
+                    name,
+                    f"持仓{hold_days}天，必须复盘是否继续持有。",
+                    "review",
+                )
+            )
+        elif hold_days >= HOLD_DAYS_WARNING:
+            alerts.append(
+                RiskAlert(
+                    "info",
+                    code,
+                    name,
+                    f"持仓{hold_days}天，短线胜率开始衰减，注意别把短线做成长线。",
+                    "review",
+                )
+            )
 
     return alerts
 
@@ -173,110 +361,109 @@ def check_stop_loss(holdings: List[Dict]) -> List[RiskAlert]:
 def check_buy_permission(
     code: str,
     name: str,
-    holdings: List[Dict],
+    holdings: List[Dict[str, Any]],
     total_asset: float = 0,
     buy_amount: float = 0,
     current_change_pct: float = 0,
     allow_averaging_down: bool = False,
 ) -> Dict[str, Any]:
-    """检查是否允许买入。
+    """检查是否允许买入。"""
 
-    Args:
-        current_change_pct: 该股票当日涨跌幅(%)，用于T+1追高检查
-        allow_averaging_down: 仅供上层策略在更严格前置条件下调用；
-            默认仍然禁止对亏损股补仓
+    reasons: List[str] = []
+    warnings: List[str] = []
 
-    Returns:
-        {"allowed": True/False, "reasons": ["原因1", ...], "warnings": ["警告1", ...]}
-    """
-    reasons = []
-    warnings = []
-
-    # 0. T+1 追高风控（最重要！）
     if current_change_pct >= CHASE_HIGH_BLOCK_PCT:
         reasons.append(
-            f"T+1追高禁止: {name}今日已涨{current_change_pct:.1f}%（超{CHASE_HIGH_BLOCK_PCT}%），"
-            f"A股T+1今天买入明天才能卖，追高后砸盘无法止损。"
-            f"历史数据：追高买入的交易亏损率超70%"
+            f"T+1追高禁止: {name}今日已涨{current_change_pct:.1f}%（超过{CHASE_HIGH_BLOCK_PCT}%），"
+            "A股今天买入明天才能卖，追高后次日被砸很难处理。"
         )
     elif current_change_pct >= CHASE_HIGH_WARN_PCT:
-        # 检查是否尾盘
         now = datetime.now()
         if LATE_SESSION_CHASE_BLOCK and now.hour >= 14 and now.minute >= 30:
             reasons.append(
                 f"尾盘追高禁止: {name}已涨{current_change_pct:.1f}%，"
-                f"14:30后买入涨幅>3%的股票，明天大概率低开"
+                "14:30 后再追容易承受隔夜低开的被动风险。"
             )
         else:
             warnings.append(
-                f"追高警告: {name}已涨{current_change_pct:.1f}%，T+1风险较高，"
-                f"建议等回调到均线附近再买入"
+                f"追高警告: {name}今日已涨{current_change_pct:.1f}%，"
+                "更适合等回踩而不是在冲高途中接力。"
             )
 
-    # 1. 禁止补仓亏损股
     if FORBID_AVERAGING_DOWN and not allow_averaging_down:
-        for h in holdings:
-            if h.get("code") == code:
-                pnl_pct = h.get("pnl_pct", 0)
-                cost = h.get("cost_price", 0)
-                current = h.get("current_price", 0)
-                if cost > 0 and current > 0:
-                    pnl_pct = (current - cost) / cost * 100
-                if pnl_pct < 0:
-                    reasons.append(
-                        f"禁止补仓: {name}({code})当前亏损{pnl_pct:.1f}%，"
-                        f"禁止对亏损股加仓（历史数据显示补仓亏损股胜率仅17%）"
-                    )
+        for holding in holdings:
+            if holding.get("code") != code:
+                continue
+            pnl_pct = _safe_float(holding.get("pnl_pct"))
+            cost = _safe_float(holding.get("cost_price"))
+            current = _safe_float(holding.get("current_price"))
+            if cost > 0 and current > 0:
+                pnl_pct = (current - cost) / cost * 100
+            if pnl_pct < 0:
+                reasons.append(
+                    f"默认不补仓亏损股: {name}({code})当前亏损{pnl_pct:.1f}%，"
+                    "只有板块回流型 / 龙头错杀型等更严格条件满足时才允许例外。"
+                )
 
-    # 2. 单只仓位上限
     if total_asset > 0 and buy_amount > 0:
         existing_value = sum(
-            h.get("market_value", 0) for h in holdings if h.get("code") == code
+            _safe_float(holding.get("market_value"))
+            for holding in holdings
+            if holding.get("code") == code
         )
         new_pct = (existing_value + buy_amount) / total_asset * 100
         if new_pct > MAX_SINGLE_POSITION_PCT:
             reasons.append(
-                f"仓位超限: 买入后{name}占比{new_pct:.1f}%，"
-                f"超过单只上限{MAX_SINGLE_POSITION_PCT}%"
+                f"仓位超限: 买入后 {name} 占比 {new_pct:.1f}% ，"
+                f"超过单只上限 {MAX_SINGLE_POSITION_PCT}% 。"
             )
 
-    # 3. 持仓数量上限
-    held_codes = set(h.get("code") for h in holdings if h.get("shares", 0) > 0)
+    held_codes = {
+        holding.get("code")
+        for holding in holdings
+        if _safe_float(holding.get("shares")) > 0
+    }
     if code not in held_codes and len(held_codes) >= MAX_POSITIONS:
         reasons.append(
-            f"持仓数超限: 当前已持有{len(held_codes)}只，"
-            f"上限{MAX_POSITIONS}只，需先卖出才能买新股"
+            f"持仓数量超限: 当前已持有 {len(held_codes)} 只，"
+            f"达到上限 {MAX_POSITIONS} 只。"
         )
 
-    # 4. 同一只股票交易频率
     try:
         from trade_journal import _conn
+
         conn = _conn()
-        recent = conn.execute("""
+        recent = conn.execute(
+            """
             SELECT COUNT(*) as cnt FROM trade_log
             WHERE code = ? AND trade_date >= date('now', '-30 days')
-        """, (code,)).fetchone()
+            """,
+            (code,),
+        ).fetchone()
         conn.close()
         if recent and recent["cnt"] >= MAX_SAME_STOCK_TRADES * 2:
             warnings.append(
-                f"频繁交易: {name}近30天已交易{recent['cnt']}次，注意交易成本"
+                f"频繁交易提醒: {name} 近30天已交易 {recent['cnt']} 次，注意减少摩擦成本。"
             )
     except Exception:
         pass
 
-    # 5. 今日新买入数量
     try:
         from trade_journal import _conn
+
         conn = _conn()
         today = datetime.now().strftime("%Y-%m-%d")
-        today_buys = conn.execute("""
+        today_buys = conn.execute(
+            """
             SELECT COUNT(DISTINCT code) as cnt FROM trade_log
             WHERE trade_type = 'buy' AND trade_date = ?
-        """, (today,)).fetchone()
+            """,
+            (today,),
+        ).fetchone()
         conn.close()
         if today_buys and today_buys["cnt"] >= MAX_DAILY_NEW_BUYS:
             warnings.append(
-                f"今日已买入{today_buys['cnt']}只新股，建议停止买入"
+                f"今日已新开 {today_buys['cnt']} 只标的，建议先停止扩散持仓。"
             )
     except Exception:
         pass
@@ -293,23 +480,17 @@ def get_position_sizing(
     current_positions: int,
     signal_strength: str = "medium",
 ) -> float:
-    """根据信号强度和当前仓位计算建议买入金额。
+    """根据信号强度和当前持仓数计算建议买入金额。"""
 
-    基于你的数据：小仓(<1000元)胜率67%最高，大仓胜率低。
-    """
-    # 总仓位不超过80%（留20%现金）
-    max_invest = total_asset * 0.8
-    # 单只上限
     single_max = total_asset * MAX_SINGLE_POSITION_PCT / 100
 
     if signal_strength == "strong":
-        base = single_max * 0.8  # 强信号：用单只上限的80%
+        base = single_max * 0.8
     elif signal_strength == "medium":
-        base = single_max * 0.5  # 中等信号：50%
+        base = single_max * 0.5
     else:
-        base = single_max * 0.3  # 弱信号：30%
+        base = single_max * 0.3
 
-    # 已有仓位多时减少新仓位
     if current_positions >= 4:
         base *= 0.5
     elif current_positions >= 3:
@@ -319,80 +500,103 @@ def get_position_sizing(
 
 
 def format_risk_alerts(alerts: List[RiskAlert]) -> str:
-    """格式化风控警报为可读文本。"""
+    """格式化风控警报。"""
+
     if not alerts:
         return "当前持仓风控状态正常"
 
-    critical = [a for a in alerts if a.level == "critical"]
-    warning = [a for a in alerts if a.level == "warning"]
-    info = [a for a in alerts if a.level == "info"]
+    critical = [alert for alert in alerts if alert.level == "critical"]
+    warning = [alert for alert in alerts if alert.level == "warning"]
+    info = [alert for alert in alerts if alert.level == "info"]
 
-    lines = []
+    lines: List[str] = []
     if critical:
-        lines.append("** 紧急（需立即处理）**")
-        for a in critical:
-            lines.append(f"  {a.name}({a.code}): {a.message}")
-            lines.append(f"    操作: {a.action}")
+        lines.append("** 紧急（需立刻处理）**")
+        for alert in critical:
+            lines.append(f"  {alert.name}({alert.code}): {alert.message}")
+            lines.append(f"    操作: {alert.action}")
     if warning:
         lines.append("\n** 警告 **")
-        for a in warning:
-            lines.append(f"  {a.name}({a.code}): {a.message}")
+        for alert in warning:
+            lines.append(f"  {alert.name}({alert.code}): {alert.message}")
     if info:
         lines.append("\n** 提示 **")
-        for a in info:
-            lines.append(f"  {a.name}({a.code}): {a.message}")
+        for alert in info:
+            lines.append(f"  {alert.name}({alert.code}): {alert.message}")
 
     return "\n".join(lines)
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 交易决策增强：基于交割单数据的硬规则
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def build_adaptive_trading_rules(
+    market_context: Optional[Dict[str, Any]] = None,
+    current_holding: Optional[Dict[str, Any]] = None,
+) -> str:
+    """构造供 LLM / Agent 使用的自适应高胜率规则。"""
 
-TRADING_RULES_FOR_LLM = """
-## 基于真实交割单数据分析的硬性交易规则（必须严格执行）
+    lines = [
+        "## 基于真实交割单与盘中环境的高胜率规则",
+        "",
+        "### 数据基线",
+        "- 已分析用户 2025.12-2026.03 的真实交易样本：胜率不低，但主要问题是赚得少、亏得深。",
+        "- 优势在短线执行：0-1 天表现最好，超过 3 天后胜率和赔率都明显下降。",
+        "",
+        "### 规则优先级（从高到低）",
+        "1. A股 T+1 追高禁令优先级最高：当日涨幅过大、尤其尾盘冲高，默认不追。",
+        "2. 亏损 5% 是风险复核线，不再机械一刀切。",
+        "   - 若市场偏弱、板块不确认、特朗普/关税等突发升级、量化砸盘压力偏高：优先清仓或大幅减仓。",
+        "   - 只有市场偏强、主线板块资金仍在、题材试板资金活跃、且仓位不重时，才允许减仓后保留底仓做T。",
+        "3. 亏损股默认不补仓。",
+        "   - 仅在“板块回流型补仓”或“龙头错杀型补仓”条件同时满足时，才允许小额试探。",
+        "4. 调仓先处理弱势和高风险仓位，再考虑弱转强切换。",
+        "5. 看市场不能只看指数，必须联合判断：",
+        "   - 新闻情绪与宏观突发（尤其特朗普、关税、贸易冲突）",
+        "   - 09:15-09:25 集合竞价方向与开盘承接",
+        "   - 热门题材滚动资金是否持续回流",
+        "   - 游资是否只是试探拉板，还是有板块跟随",
+        "   - 是否出现量化砸盘式的指数弱、承接差、分时共振下杀",
+        "6. 盈利 8% 以上优先考虑锁利，不把短线利润无谓回吐。",
+        "7. 持仓超过 3 天后，若没有继续走强证据，要主动降低预期。",
+    ]
 
-### 数据来源
-分析了用户2025.12-2026.03共233笔交易（123笔完成配对），得出以下规则：
+    if market_context:
+        top_sectors = market_context.get("top_sectors") or []
+        top_sector_text = " / ".join(
+            f"{sector.get('name', '')} { _safe_float(sector.get('change_pct')):+.1f}%"
+            for sector in top_sectors[:3]
+            if sector.get("name")
+        ) or "暂无"
+        opening_auction = market_context.get("opening_auction") or {}
+        hot_money = market_context.get("hot_money_probe") or {}
+        quant_pressure = market_context.get("quant_pressure") or {}
+        lines.extend(
+            [
+                "",
+                "### 当前市场约束",
+                f"- 市场偏向: {market_context.get('bias_label') or market_context.get('bias') or '未知'}",
+                f"- 市场分值: {_safe_float(market_context.get('market_score')):.2f}",
+                f"- 宏观/消息风险: {market_context.get('macro_risk_level', '未知')}",
+                f"- 热门板块: {top_sector_text}",
+                f"- 集合竞价: {opening_auction.get('direction', 'unavailable')}",
+                f"- 游资/题材试板: {hot_money.get('signal', 'quiet')}",
+                f"- 量化砸盘压力: {quant_pressure.get('signal', 'medium')}",
+            ]
+        )
 
-### 核心发现
-- 用户胜率60.2%（不低），但盈亏比只有0.40（赚少亏多）
-- 赚钱时平均赚5.12%，亏钱时平均亏12.67%
-- 短线是优势：当天卖胜率100%，隔天卖93%，超3天胜率骤降至56%
+    if current_holding:
+        sector_name = str(current_holding.get("sector", "") or "").strip()
+        pnl_pct = _safe_float(current_holding.get("pnl_pct"))
+        lines.extend(
+            [
+                "",
+                "### 当前标的约束",
+                f"- 当前持仓盈亏: {pnl_pct:+.2f}%",
+                f"- 所属板块: {sector_name or '未知'}",
+                "- 如果该标的不在主线强确认里，就算跌到低位，也不能把“想做T”当成继续死扛的理由。",
+            ]
+        )
 
-### 必须执行的硬规则
+    return "\n".join(lines)
 
-**规则0（最高优先级）: A股T+1追高禁令**
-- 当日涨幅超5%的股票：禁止买入，无例外
-- 当日涨幅超3%的股票：14:30后禁止买入
-- 当日涨幅超3%的股票：其他时段也需降低仓位50%
-- 理由：A股T+1，今天追高买入明天才能卖。用户亏损最大的6笔交易（-28%/-27%/-25%）
-  全部是追涨后第二天砸盘被套，因为T+1无法当天止损
-- **正确做法**：买在回调支撑位（MA5/MA10），不买在冲高途中
-- **尾盘更危险**：14:30后追高 = 承受整晚不确定性，次日低开概率极高
 
-1. **绝对止损5%**：任何持仓浮亏超过5%，必须建议"清仓"，无任何例外
-   理由：用户亏损超20%的交易有6笔，全部是没及时止损导致的
+TRADING_RULES_FOR_LLM = build_adaptive_trading_rules()
 
-2. **最长持股3个交易日**：超过3天且盈利不足5%的持仓，必须建议"减仓/清仓"
-   理由：用户持股0-1天胜率93%，2-3天72%，4-7天仅56%，7天+仅41%
-
-3. **盈利8%必须减仓一半**：锁定利润，剩余部分用移动止损保护
-   理由：用户平均盈利只有5.12%，能到8%已经是超额收益
-
-4. **禁止补仓亏损股**：已经浮亏的股票，绝对不能建议"加仓"
-   理由：用户补仓亏损股的案例（雷科防务6笔17%胜率亏1806元）全部是灾难
-
-5. **同一只股票30天内不超过3次交易**：避免反复进出同一只股票
-   理由：频繁交易同一只股票（如利欧股份13次）虽然部分盈利但增加摩擦成本
-
-6. **单只仓位不超过15%**：分散风险，即使看好也不能重仓
-
-7. **优先选择回调买入而非突破买入**：
-   - 最佳买点：强势股缩量回踩MA5（而非放量突破新高）
-   - 理由：追突破 = 追高，T+1下追高当天无法止损；回调买入成本低+止损距离短
-   - 用户的盈利案例中，回调买入成功率远高于追涨买入
-
-8. **避开空头排列的股票**：MA空头排列+底部收敛的组合胜率极低
-   理由：用户在空头排列买入的63笔交易中，胜率只有17.5%
-"""

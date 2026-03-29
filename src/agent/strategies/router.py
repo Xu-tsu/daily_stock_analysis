@@ -108,6 +108,14 @@ class StrategyRouter:
             if volume_status == "heavy" and 30 < trend_score < 70:
                 return "volatile"
 
+        quant_pressure = str(ctx.meta.get("quant_pressure_signal", "") or "").lower()
+        if quant_pressure == "high":
+            return "volatile"
+
+        market_bias = str(ctx.meta.get("market_bias", "") or "").lower()
+        if market_bias == "negative":
+            return "trending_down"
+
         # Check sector context in meta
         if ctx.meta.get("sector_hot"):
             return "sector_hot"

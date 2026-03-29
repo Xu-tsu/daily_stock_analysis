@@ -44,13 +44,22 @@ Your task: search for and evaluate ALL potential risk factors, then \
 output a structured JSON risk assessment.
 
 ## Mandatory Risk Checks
-1. **Insider / Major Shareholder Activity** — sell-downs (减持), pledges
-2. **Earnings Warnings** — pre-loss, downward revisions (业绩预亏, 业绩变脸)
-3. **Regulatory** — penalties, investigations, violations (监管处罚, 立案调查)
-4. **Industry Policy** — headwinds, sector crackdowns
-5. **Lock-up Expirations** — large block unlocks within 30 days (解禁)
-6. **Valuation Extremes** — PE > 100 or negative, PB > 10 (flag as anomaly)
-7. **Technical Warning Signs** — death crosses, breaking key supports
+1. **Insider / Major Shareholder Activity** – sell-downs (减持), pledges
+2. **Earnings Warnings** – pre-loss, downward revisions (业绩预亏, 业绩变脸)
+3. **Regulatory** – penalties, investigations, violations (监管处罚, 立案调查)
+4. **Industry Policy** – headwinds, sector crackdowns
+5. **Lock-up Expirations** – large block unlocks within 30 days (解禁)
+6. **Valuation Extremes** – PE > 100 or negative, PB > 10 (flag as anomaly)
+7. **Technical Warning Signs** – death crosses, breaking key supports
+8. **Macro Shock Context** – tariff / Trump / trade-war / policy headlines in `market_context`
+9. **Sector Confirmation** – whether the stock's sector is actually confirmed by rolling fund flow
+10. **Auction / Flow Context** – opening auction direction, hot-money probing, and quant-dump pressure when provided
+
+## Trading Guardrails
+- Treat `adaptive_trading_rules` as a high-priority constraint layer.
+- A 5% loss is a **risk review line**, not an unconditional liquidation rule.
+- If market/sector confirmation is weak, macro shock is high, or quant pressure is high, escalate quickly.
+- Only treat "keep a base position for T" as valid when `market_context` clearly supports it.
 
 ## Severity Levels
 - "high": existential or material risk (lawsuits, fraud, massive insider selling)
@@ -64,7 +73,7 @@ Return **only** a JSON object:
   "risk_score": 0-100,
   "flags": [
     {
-      "category": "insider|earnings|regulatory|industry|lockup|valuation|technical",
+      "category": "insider|earnings|regulatory|industry|lockup|valuation|technical|macro|sector|flow|auction",
       "severity": "high|medium|low",
       "description": "Clear description of the risk",
       "source": "Where this information came from"
@@ -85,6 +94,7 @@ from your search results. Do NOT invent risks.
             parts[0] += f" ({ctx.stock_name})"
         parts.append("for ALL risk factors listed in your instructions.")
         parts.append("Search for latest news if you haven't received intel data yet.")
+        parts.append("Use any pre-fetched `market_context`, `current_holding`, and `adaptive_trading_rules` as hard constraints.")
 
         # Feed any existing intel data so the risk agent doesn't redo searches
         if ctx.get_data("intel_opinion"):

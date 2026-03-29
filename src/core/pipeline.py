@@ -618,6 +618,61 @@ class StockAnalysisPipeline:
             if trend_result:
                 initial_context["trend_result"] = self._safe_to_dict(trend_result)
 
+            current_holding = None
+            stock_sector = ""
+            try:
+                from portfolio_manager import load_portfolio, sync_portfolio_from_trades
+
+                portfolio = sync_portfolio_from_trades(load_portfolio())
+                current_holding = next(
+                    (
+                        dict(holding)
+                        for holding in portfolio.get("holdings", []) or []
+                        if holding.get("code") == code
+                    ),
+                    None,
+                )
+            except Exception as e:
+                logger.debug("[%s] Agent mode: failed to resolve current holding context: %s", code, e)
+
+            if current_holding:
+                initial_context["current_holding"] = current_holding
+                stock_sector = str(current_holding.get("sector", "") or "").strip()
+
+            if not stock_sector and isinstance(fundamental_context, dict):
+                stock_sector = str(
+                    fundamental_context.get("industry")
+                    or fundamental_context.get("sector")
+                    or ""
+                ).strip()
+
+            try:
+                from market_monitor import build_agent_market_context
+                from risk_control import build_adaptive_trading_rules
+
+                market_context = build_agent_market_context(
+                    stock_code=code,
+                    stock_name=stock_name,
+                    stock_sector=stock_sector,
+                )
+                if market_context:
+                    initial_context["market_context"] = market_context
+                initial_context["adaptive_trading_rules"] = build_adaptive_trading_rules(
+                    market_context=market_context if isinstance(market_context, dict) else None,
+                    current_holding=current_holding,
+                )
+            except Exception as e:
+                logger.debug("[%s] Agent mode: failed to build market context: %s", code, e)
+                try:
+                    from risk_control import build_adaptive_trading_rules
+
+                    initial_context["adaptive_trading_rules"] = build_adaptive_trading_rules(
+                        market_context=None,
+                        current_holding=current_holding,
+                    )
+                except Exception:
+                    pass
+
             # Agent path: inject social sentiment as news_context so both
             # executor (_build_user_message) and orchestrator (ctx.set_data)
             # can consume it through the existing news_context channel
