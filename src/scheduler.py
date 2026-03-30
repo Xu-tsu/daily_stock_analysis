@@ -1,83 +1,110 @@
 # -*- coding: utf-8 -*-
 """
-===================================
-定时调度模块
-===================================
+Daily scheduler helpers.
 
-职责：
-1. 支持每日定时执行股票分析
-2. 支持定时执行大盘复盘
-3. 优雅处理信号，确保可靠退出
-
-依赖：
-- schedule: 轻量级定时任务库
+This project's fixed daily checkpoints are defined in A-share market time
+(Asia/Shanghai), while the `schedule` library runs against the host's local
+wall-clock time. This module converts market times to local times at
+registration so overseas hosts still trigger `10:15` / `12:30` checkpoints at
+the intended A-share moments.
 """
 
 import logging
 import signal
-import sys
-import time
 import threading
-from datetime import datetime
+import time
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
+CN_MARKET_TIMEZONE = timezone(timedelta(hours=8), "Asia/Shanghai")
+
+
+def _get_local_timezone():
+    """Return the host timezone used by the local schedule loop."""
+    return datetime.now().astimezone().tzinfo or CN_MARKET_TIMEZONE
+
+
+def _normalize_hhmm(time_str: str) -> str:
+    """Validate and normalize a HH:MM string."""
+    parsed = datetime.strptime(time_str, "%H:%M")
+    return parsed.strftime("%H:%M")
+
+
+def _format_timezone_name(tz) -> str:
+    if tz is None:
+        return "local"
+    return tz.tzname(None) or str(tz)
+
+
+def convert_market_time_to_local_time(
+    time_str: str,
+    market_timezone=CN_MARKET_TIMEZONE,
+    local_timezone=None,
+    reference: Optional[datetime] = None,
+) -> str:
+    """
+    Convert an A-share market clock time to the host local clock time.
+
+    `schedule` only understands local wall-clock time, so `10:15` and `12:30`
+    need to be interpreted as A-share time first and then converted.
+    """
+    normalized = _normalize_hhmm(time_str)
+    local_tz = local_timezone or _get_local_timezone()
+    current_local = reference.astimezone(local_tz) if reference else datetime.now(local_tz)
+    current_market = current_local.astimezone(market_timezone)
+    hour, minute = [int(part) for part in normalized.split(":")]
+    target_market = current_market.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    target_local = target_market.astimezone(local_tz)
+    return target_local.strftime("%H:%M")
 
 
 class GracefulShutdown:
-    """
-    优雅退出处理器
-    
-    捕获 SIGTERM/SIGINT 信号，确保任务完成后再退出
-    """
-    
+    """Handle SIGTERM / SIGINT and stop after the current job finishes."""
+
     def __init__(self):
         self.shutdown_requested = False
         self._lock = threading.Lock()
-        
-        # 注册信号处理器
+
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
-    
+
     def _signal_handler(self, signum, frame):
-        """信号处理函数"""
         with self._lock:
             if not self.shutdown_requested:
-                logger.info(f"收到退出信号 ({signum})，等待当前任务完成...")
+                logger.info("收到退出信号 (%s)，等待当前任务完成后再退出...", signum)
                 self.shutdown_requested = True
-    
+
     @property
     def should_shutdown(self) -> bool:
-        """检查是否应该退出"""
         with self._lock:
             return self.shutdown_requested
 
 
 class Scheduler:
     """
-    定时任务调度器
-    
-    基于 schedule 库实现，支持：
-    - 每日定时执行
-    - 启动时立即执行
-    - 优雅退出
+    Lightweight daily task scheduler.
+
+    By default, scheduled times are interpreted as A-share market time.
     """
-    
-    def __init__(self, schedule_time: str = "18:00"):
-        """
-        初始化调度器
-        
-        Args:
-            schedule_time: 每日执行时间，格式 "HH:MM"
-        """
+
+    def __init__(
+        self,
+        schedule_time: str = "18:00",
+        market_timezone=CN_MARKET_TIMEZONE,
+        local_timezone=None,
+    ):
         try:
             import schedule
+
             self.schedule = schedule
         except ImportError:
             logger.error("schedule 库未安装，请执行: pip install schedule")
             raise ImportError("请安装 schedule 库: pip install schedule")
-        
-        self.schedule_time = schedule_time
+
+        self.schedule_time = _normalize_hhmm(schedule_time)
+        self.market_timezone = market_timezone
+        self.local_timezone = local_timezone or _get_local_timezone()
         self.shutdown_handler = GracefulShutdown()
         self._task_callback: Optional[Callable] = None
         self._running = False
@@ -88,14 +115,7 @@ class Scheduler:
         run_immediately: bool = False,
         immediate_task_names: Optional[Sequence[str]] = None,
     ):
-        """
-        设置多个每日定时任务。
-
-        Args:
-            tasks: [(time_str, callback, task_name), ...]
-            run_immediately: 是否执行 immediate_task_names 中的任务
-            immediate_task_names: 启动时立即执行的任务名列表；为空时默认执行首个任务
-        """
+        """Register multiple daily jobs."""
         if not tasks:
             return
 
@@ -105,91 +125,101 @@ class Scheduler:
             immediate_names = [tasks[0][2]]
 
         for time_str, task, task_name in tasks:
-            self.schedule.every().day.at(time_str).do(
+            market_time = _normalize_hhmm(time_str)
+            local_time = convert_market_time_to_local_time(
+                market_time,
+                market_timezone=self.market_timezone,
+                local_timezone=self.local_timezone,
+            )
+            self.schedule.every().day.at(local_time).do(
                 self._safe_run_task,
                 task_name=task_name,
                 task_callback=task,
             )
-            logger.info(f"已设置每日定时任务 [{task_name}]，执行时间: {time_str}")
+            logger.info(
+                "已设置每日定时任务 [%s]，A股时间: %s (%s) -> 本机时间: %s (%s)",
+                task_name,
+                market_time,
+                _format_timezone_name(self.market_timezone),
+                local_time,
+                _format_timezone_name(self.local_timezone),
+            )
 
         if run_immediately:
             for _, task, task_name in tasks:
                 if task_name in immediate_names:
-                    logger.info(f"立即执行任务 [{task_name}]...")
+                    logger.info("立即执行任务 [%s]...", task_name)
                     self._safe_run_task(task_name=task_name, task_callback=task)
-        
+
     def set_daily_task(self, task: Callable, run_immediately: bool = True):
-        """
-        设置每日定时任务
-        
-        Args:
-            task: 要执行的任务函数（无参数）
-            run_immediately: 是否在设置后立即执行一次
-        """
+        """Backward-compatible single daily task helper."""
         self.set_daily_tasks(
             tasks=[(self.schedule_time, task, "daily_task")],
             run_immediately=run_immediately,
             immediate_task_names=["daily_task"],
         )
-    
+
     def _safe_run_task(
         self,
         task_name: str = "daily_task",
         task_callback: Optional[Callable] = None,
     ):
-        """安全执行任务（带异常捕获）"""
+        """Run a scheduled task with error handling."""
         callback = task_callback or self._task_callback
         if callback is None:
             return
-        
+
         try:
             logger.info("=" * 50)
             logger.info(
-                f"定时任务开始执行 [{task_name}] - "
-                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                "定时任务开始执行 [%s] - %s",
+                task_name,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             )
             logger.info("=" * 50)
-            
+
             callback()
-            
+
             logger.info(
-                f"定时任务执行完成 [{task_name}] - "
-                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                "定时任务执行完成 [%s] - %s",
+                task_name,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             )
-            
-        except Exception as e:
-            logger.exception(f"定时任务执行失败 [{task_name}]: {e}")
-    
+
+        except Exception as exc:
+            logger.exception("定时任务执行失败 [%s]: %s", task_name, exc)
+
     def run(self):
-        """
-        运行调度器主循环
-        
-        阻塞运行，直到收到退出信号
-        """
+        """Run the scheduler loop until a shutdown signal is received."""
         self._running = True
         logger.info("调度器开始运行...")
-        logger.info(f"下次执行时间: {self._get_next_run_time()}")
-        
+        logger.info("下次执行时间: %s", self._get_next_run_time())
+
         while self._running and not self.shutdown_handler.should_shutdown:
             self.schedule.run_pending()
-            time.sleep(30)  # 每30秒检查一次
-            
-            # 每小时打印一次心跳
-            if datetime.now().minute == 0 and datetime.now().second < 30:
-                logger.info(f"调度器运行中... 下次执行: {self._get_next_run_time()}")
-        
+            time.sleep(30)
+
+            now = datetime.now()
+            if now.minute == 0 and now.second < 30:
+                logger.info("调度器运行中... 下次执行: %s", self._get_next_run_time())
+
         logger.info("调度器已停止")
-    
+
     def _get_next_run_time(self) -> str:
-        """获取下次执行时间"""
+        """Return the next scheduled run in both local and A-share time."""
         jobs = self.schedule.get_jobs()
-        if jobs:
-            next_run = min(job.next_run for job in jobs)
-            return next_run.strftime('%Y-%m-%d %H:%M:%S')
-        return "未设置"
-    
+        if not jobs:
+            return "未设置"
+
+        next_run = min(job.next_run for job in jobs)
+        local_dt = next_run.replace(tzinfo=self.local_timezone)
+        market_dt = local_dt.astimezone(self.market_timezone)
+        return (
+            f"{local_dt.strftime('%Y-%m-%d %H:%M:%S')} ({_format_timezone_name(self.local_timezone)}) / "
+            f"{market_dt.strftime('%Y-%m-%d %H:%M:%S')} ({_format_timezone_name(self.market_timezone)})"
+        )
+
     def stop(self):
-        """停止调度器"""
         self._running = False
 
 
@@ -199,15 +229,7 @@ def run_with_schedule(
     run_immediately: bool = True,
     extra_daily_tasks: Optional[Sequence[Tuple[str, Callable, str]]] = None,
 ):
-    """
-    便捷函数：使用定时调度运行任务
-    
-    Args:
-        task: 要执行的任务函数
-        schedule_time: 每日执行时间
-        run_immediately: 是否立即执行一次
-        extra_daily_tasks: 额外的日内任务 [(time_str, callback, task_name), ...]
-    """
+    """Convenience helper for daily schedule mode."""
     scheduler = Scheduler(schedule_time=schedule_time)
     if extra_daily_tasks:
         scheduler.set_daily_tasks(
@@ -221,16 +243,15 @@ def run_with_schedule(
 
 
 if __name__ == "__main__":
-    # 测试定时调度
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s',
+        format="%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s",
     )
-    
+
     def test_task():
         print(f"任务执行中... {datetime.now()}")
         time.sleep(2)
         print("任务完成!")
-    
+
     print("启动测试调度器（按 Ctrl+C 退出）")
     run_with_schedule(test_task, schedule_time="23:59", run_immediately=True)

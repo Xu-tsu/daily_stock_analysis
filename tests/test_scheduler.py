@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Unit tests for multi-checkpoint scheduler wiring."""
+"""Unit tests for schedule mode timezone handling."""
 
 import sys
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 
 class _FakeJobBuilder:
@@ -58,10 +58,14 @@ class SchedulerMultiTaskTestCase(unittest.TestCase):
             sys.modules["schedule"] = self._original_schedule
 
     def test_set_daily_tasks_registers_multiple_jobs_and_runs_only_named_immediate_task(self) -> None:
-        from src.scheduler import Scheduler
+        from src.scheduler import CN_MARKET_TIMEZONE, Scheduler
 
         executed = []
-        scheduler = Scheduler(schedule_time="18:00")
+        scheduler = Scheduler(
+            schedule_time="18:00",
+            market_timezone=CN_MARKET_TIMEZONE,
+            local_timezone=CN_MARKET_TIMEZONE,
+        )
         scheduler.set_daily_tasks(
             tasks=[
                 ("18:00", lambda: executed.append("daily"), "daily_analysis"),
@@ -75,11 +79,34 @@ class SchedulerMultiTaskTestCase(unittest.TestCase):
         self.assertEqual(executed, ["daily"])
         self.assertEqual([job["time"] for job in scheduler.schedule.jobs], ["18:00", "10:15", "12:30"])
 
+    def test_set_daily_tasks_converts_a_share_time_to_local_host_time(self) -> None:
+        from src.scheduler import CN_MARKET_TIMEZONE, Scheduler
+
+        tokyo_tz = timezone(timedelta(hours=9), "Asia/Tokyo")
+        scheduler = Scheduler(
+            schedule_time="18:00",
+            market_timezone=CN_MARKET_TIMEZONE,
+            local_timezone=tokyo_tz,
+        )
+        scheduler.set_daily_tasks(
+            tasks=[
+                ("10:15", lambda: None, "morning_review"),
+                ("12:30", lambda: None, "afternoon_review"),
+            ],
+            run_immediately=False,
+        )
+
+        self.assertEqual([job["time"] for job in scheduler.schedule.jobs], ["11:15", "13:30"])
+
     def test_set_daily_task_keeps_backward_compatible_single_job_behavior(self) -> None:
-        from src.scheduler import Scheduler
+        from src.scheduler import CN_MARKET_TIMEZONE, Scheduler
 
         executed = []
-        scheduler = Scheduler(schedule_time="18:00")
+        scheduler = Scheduler(
+            schedule_time="18:00",
+            market_timezone=CN_MARKET_TIMEZONE,
+            local_timezone=CN_MARKET_TIMEZONE,
+        )
         scheduler.set_daily_task(lambda: executed.append("single"), run_immediately=True)
 
         self.assertEqual(executed, ["single"])

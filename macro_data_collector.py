@@ -18,6 +18,9 @@ logger = logging.getLogger(__name__)
 _SEARXNG_CACHE = {}
 _SEARXNG_CACHE_LOCK = Lock()
 _SEARXNG_CACHE_TTL_SECONDS = 45.0
+_SEARXNG_DISABLED_UNTIL = 0.0
+_SEARXNG_DISABLED_REASON = ""
+_SEARXNG_COOLDOWN_SECONDS = 180.0
 
 # Tushare（可选，有 Token 时启用更多数据）
 TUSHARE_TOKEN = os.getenv("TUSHARE_TOKEN", "")
@@ -36,6 +39,33 @@ def _get_tushare():
 
 # SearXNG 地址
 SEARXNG_URL = os.getenv("SEARXNG_BASE_URLS", "http://127.0.0.1:8888")
+
+
+def _get_searxng_cooldown_remaining(now: Optional[float] = None) -> float:
+    current = time.time() if now is None else now
+    with _SEARXNG_CACHE_LOCK:
+        return max(0.0, _SEARXNG_DISABLED_UNTIL - current)
+
+
+def _mark_searxng_unavailable(reason: str) -> None:
+    global _SEARXNG_DISABLED_UNTIL, _SEARXNG_DISABLED_REASON
+    with _SEARXNG_CACHE_LOCK:
+        already_disabled = _SEARXNG_DISABLED_UNTIL > time.time()
+        _SEARXNG_DISABLED_UNTIL = time.time() + _SEARXNG_COOLDOWN_SECONDS
+        _SEARXNG_DISABLED_REASON = reason
+    if not already_disabled:
+        logger.warning(
+            "SearXNG 当前不可用，%.0f 秒内跳过后续搜索: %s",
+            _SEARXNG_COOLDOWN_SECONDS,
+            reason,
+        )
+
+
+def _clear_searxng_unavailable() -> None:
+    global _SEARXNG_DISABLED_UNTIL, _SEARXNG_DISABLED_REASON
+    with _SEARXNG_CACHE_LOCK:
+        _SEARXNG_DISABLED_UNTIL = 0.0
+        _SEARXNG_DISABLED_REASON = ""
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -513,6 +543,8 @@ def _searxng_search(query: str, max_results: int = 10) -> list:
         entry = _SEARXNG_CACHE.get(cache_key)
         if entry and (now - entry["ts"]) <= _SEARXNG_CACHE_TTL_SECONDS:
             return copy.deepcopy(entry["value"])
+        if _SEARXNG_DISABLED_UNTIL > now:
+            return []
     try:
         r = requests.get(
             f"{SEARXNG_URL}/search",
@@ -531,7 +563,9 @@ def _searxng_search(query: str, max_results: int = 10) -> list:
                 })
             with _SEARXNG_CACHE_LOCK:
                 _SEARXNG_CACHE[cache_key] = {"ts": time.time(), "value": copy.deepcopy(results)}
+            _clear_searxng_unavailable()
             return results
+        _mark_searxng_unavailable(f"HTTP {r.status_code} @ {SEARXNG_URL}")
     except Exception as e:
         logger.warning(f"SearXNG 搜索失败: {e}")
     return []
