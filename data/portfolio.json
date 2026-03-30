@@ -1,22 +1,9 @@
 {
-  "updated_at": "2026-03-28 14:09:00",
-  "cash": 10028.28,
+  "updated_at": "2026-03-30 18:35:39",
+  "cash": 8533.28,
   "total_asset": 20582.28,
   "target_position_ratio": 0.7,
   "holdings": [
-    {
-      "code": "600744",
-      "name": "华银电力",
-      "shares": 200,
-      "cost_price": 8.861,
-      "current_price": 8.54,
-      "market_value": 1708.0,
-      "pnl": -65.48,
-      "pnl_pct": -3.62,
-      "sector": "电力",
-      "buy_date": "2026-03-25",
-      "strategy_tag": "趋势"
-    },
     {
       "code": "002131",
       "name": "利欧股份",
@@ -33,10 +20,10 @@
     {
       "code": "002506",
       "name": "协鑫集成",
-      "shares": 700,
-      "cost_price": 5.38,
-      "current_price": 5.4,
-      "market_value": 2160.0,
+      "shares": 1300,
+      "cost_price": 5.239,
+      "current_price": 5.075,
+      "market_value": 6597.5,
       "pnl": -17.78,
       "pnl_pct": -0.74,
       "sector": "光伏",

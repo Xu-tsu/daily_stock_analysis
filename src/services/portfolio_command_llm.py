@@ -1,15 +1,10 @@
 # -*- coding: utf-8 -*-
-"""
-Natural-language portfolio command interpreter backed by local LLM.
-
-Used by chat / bot layers to turn free-form Chinese phrases such as
-"帮我把协鑫集成再补三手，挂5块05" into a structured command payload.
-"""
+"""Natural-language portfolio command interpreter backed by a local LLM."""
 
 from __future__ import annotations
 
-import json
 import importlib
+import json
 import logging
 import os
 import re
@@ -22,6 +17,7 @@ from src.config import (
     get_api_keys_for_model,
     get_config,
 )
+from src.services.trade_feedback_service import get_recent_trade_context
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +36,10 @@ COMMAND_SCHEMA = {
     "stock_hint": "",
     "shares": None,
     "price": None,
+    "outcome_price": None,
+    "reference_action": "",
+    "feedback_tag": "other",
+    "summary": "",
     "needs_clarification": False,
     "clarification": "",
     "confidence": 0.0,
@@ -50,6 +50,7 @@ VALID_ACTIONS = {
     "buy",
     "sell",
     "clear",
+    "feedback",
     "show_portfolio",
     "rebalance",
     "scan",
@@ -74,29 +75,36 @@ ACTION_ALIASES = {
     "主线": "mainline",
     "回测": "backtest",
     "预警": "alert",
+    "feedback": "feedback",
+    "复盘反馈": "feedback",
+    "反馈": "feedback",
 }
 
 _JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
 
-PORTFOLIO_COMMAND_SYSTEM_PROMPT = """你是A股持仓机器人里的“口令识别器”，只做一件事：把用户自然语言识别成结构化持仓命令。
-
+PORTFOLIO_COMMAND_SYSTEM_PROMPT = """你是 A 股持仓机器人里的“口令识别器”，只做一件事：把用户自然语言识别成结构化命令。
 你必须严格只返回一个 JSON 对象，不要 markdown，不要解释，不要多余文字。
 
 支持动作：
 - buy: 买入 / 加仓 / 补仓 / 再买
 - sell: 卖出 / 减仓 / 先出一部分
 - clear: 清仓 / 全卖 / 卖光
+- feedback: 用户在复盘上一次交易结果，希望系统吸收经验并改进下次判断
 - show_portfolio: 查看持仓 / 看看仓位
 - rebalance / scan / mainline / backtest / alert / performance / pattern_review / trade_history
-- other: 不是持仓机器人命令，只是聊天、问股、讨论行情
+- other: 不是持仓机器人命令，只是聊天、问行情、问机会
 
 输出 JSON schema：
 {
   "is_portfolio_command": true,
-  "action": "buy|sell|clear|show_portfolio|rebalance|scan|mainline|backtest|alert|performance|pattern_review|trade_history|other",
+  "action": "buy|sell|clear|feedback|show_portfolio|rebalance|scan|mainline|backtest|alert|performance|pattern_review|trade_history|other",
   "stock_hint": "股票名称或代码，没有则空字符串",
   "shares": 300,
   "price": 5.05,
+  "outcome_price": 7.77,
+  "reference_action": "buy|sell|clear|hold|other",
+  "feedback_tag": "sold_too_early|stopped_out_then_rebounded|dip_buy_success|bought_too_early|chased_high_then_dumped|good_exit|other",
+  "summary": "一句话总结这条反馈",
   "needs_clarification": false,
   "clarification": "",
   "confidence": 0.96,
@@ -104,14 +112,16 @@ PORTFOLIO_COMMAND_SYSTEM_PROMPT = """你是A股持仓机器人里的“口令识
 }
 
 规则：
-1. 只要用户是在“执行持仓动作”或“查看当前持仓/仓位”，就判为 is_portfolio_command=true。
+1. 只要用户是在执行持仓动作、查看当前持仓/仓位、或者对上一笔交易做复盘反馈，就判定 is_portfolio_command=true。
 2. 普通聊天、问行情、问龙头、问机会、让你推荐股票，不算持仓命令，返回 action=other。
-3. A股数量统一输出为 shares（股数），不要输出“手”；3手必须输出 300。
+3. A 股数量统一输出为 shares（股数），不要输出“手”；3手必须输出成 300。
 4. 用户说“全卖”“卖光”“清掉”这类，action=clear，shares 置空。
-5. 对语音转文字口误、同音字、近音字，要结合当前持仓列表优先推断，例如“写信继承”优先理解成“协鑫集成”。
-6. 如果明确是持仓命令，但缺少必要信息（例如加仓没说价格，减仓没说数量），则 is_portfolio_command=true，needs_clarification=true，并给出 clarification。
-7. 如果是查看仓位/持仓，不需要股票名、股数、价格。
-8. confidence 取 0 到 1。
+5. 如果用户描述的是过去已经发生的交易结果，例如“7.61 清仓后立刻被拉升到 7.77”“止损后马上反弹”，这是 feedback，不是新的卖出命令。
+6. 对语音转文字口误、同音字、近音字，要结合当前持仓列表和最近交易记录优先推断，例如“写信继承”优先理解成“协鑫集成”。
+7. 如果是明确的持仓命令，但缺少必要信息（例如加仓没说价格，减仓没说数量），则 needs_clarification=true，并给出 clarification。
+8. 如果是查看仓位/持仓，不需要股票名、股数、价格。
+9. feedback 的 summary 要总结“这次交易哪里做对/做错了”；feedback_tag 选最贴切的一个。
+10. confidence 取值 0 到 1。
 """
 
 
@@ -161,11 +171,10 @@ def _normalize_action(action: Any) -> str:
 
 def _normalize_response(data: dict, raw_text: str) -> dict:
     normalized = dict(COMMAND_SCHEMA)
+
     action = _normalize_action(data.get("action"))
     normalized["action"] = action
-    normalized["is_portfolio_command"] = _bool_value(
-        data.get("is_portfolio_command")
-    ) or action != "other"
+    normalized["is_portfolio_command"] = _bool_value(data.get("is_portfolio_command")) or action != "other"
 
     stock_hint = data.get("stock_hint")
     normalized["stock_hint"] = stock_hint.strip() if isinstance(stock_hint, str) else ""
@@ -178,6 +187,18 @@ def _normalize_response(data: dict, raw_text: str) -> dict:
     price = _to_float(data.get("price"))
     normalized["price"] = round(price, 3) if price and price > 0 else None
 
+    outcome_price = _to_float(data.get("outcome_price"))
+    normalized["outcome_price"] = round(outcome_price, 3) if outcome_price and outcome_price > 0 else None
+
+    reference_action = data.get("reference_action")
+    normalized["reference_action"] = reference_action.strip().lower() if isinstance(reference_action, str) else ""
+
+    feedback_tag = data.get("feedback_tag")
+    normalized["feedback_tag"] = feedback_tag.strip() if isinstance(feedback_tag, str) and feedback_tag.strip() else "other"
+
+    summary = data.get("summary")
+    normalized["summary"] = summary.strip() if isinstance(summary, str) else ""
+
     normalized["needs_clarification"] = _bool_value(data.get("needs_clarification"))
     clarification = data.get("clarification")
     normalized["clarification"] = clarification.strip() if isinstance(clarification, str) else ""
@@ -185,9 +206,7 @@ def _normalize_response(data: dict, raw_text: str) -> dict:
         normalized["clarification"] = "识别到了持仓操作，但缺少必要的价格或数量，请补充后再发一次。"
 
     confidence = _to_float(data.get("confidence"))
-    if confidence is None:
-        confidence = 0.0
-    normalized["confidence"] = max(0.0, min(1.0, confidence))
+    normalized["confidence"] = max(0.0, min(1.0, confidence or 0.0))
 
     reason = data.get("reason")
     normalized["reason"] = reason.strip() if isinstance(reason, str) else ""
@@ -226,7 +245,7 @@ def _resolve_local_command_model() -> str:
         candidates.append(explicit)
 
     primary = str(getattr(cfg, "litellm_model", "") or "").strip()
-    if primary and primary.startswith("ollama/"):
+    if primary.startswith("ollama/"):
         candidates.append(primary)
 
     for fallback in list(getattr(cfg, "litellm_fallback_models", []) or []):
@@ -270,6 +289,8 @@ def _call_local_command_llm(text: str, holdings: Optional[List[dict]] = None) ->
 
     cfg = get_config()
     holdings = holdings or []
+    recent_trades = get_recent_trade_context(limit=8)
+
     holdings_brief = [
         {
             "code": str(item.get("code", "") or "").strip(),
@@ -278,9 +299,23 @@ def _call_local_command_llm(text: str, holdings: Optional[List[dict]] = None) ->
         }
         for item in holdings
     ]
+    recent_trades_brief = [
+        {
+            "trade_date": str(item.get("trade_date", "") or "").strip(),
+            "trade_type": str(item.get("trade_type", "") or "").strip(),
+            "code": str(item.get("code", "") or "").strip(),
+            "name": str(item.get("name", "") or "").strip(),
+            "shares": int(item.get("shares", 0) or 0),
+            "price": round(float(item.get("price", 0) or 0), 3),
+        }
+        for item in recent_trades
+    ]
+
     user_prompt = (
-        "当前持仓列表（优先用它来消歧义和纠正语音识别口误）：\n"
+        "当前持仓列表（优先用它来消歧和修正语音识别口误）：\n"
         f"{json.dumps(holdings_brief, ensure_ascii=False)}\n\n"
+        "最近交易记录（优先用于理解“7.61 清仓后拉到 7.77”这类反馈）：\n"
+        f"{json.dumps(recent_trades_brief, ensure_ascii=False)}\n\n"
         f"用户原始消息：{text}"
     )
 
@@ -326,11 +361,12 @@ def interpret_portfolio_command(text: str, holdings: Optional[List[dict]] = None
             return None
         parsed["model"] = model
         logger.info(
-            "[PortfolioLLM] action=%s stock=%s shares=%s price=%s clarification=%s model=%s confidence=%.2f",
+            "[PortfolioLLM] action=%s stock=%s shares=%s price=%s outcome=%s clarification=%s model=%s confidence=%.2f",
             parsed.get("action"),
             parsed.get("stock_hint"),
             parsed.get("shares"),
             parsed.get("price"),
+            parsed.get("outcome_price"),
             parsed.get("needs_clarification"),
             model,
             parsed.get("confidence", 0.0),
@@ -339,3 +375,4 @@ def interpret_portfolio_command(text: str, holdings: Optional[List[dict]] = None
     except Exception as exc:
         logger.warning("[PortfolioLLM] 本地模型识别持仓口令失败: %s", exc)
         return None
+

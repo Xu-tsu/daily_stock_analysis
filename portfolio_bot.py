@@ -80,6 +80,12 @@ LLM_PORTFOLIO_HINT_WORDS = (
 
 _PORTFOLIO_LLM_CACHE: dict[str, Optional[dict]] = {}
 
+FEEDBACK_CUE_WORDS = (
+    "卖飞", "止盈后", "清仓后", "卖出后", "减仓后", "买入后", "加仓后", "补仓后",
+    "后立刻", "后马上", "后就", "后被", "结果", "反弹", "拉升", "冲到", "回落到",
+    "踏空了", "反馈", "复盘",
+)
+
 
 def _compact_text(text: str) -> str:
     return re.sub(r"\s+", "", (text or "").replace("\u3000", " ").strip())
@@ -93,12 +99,30 @@ def _get_holdings_snapshot() -> list[dict]:
     return list(portfolio.get("holdings", []) or [])
 
 
+def _looks_like_trade_feedback(text: str) -> bool:
+    compact = _compact_text(text)
+    if not compact:
+        return False
+    if "卖飞" in compact:
+        return True
+    action_words = ("买入", "加仓", "补仓", "卖出", "减仓", "清仓", "止盈", "止损")
+    has_action_context = any(word in compact for word in action_words)
+    if not has_action_context:
+        return False
+    followup_cue = any(word in compact for word in FEEDBACK_CUE_WORDS)
+    price_count = len(re.findall(r"\d+(?:\.\d+)?", compact))
+    past_tense_cue = any(word in compact for word in ("后", "结果", "被", "后来", "立刻", "马上"))
+    return followup_cue or (price_count >= 2 and past_tense_cue)
+
+
 def _should_try_llm_portfolio_interpretation(text: str) -> bool:
     compact = _compact_text(text)
-    if not compact or len(compact) > 80:
+    if not compact or len(compact) > 160:
         return False
 
     if _is_show_portfolio_command(compact):
+        return True
+    if _looks_like_trade_feedback(compact):
         return True
 
     has_hint_word = any(word in compact for word in LLM_PORTFOLIO_HINT_WORDS)
@@ -191,6 +215,8 @@ def _looks_like_trade_instruction(text: str) -> bool:
 
 def _detect_trade_action(text: str) -> Optional[str]:
     compact = _compact_text(text)
+    if _looks_like_trade_feedback(compact):
+        return None
     for keyword, action in TRADE_ACTION_MAP.items():
         if compact.startswith(keyword):
             return action
@@ -304,6 +330,34 @@ def _parse_clear_target(text: str) -> Tuple[Optional[str], Optional[str]]:
     return code, None
 
 
+def _looks_like_trade_instruction(text: str) -> bool:
+    compact = _compact_text(text)
+    has_action = any(word in compact for word in ("买入", "加仓", "补仓", "卖出", "减仓"))
+    has_quantity = LOT_PATTERN.search(compact) is not None
+    has_price = _extract_price(compact) is not None
+    has_symbol = _extract_stock_identifier(compact) is not None
+    return has_action and has_quantity and has_price and has_symbol
+
+
+def _detect_trade_action(text: str) -> Optional[str]:
+    compact = _compact_text(text)
+    if _looks_like_trade_feedback(compact):
+        return None
+    for keyword, action in TRADE_ACTION_MAP.items():
+        if compact.startswith(keyword):
+            return action
+
+    if "清仓" in compact:
+        return "clear"
+
+    if _looks_like_trade_instruction(compact):
+        if any(word in compact for word in ("加仓", "补仓", "买入")):
+            return "buy"
+        if any(word in compact for word in ("减仓", "卖出")):
+            return "sell"
+    return None
+
+
 def is_portfolio_command(text: str) -> bool:
     """判断是否是持仓管理指令"""
     text = text.strip()
@@ -410,6 +464,8 @@ def _handle_llm_portfolio_command(command: Optional[dict], raw_text: str) -> Opt
         return _handle_pattern_review()
     if action == "trade_history":
         return _handle_trade_history()
+    if action == "feedback":
+        return _handle_trade_feedback(command, raw_text)
     if action in {"buy", "sell", "clear"}:
         holdings = _get_holdings_snapshot()
         stock_hint = str(command.get("stock_hint", "") or "").strip()
@@ -429,6 +485,42 @@ def _handle_llm_portfolio_command(command: Optional[dict], raw_text: str) -> Opt
         return _execute_sell_order(code, shares, price)
 
     return None
+
+
+def _handle_trade_feedback(command: Optional[dict], raw_text: str) -> str:
+    if not command:
+        return "识别到了复盘反馈，但缺少可用内容，请补充后再发一次。"
+
+    try:
+        from src.services.trade_feedback_service import record_trade_feedback
+
+        result = record_trade_feedback(raw_text=raw_text, parsed_feedback=command, source="feishu")
+    except Exception as exc:
+        logger.warning("记录交易反馈失败: %s", exc)
+        return f"识别到了复盘反馈，但写入失败：{exc}"
+
+    if result.get("needs_clarification"):
+        return result.get("clarification") or "识别到了复盘反馈，但还需要补充股票名后才能吸收。"
+
+    symbol = result.get("name") or result.get("code") or "该笔交易"
+    tag = result.get("feedback_tag") or "other"
+    tag_text = {
+        "sold_too_early": "卖飞/止盈偏早",
+        "stopped_out_then_rebounded": "止损后反抽",
+        "dip_buy_success": "分歧低吸有效",
+        "bought_too_early": "左侧接早",
+        "chased_high_then_dumped": "追高回撤",
+        "good_exit": "兑现节奏正确",
+        "other": "执行反馈",
+    }.get(tag, "执行反馈")
+    guidance = result.get("guidance") or "后续预判会把这条反馈作为纠偏样本。"
+    summary = result.get("summary") or raw_text
+    return (
+        f"✅ 已记录反馈\n"
+        f"  {symbol}: {tag_text}\n"
+        f"  📝 {summary}\n"
+        f"  💡 后续纠偏: {guidance}"
+    )
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -485,7 +577,7 @@ def _execute_buy_order(code: str, shares: int, price: float, raw_text: str = "")
     else:
         # 新建仓位
         # 猜板块
-        sector = _guess_sector(text, code)
+        sector = _guess_sector(raw_text, code)
         holdings.append({
             "code": code,
             "name": name,
@@ -504,6 +596,20 @@ def _execute_buy_order(code: str, shares: int, price: float, raw_text: str = "")
     portfolio["holdings"] = holdings
     save_portfolio(portfolio)
     _clear_portfolio_llm_cache()
+    try:
+        from trade_journal import record_buy
+
+        record_buy(
+            code=code,
+            name=name,
+            shares=shares,
+            price=price,
+            sector=existing.get("sector", "") if existing else _guess_sector(raw_text, code),
+            source="portfolio_bot",
+            note=raw_text or action,
+        )
+    except Exception as exc:
+        logger.debug("记录买入交易日志失败: %s", exc)
 
     return (
         f"✅ {action}成功\n"
@@ -561,6 +667,8 @@ def _execute_sell_order(code: str, shares: int, price: float) -> str:
     income = round(shares * price, 2)
     pnl = round((price - target["cost_price"]) * shares, 2)
     pnl_pct = round((price - target["cost_price"]) / target["cost_price"] * 100, 2)
+    trade_name = target.get("name", code)
+    trade_cost_price = float(target.get("cost_price", 0) or 0)
 
     target["shares"] -= shares
     target["current_price"] = price
@@ -574,6 +682,20 @@ def _execute_sell_order(code: str, shares: int, price: float) -> str:
     portfolio["holdings"] = holdings
     save_portfolio(portfolio)
     _clear_portfolio_llm_cache()
+    try:
+        from trade_journal import record_sell
+
+        record_sell(
+            code=code,
+            name=trade_name,
+            shares=shares,
+            price=price,
+            cost_price=trade_cost_price,
+            source="portfolio_bot",
+            note="manual_sell",
+        )
+    except Exception as exc:
+        logger.debug("记录卖出交易日志失败: %s", exc)
 
     emoji = "🟢" if pnl >= 0 else "🔴"
     return (
@@ -619,12 +741,29 @@ def _execute_clear_order(code: str) -> str:
 
     income = round(target["shares"] * current_price, 2)
     pnl = round((current_price - target["cost_price"]) * target["shares"], 2)
+    cleared_shares = int(target["shares"])
+    target_name = target.get("name", code)
+    cost_price = float(target.get("cost_price", 0) or 0)
 
     holdings = [h for h in holdings if h["code"] != code]
     portfolio["cash"] = round(portfolio.get("cash", 0) + income, 2)
     portfolio["holdings"] = holdings
     save_portfolio(portfolio)
     _clear_portfolio_llm_cache()
+    try:
+        from trade_journal import record_sell
+
+        record_sell(
+            code=code,
+            name=target_name,
+            shares=cleared_shares,
+            price=current_price,
+            cost_price=cost_price,
+            source="portfolio_bot",
+            note="manual_clear",
+        )
+    except Exception as exc:
+        logger.debug("记录清仓交易日志失败: %s", exc)
 
     emoji = "🟢" if pnl >= 0 else "🔴"
     return (

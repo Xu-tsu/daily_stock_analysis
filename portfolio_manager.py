@@ -473,6 +473,9 @@ def format_rebalance_report(rebalance: dict) -> str:
         lines.append("🔍 **换股候选**:")
         for candidate in candidates:
             line = f"  • {candidate.get('name', '')}({candidate.get('code', '')}) — {candidate.get('reason', '')}"
+            relay_role = candidate.get("relay_role")
+            if relay_role:
+                line += f"\n    🔗 角色: {relay_role}"
             buy_range = candidate.get("buy_price_range")
             target_price = candidate.get("target_sell_price")
             stop_loss = candidate.get("stop_loss_price")
@@ -485,6 +488,9 @@ def format_rebalance_report(rebalance: dict) -> str:
                 if stop_loss:
                     prices.append(f"止损:{stop_loss}")
                 line += f"\n    🎯 {' | '.join(prices)}"
+            timing_note = candidate.get("timing_note")
+            if timing_note:
+                line += f"\n    ⏱️ 时机: {timing_note}"
             lines.append(line)
             _append_execution_plan(lines, candidate, indent="    ")
         lines.append("")

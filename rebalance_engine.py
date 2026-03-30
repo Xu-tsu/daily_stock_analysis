@@ -16,7 +16,7 @@ LLM 调用方式:
 import json, logging, os, time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +27,7 @@ from macro_data_collector import collect_full_macro_data
 from portfolio_manager import (
     load_portfolio, update_current_prices, format_rebalance_report,
 )
+from src.services.trade_feedback_service import format_feedback_for_prompt
 from src.services.trade_sizing_service import annotate_a_share_trade_suggestions
 
 # 蒸馏数据保存目录
@@ -276,6 +277,125 @@ def _parse_llm_json(response: str) -> dict:
                 pass
         logger.error(f"JSON 解析失败，原始响应前300字: {text[:300]}...")
         return {}
+
+
+def _build_recent_feedback_prompt_block(limit: int = 6) -> str:
+    """Return a compact manual-feedback block for future rebalance prompts."""
+    try:
+        feedback_text = format_feedback_for_prompt(limit=limit)
+    except Exception as exc:
+        logger.debug("加载人工反馈纠偏样本失败: %s", exc)
+        return ""
+    if not feedback_text:
+        return ""
+    return (
+        "\n\n## 最近的实盘反馈纠偏（来自飞书人工回灌，优先用于修正执行偏差）\n"
+        f"{feedback_text}\n"
+        "请把这些反馈当作真实交易后的纠偏样本，在不破坏核心风控的前提下，优先修正容易卖飞、追高或左侧接早的问题。"
+    )
+
+
+def _load_scan_mode_candidates(scan_mode: str, limit: int = 12) -> List[dict]:
+    try:
+        from data_store import _get_conn
+    except Exception as exc:
+        logger.debug("加载 %s 扫描结果失败: %s", scan_mode, exc)
+        return []
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT code, name, price, change_pct, turnover_rate, market_cap,
+                   ma_trend, macd_signal, rsi, vol_pattern, tech_score
+            FROM scan_results
+            WHERE scan_date = ? AND scan_mode = ?
+            ORDER BY tech_score DESC, created_at DESC
+            LIMIT ?
+            """,
+            (today, scan_mode, limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    except Exception as exc:
+        logger.debug("读取 %s 扫描结果失败: %s", scan_mode, exc)
+        return []
+    finally:
+        conn.close()
+
+
+def _build_relay_candidate_pool(
+    hot_candidates: list,
+    dominant_themes: Optional[List[str]] = None,
+    limit: int = 10,
+) -> List[dict]:
+    """Merge trend candidates with sub-dragon scans and annotate entry timing."""
+    from src.services.theme_rotation_service import annotate_rotation_candidates
+
+    merged: Dict[str, dict] = {}
+    for item in hot_candidates or []:
+        code = str(item.get("code", "") or "").strip()
+        if not code:
+            continue
+        row = dict(item)
+        row.setdefault("candidate_source", "trend_hot")
+        merged[code] = row
+
+    for item in _load_scan_mode_candidates("sub_dragon", limit=max(limit, 8)):
+        code = str(item.get("code", "") or "").strip()
+        if not code:
+            continue
+        existing = merged.get(code, {})
+        row = {**item, **existing}
+        row["candidate_source"] = "sub_dragon"
+        merged[code] = row
+
+    annotated = annotate_rotation_candidates(
+        list(merged.values()),
+        dominant_themes=dominant_themes or [],
+        limit=None,
+    )
+    return annotated[:limit]
+
+
+def _apply_candidate_timing_guards(new_candidates: list, candidate_snapshots: list) -> list:
+    """Prevent stale buy ranges after intraday low has already been missed."""
+
+    snapshot_by_code = {
+        str(item.get("code", "") or "").strip(): item
+        for item in candidate_snapshots or []
+        if str(item.get("code", "") or "").strip()
+    }
+    guarded: List[dict] = []
+    for candidate in new_candidates or []:
+        row = dict(candidate)
+        code = str(row.get("code", "") or "").strip()
+        snapshot = snapshot_by_code.get(code)
+        if not snapshot:
+            guarded.append(row)
+            continue
+
+        timing_note = str(snapshot.get("timing_note", "") or "").strip()
+        preferred_buy_range = str(snapshot.get("preferred_buy_range", "") or "").strip()
+        entry_state = str(snapshot.get("entry_state", "") or "").strip()
+        relay_role = str(snapshot.get("relay_role", "") or "").strip()
+        row["timing_note"] = timing_note
+        row["relay_role"] = relay_role
+        row["current_price"] = snapshot.get("price")
+        row["change_pct"] = snapshot.get("change_pct")
+        row["main_net"] = snapshot.get("main_net")
+
+        if snapshot.get("missed_entry"):
+            if preferred_buy_range:
+                row["buy_price_range"] = preferred_buy_range
+            base_reason = str(row.get("reason", "") or "").strip()
+            miss_note = "当前价格已明显脱离盘中低吸窗口，若没在分歧低点成交，现阶段不追高，等待下一次回踩确认。"
+            row["reason"] = f"{base_reason} {miss_note}".strip()
+        elif entry_state in {"pullback_ready", "secondary_relay"} and preferred_buy_range and not row.get("buy_price_range"):
+            row["buy_price_range"] = preferred_buy_range
+
+        guarded.append(row)
+    return guarded
 
 
 def _truncate_discussion_text(value, limit: int = 140) -> str:
@@ -902,6 +1022,8 @@ PROMPT_DEBATE_CRITIQUE = """你是一位严谨保守的A股风控专家，你的
 7. **卖点合理性**：目标卖出价和止损价是否合理？止盈太贪或止损太松都不行
 8. **低吸机会**：如果大盘下跌但主线板块资金仍在、个股只是回踩支撑，方案是否错过“买在分歧”的低吸机会？
 9. **高潮兑现**：如果个股红盘冲高、题材一致加速、人气过热，方案是否应该更主动止盈，而不是继续恋战？
+10. **题材切主线**：如果领涨龙头继续连板、板块内副龙/补涨股开始放量承接，方案有没有及时识别“新主线切换”和副龙低吸机会？
+11. **过期买点**：如果建议买入区间已经被盘中拉升明显脱离，方案是否还在给一个已经失效的低点价位？
 
 请严格按以下 JSON 格式回复：
 {{
@@ -942,6 +1064,8 @@ PROMPT_DEBATE_ARBITRATE = """你是最终仲裁者，需要综合激进派交易
 5. 每只股必须给出 target_sell_price 和 stop_loss_price
 6. 换股只能从热门股列表中选，不能自己编造
 7. 同等条件下，优先“买在分歧、卖在高潮”：指数回落但主线未坏时允许小仓低吸；红盘冲高且人气拥挤时优先兑现
+8. 如果龙头已经加速封板，优先考虑同题材里尚未完全加速、但资金开始扩散承接的副龙/补涨股
+9. 如果原始低吸位已经被盘中拉升明显脱离，不要继续给过期买点；应改成等待下一次回踩确认
 
 请严格按以下 JSON 格式回复：
 {{
@@ -991,6 +1115,8 @@ PROMPT_REBALANCE_FINAL = """你是一位经验丰富的A股短线交易员，擅
 - 更高胜率的买点通常出现在大盘回落、盘面转冷、个股回踩支撑、市场“无人问津”时；前提是主线板块资金确认仍在，不能把下跌趋势误当低吸机会
 - 如果个股红盘冲高、题材一致加速、讨论度和跟风情绪明显升温，要优先考虑分批止盈/减仓，做到“卖在人声鼎沸”
 - 同等条件下，优先选择轻微回调或平盘承接的候选，而不是当天最热、最拥挤、最接近涨停的票
+- 如果领涨龙头已经涨停或连续加速，而同板块副龙开始放量承接、但尚未脱离低吸区间，应优先考虑副龙/补涨，而不是继续追龙头
+- 如果盘中最低点已经走过、当前价格明显高于低吸区间，不要继续给一个过期的静态买点，应明确写“等回踩/不追高”
 
 ### A股T+1追高禁令（最重要的规则！）
 - 绝对禁止买入当日涨幅超5%的股票
@@ -1041,6 +1167,7 @@ PROMPT_REBALANCE_FINAL = """你是一位经验丰富的A股短线交易员，擅
 6. **每只股票必须给出 sell_timing（什么条件下卖出）**，如"盈利5%或跌破MA5卖出"
 7. 标注风险等级
 8. 持仓天数必须严格按照 buy_date 字段计算到今天的交易日数，不要编造
+9. 如果某只股票所处题材仍在强化、只是冲高后可能回踩，不要动不动就一刀切清仓；除非触发硬风控，否则优先分批止盈、保留底仓观察二波
 9. 如果大盘极弱，可以建议空仓等待，但一旦有板块异动要给出抄底候选
 
 请严格按以下 JSON 格式回复：
@@ -1255,7 +1382,7 @@ def run_rebalance_analysis(config: Config = None) -> dict:
     # ── Step 5: 多模型辩论调仓（激进派 vs 保守派 → 仲裁）──
     logger.info("\n[Step 5/7] 多模型辩论调仓决策...")
 
-    # 真实换股候选（来自同花顺爬虫，不让LLM编造）
+    # 真实换股候选（来自全市场扫描/副龙头扫描/资金流，不让LLM编造）
     hot_picks = macro_data.get("hot_candidates", [])
     if not hot_picks:
         # 兜底：从板块数据中提取
@@ -1263,6 +1390,11 @@ def run_rebalance_analysis(config: Config = None) -> dict:
             if isinstance(sector_info, dict):
                 for item in sector_info.get("top_inflow", [])[:3]:
                     hot_picks.append(item)
+    hot_picks = _build_relay_candidate_pool(
+        hot_picks,
+        dominant_themes=sector_judge.get("hot_sectors", []),
+        limit=15,
+    )
 
     # 风控检查：为每只持仓标注风控状态
     risk_alerts_text = ""
@@ -1285,7 +1417,7 @@ def run_rebalance_analysis(config: Config = None) -> dict:
     except Exception as e:
         logger.debug(f"风控检查跳过: {e}")
 
-    # 过滤热门候选：去除当日涨幅>5%的追高股
+    # 过滤热门候选：去除当日涨幅>5%的追高股，并优先保留分歧低吸/副龙接力候选
     filtered_hot = []
     for pick in hot_picks[:15]:
         chg = pick.get("change_pct", pick.get("涨跌幅", 0))
@@ -1301,6 +1433,11 @@ def run_rebalance_analysis(config: Config = None) -> dict:
     hot_picks = sorted(
         filtered_hot,
         key=lambda item: (
+            {"pullback_ready": 0, "secondary_relay": 1, "watch": 2, "overextended": 3, "leader_locked": 4}.get(
+                str(item.get("entry_state", "watch")),
+                9,
+            ),
+            -float(item.get("rotation_score", 0) or 0),
             0 if -2.5 <= float(item.get("_rebalance_change_pct", 0) or 0) <= 1.5 else 1,
             abs(float(item.get("_rebalance_change_pct", 0) or 0) + 0.2),
             -float(item.get("main_net", 0) or 0),
@@ -1348,6 +1485,7 @@ def run_rebalance_analysis(config: Config = None) -> dict:
         indent=2,
     )
     hot_picks_json = json.dumps(hot_picks[:10], ensure_ascii=False, indent=2)
+    feedback_prompt_block = _build_recent_feedback_prompt_block()
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # Step 5a: 激进派（Qwen）— 提出调仓方案
@@ -1363,6 +1501,8 @@ def run_rebalance_analysis(config: Config = None) -> dict:
         portfolio=portfolio_json,
         hot_picks=hot_picks_json,
     )
+    if feedback_prompt_block:
+        prompt_proposal = prompt_proposal + feedback_prompt_block
     if risk_alerts_text:
         prompt_proposal = prompt_proposal + risk_alerts_text
 
@@ -1396,6 +1536,8 @@ def run_rebalance_analysis(config: Config = None) -> dict:
             market_summary=market_judge.get("summary", ""),
             sector_summary=sector_judge.get("summary", ""),
         )
+        if feedback_prompt_block:
+            prompt_critique = prompt_critique + feedback_prompt_block
         critique_raw, critique_model_used = _call_debate_llm(
             prompt_critique,
             "Agent4b_保守派",
@@ -1438,6 +1580,8 @@ def run_rebalance_analysis(config: Config = None) -> dict:
             portfolio=portfolio_json,
             hot_picks=hot_picks_json,
         )
+        if feedback_prompt_block:
+            prompt_arbitrate = prompt_arbitrate + feedback_prompt_block
         if risk_alerts_text:
             prompt_arbitrate = prompt_arbitrate + "\n" + risk_alerts_text
         prompt_used = prompt_arbitrate
@@ -1475,6 +1619,8 @@ def run_rebalance_analysis(config: Config = None) -> dict:
             portfolio=portfolio_json,
             hot_picks=hot_picks_json,
         )
+        if feedback_prompt_block:
+            prompt_fallback = prompt_fallback + feedback_prompt_block
         if risk_alerts_text:
             prompt_fallback = prompt_fallback + risk_alerts_text
         prompt_used = prompt_fallback
@@ -1530,7 +1676,7 @@ def run_rebalance_analysis(config: Config = None) -> dict:
             max_single_position_pct=MAX_SINGLE_POSITION_PCT,
         )
         rebalance["actions"] = annotated_actions
-        rebalance["new_candidates"] = annotated_candidates
+        rebalance["new_candidates"] = _apply_candidate_timing_guards(annotated_candidates, hot_picks)
         rebalance.setdefault("_meta", {})
         rebalance["_meta"]["execution_profile_source"] = execution_profile.source
         rebalance["_meta"]["execution_profile_samples"] = execution_profile.sample_size

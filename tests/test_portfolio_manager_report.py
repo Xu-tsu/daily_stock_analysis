@@ -71,7 +71,16 @@ class TestPortfolioManagerRebalanceReport(unittest.TestCase):
             "market_assessment": "指数弱势震荡。",
             "sector_assessment": "热点轮动加快。",
             "actions": [],
-            "new_candidates": [],
+            "new_candidates": [
+                {
+                    "code": "002361",
+                    "name": "神剑股份",
+                    "reason": "商业航天副龙开始承接。",
+                    "relay_role": "副龙/补涨候选",
+                    "buy_price_range": "7.05-7.16",
+                    "timing_note": "当前若已脱离该区间，不追高，等下一次回踩。",
+                }
+            ],
             "risk_warning": "谨慎追高。",
         }
 
@@ -80,6 +89,8 @@ class TestPortfolioManagerRebalanceReport(unittest.TestCase):
         self.assertIn("调仓建议报告", report)
         self.assertIn("仓位建议", report)
         self.assertNotIn("Agent1 大盘研判", report)
+        self.assertIn("角色: 副龙/补涨候选", report)
+        self.assertIn("不追高", report)
 
 
 if __name__ == "__main__":

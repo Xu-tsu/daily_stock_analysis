@@ -152,6 +152,9 @@ class TestOpeningAuctionMonitor(unittest.TestCase):
         summary["portfolio_advice"] = {
             "has_holdings": True,
             "position_advice": "测试仓位建议",
+            "theme_rotation": {
+                "summary": "商业航天有切主线迹象，领涨股封板后副龙开始承接。",
+            },
             "actions": [
                 {
                     "code": "300750",
@@ -178,6 +181,7 @@ class TestOpeningAuctionMonitor(unittest.TestCase):
         self.assertIn("12:30 午后方向判断", alert)
         self.assertIn("午后偏强", alert)
         self.assertIn("机器人", alert)
+        self.assertIn("商业航天有切主线迹象", alert)
         self.assertIn("[强势回踩加仓]", alert)
         self.assertIn("建议 200股", alert)
         self.assertIn("总支出 2965.92元", alert)
@@ -260,6 +264,7 @@ class TestOpeningAuctionMonitor(unittest.TestCase):
         self.assertEqual(action_by_code["000001"]["action"], "hold")
         self.assertEqual(action_by_code["000001"]["strategy"], "wait_for_base")
         self.assertEqual(advice["rotation_candidates"][0]["code"], "002594")
+        self.assertIn("theme_rotation", advice)
 
     def test_build_intraday_portfolio_advice_generates_round_lot_quantity(self) -> None:
         summary = {
@@ -621,6 +626,7 @@ class TestOpeningAuctionMonitor(unittest.TestCase):
         self.assertEqual(context["opening_auction"]["direction"], "strong")
         self.assertTrue(context["sector_confirmation"]["confirmed"])
         self.assertEqual(context["sector_confirmation"]["strength"], "strong")
+        self.assertEqual(context["theme_rotation"]["switch_signal"], "active")
 
 
 if __name__ == "__main__":

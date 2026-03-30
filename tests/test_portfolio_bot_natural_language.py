@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Tests for natural-language portfolio bot trade commands."""
+"""Tests for natural-language portfolio bot commands."""
 
 import os
 import sys
@@ -22,6 +22,9 @@ class TestPortfolioBotNaturalLanguage(unittest.TestCase):
     def test_is_portfolio_command_does_not_intercept_plain_buy_question(self) -> None:
         self.assertFalse(is_portfolio_command("有没有假如早盘低开买入有可能涨停的龙头股"))
 
+    def test_feedback_text_is_not_misclassified_as_new_clear_order(self) -> None:
+        self.assertIsNone(portfolio_bot._detect_trade_action("7.61清仓后立刻被拉升到了7.77"))
+
     @patch("portfolio_bot.interpret_portfolio_command")
     @patch("portfolio_bot.load_portfolio", return_value={"holdings": [{"code": "002506", "name": "协鑫集成", "shares": 700}]})
     def test_is_portfolio_command_uses_llm_for_free_form_command(
@@ -42,6 +45,7 @@ class TestPortfolioBotNaturalLanguage(unittest.TestCase):
         self.assertTrue(is_portfolio_command("帮我把协鑫集成再补三手，挂5块05"))
         mock_interpret.assert_called_once()
 
+    @patch("trade_journal.record_buy")
     @patch("portfolio_bot.save_portfolio")
     @patch("portfolio_bot.load_portfolio")
     @patch("portfolio_bot._get_stock_name", return_value="协鑫集成")
@@ -54,6 +58,7 @@ class TestPortfolioBotNaturalLanguage(unittest.TestCase):
         mock_get_stock_name,
         mock_load_portfolio,
         mock_save_portfolio,
+        mock_record_buy,
     ) -> None:
         mock_load_portfolio.return_value = {
             "cash": 10000.0,
@@ -83,6 +88,7 @@ class TestPortfolioBotNaturalLanguage(unittest.TestCase):
         self.assertEqual(saved_portfolio["cash"], 8485.0)
         mock_resolve_name.assert_not_called()
         mock_get_stock_name.assert_called_once_with("002506")
+        mock_record_buy.assert_called_once()
 
     @patch("portfolio_bot._should_try_llm_portfolio_interpretation", return_value=False)
     @patch("portfolio_bot._handle_show_portfolio", return_value="mocked portfolio")
@@ -91,6 +97,7 @@ class TestPortfolioBotNaturalLanguage(unittest.TestCase):
         self.assertEqual(result, "mocked portfolio")
         mock_show.assert_called_once()
 
+    @patch("trade_journal.record_sell")
     @patch("portfolio_bot.save_portfolio")
     @patch("portfolio_bot.load_portfolio")
     @patch("portfolio_bot.resolve_name_to_code", return_value=None)
@@ -101,6 +108,7 @@ class TestPortfolioBotNaturalLanguage(unittest.TestCase):
         mock_resolve_name,
         mock_load_portfolio,
         mock_save_portfolio,
+        mock_record_sell,
     ) -> None:
         mock_load_portfolio.return_value = {
             "cash": 2000.0,
@@ -127,7 +135,9 @@ class TestPortfolioBotNaturalLanguage(unittest.TestCase):
         self.assertEqual(holding["shares"], 400)
         self.assertEqual(saved_portfolio["cash"], 2530.0)
         mock_resolve_name.assert_not_called()
+        mock_record_sell.assert_called_once()
 
+    @patch("trade_journal.record_buy")
     @patch("portfolio_bot.save_portfolio")
     @patch("portfolio_bot.load_portfolio")
     @patch("portfolio_bot._get_stock_name", return_value="协鑫集成")
@@ -140,6 +150,7 @@ class TestPortfolioBotNaturalLanguage(unittest.TestCase):
         mock_get_stock_name,
         mock_load_portfolio,
         mock_save_portfolio,
+        mock_record_buy,
     ) -> None:
         mock_load_portfolio.return_value = {
             "cash": 10000.0,
@@ -167,7 +178,9 @@ class TestPortfolioBotNaturalLanguage(unittest.TestCase):
         self.assertEqual(holding["shares"], 1000)
         mock_resolve_name.assert_not_called()
         mock_get_stock_name.assert_called_once_with("002506")
+        mock_record_buy.assert_called_once()
 
+    @patch("trade_journal.record_buy")
     @patch("portfolio_bot.save_portfolio")
     @patch("portfolio_bot._get_stock_name", return_value="协鑫集成")
     @patch("portfolio_bot.load_portfolio")
@@ -178,6 +191,7 @@ class TestPortfolioBotNaturalLanguage(unittest.TestCase):
         mock_load_portfolio,
         mock_get_stock_name,
         mock_save_portfolio,
+        mock_record_buy,
     ) -> None:
         mock_load_portfolio.return_value = {
             "cash": 10000.0,
@@ -211,7 +225,45 @@ class TestPortfolioBotNaturalLanguage(unittest.TestCase):
         saved_portfolio = mock_save_portfolio.call_args.args[0]
         self.assertEqual(saved_portfolio["holdings"][0]["shares"], 1000)
         mock_get_stock_name.assert_called_once_with("002506")
+        mock_record_buy.assert_called_once()
+
+    @patch("portfolio_bot.load_portfolio", return_value={"holdings": []})
+    @patch("portfolio_bot.interpret_portfolio_command")
+    @patch("src.services.trade_feedback_service.record_trade_feedback")
+    def test_handle_feedback_via_llm_interpreter(
+        self,
+        mock_record_feedback,
+        mock_interpret,
+        _mock_load_portfolio,
+    ) -> None:
+        mock_interpret.return_value = {
+            "is_portfolio_command": True,
+            "action": "feedback",
+            "stock_hint": "协鑫集成",
+            "price": 7.61,
+            "outcome_price": 7.77,
+            "reference_action": "clear",
+            "feedback_tag": "sold_too_early",
+            "summary": "7.61清仓后立刻被拉到7.77，属于卖飞",
+            "needs_clarification": False,
+            "confidence": 0.96,
+        }
+        mock_record_feedback.return_value = {
+            "saved": True,
+            "name": "协鑫集成",
+            "code": "002506",
+            "feedback_tag": "sold_too_early",
+            "summary": "7.61清仓后立刻被拉到7.77，属于卖飞",
+            "guidance": "下次若主线和盘口仍强，优先分批止盈并保留底仓做T。",
+        }
+
+        result = handle_portfolio_command("7.61清仓后立刻被拉升到了7.77")
+
+        self.assertIn("已记录反馈", result)
+        self.assertIn("卖飞", result)
+        mock_record_feedback.assert_called_once()
 
 
 if __name__ == "__main__":
     unittest.main()
+

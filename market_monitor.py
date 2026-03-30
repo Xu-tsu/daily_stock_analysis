@@ -746,6 +746,7 @@ def compose_market_decision_context(
     stock_sector: str = "",
 ) -> dict:
     """Compose a reusable market context for agent prompts and adaptive rules."""
+    from src.services.theme_rotation_service import analyze_theme_rotation
 
     anomalies = list((anomaly_result or {}).get("anomalies") or summary.get("anomalies") or [])
     trump_news = list((anomaly_result or {}).get("trump_news") or [])
@@ -759,6 +760,7 @@ def compose_market_decision_context(
             "rank": rank,
             "change_pct": round(float(sector.get("change_pct", 0) or 0), 2),
             "main_net": round(float(sector.get("main_net", 0) or 0), 2),
+            "sector_type": str(sector.get("sector_type", "") or "").strip() or "hy",
         })
 
     bias = str(summary.get("bias", "neutral") or "neutral").strip().lower()
@@ -914,6 +916,8 @@ def compose_market_decision_context(
     elif hot_money_signal == "active" and bias == "positive":
         headline_sentiment = "risk_on"
 
+    theme_rotation = analyze_theme_rotation(top_sectors, hot_money_targets)
+
     return {
         "timestamp": summary.get("timestamp") or _now_cn().strftime("%Y-%m-%d %H:%M:%S"),
         "bias": bias,
@@ -931,6 +935,7 @@ def compose_market_decision_context(
             "最后看量化砸盘压力与个股盈亏位置",
         ],
         "top_sectors": top_sectors[:5],
+        "theme_rotation": theme_rotation,
         "sector_confirmation": sector_confirmation,
         "opening_auction": opening_auction,
         "hot_money_probe": {
@@ -964,9 +969,10 @@ def build_agent_market_context(
     stock_sector: str = "",
 ) -> dict:
     """Build a live market overview for multi-agent analysis."""
+    from src.services.theme_rotation_service import annotate_rotation_candidates
 
     checkpoint = _select_market_context_checkpoint()
-    with ThreadPoolExecutor(max_workers=5) as pool:
+    with ThreadPoolExecutor(max_workers=6) as pool:
         futures = {
             "quotes": pool.submit(
                 _fetch_quotes_cached,
@@ -974,16 +980,35 @@ def build_agent_market_context(
                 8,
                 5.0,
             ),
-            "sectors": pool.submit(_fetch_sector_flow_cached, "hy", 5, 20.0),
+            "hy_sectors": pool.submit(_fetch_sector_flow_cached, "hy", 5, 20.0),
+            "gn_sectors": pool.submit(_fetch_sector_flow_cached, "gn", 5, 20.0),
             "hot_candidates": pool.submit(_fetch_hot_candidates_cached, 15.0, 5, 20.0),
             "financial_news": pool.submit(_fetch_financial_news_cached, 45.0),
             "trump_news": pool.submit(_fetch_trump_news_cached, 45.0),
         }
 
         quotes = futures["quotes"].result()
-        sectors = futures["sectors"].result()
+        sectors = []
+        for sector_type in ("hy_sectors", "gn_sectors"):
+            raw_rows = futures[sector_type].result()
+            mapped_type = "hy" if sector_type == "hy_sectors" else "gn"
+            for sector in raw_rows:
+                row = dict(sector)
+                row["sector_type"] = mapped_type
+                sectors.append(row)
+        sectors = sorted(
+            sectors,
+            key=lambda item: (
+                -float(item.get("main_net", 0) or 0),
+                -float(item.get("change_pct", 0) or 0),
+            ),
+        )
         try:
-            hot_candidates = futures["hot_candidates"].result()
+            hot_candidates = annotate_rotation_candidates(
+                futures["hot_candidates"].result(),
+                dominant_themes=[sector.get("name") for sector in sectors[:3]],
+                limit=5,
+            )
         except Exception as exc:
             logger.debug("build_agent_market_context hot candidates failed: %s", exc)
             hot_candidates = []
@@ -1070,6 +1095,7 @@ def build_intraday_portfolio_advice(
         get_position_sizing,
     )
     from src.services.trade_sizing_service import annotate_a_share_trade_suggestions
+    from src.services.theme_rotation_service import analyze_theme_rotation, annotate_rotation_candidates
 
     holdings = portfolio.get("holdings", []) or []
     if not holdings:
@@ -1129,10 +1155,15 @@ def build_intraday_portfolio_advice(
 
     actions = []
     held_codes = {holding.get("code") for holding in holdings if holding.get("code")}
-    rotation_pool = [
-        candidate for candidate in (rotation_candidates or [])
-        if candidate.get("code") not in held_codes
-    ][:3]
+    theme_rotation = analyze_theme_rotation(sectors or [], rotation_candidates or [])
+    rotation_pool = annotate_rotation_candidates(
+        [
+            candidate for candidate in (rotation_candidates or [])
+            if candidate.get("code") not in held_codes
+        ],
+        dominant_themes=theme_rotation.get("dominant_themes") or [],
+        limit=3,
+    )
     has_rotation_pool = bool(rotation_pool)
     sector_snapshot = {}
     for rank, sector in enumerate(sectors or [], start=1):
@@ -1531,6 +1562,7 @@ def build_intraday_portfolio_advice(
         "position_advice": position_advice,
         "actions": actions,
         "rotation_candidates": rotation_pool,
+        "theme_rotation": theme_rotation,
         "cash": round(cash, 2),
         "total_asset": round(total_asset, 2),
         "actual_position_ratio": round(actual_ratio * 100, 1),
@@ -1654,6 +1686,10 @@ def format_intraday_checkpoint_alert(summary: dict) -> str:
         )
         lines.append(f"🔥 热点: {sector_line}")
 
+    theme_rotation = (summary.get("portfolio_advice") or {}).get("theme_rotation") or {}
+    if theme_rotation.get("summary"):
+        lines.append(f"🧭 主线切换: {theme_rotation.get('summary')}")
+
     anomalies = summary.get("anomalies") or []
     if anomalies:
         lines.append("⚠️ 风险:")
@@ -1699,11 +1735,15 @@ def format_intraday_checkpoint_alert(summary: dict) -> str:
                 lines.append(
                     f"  - {candidate.get('code','')} {candidate.get('name','')} "
                     f"{float(candidate.get('price', 0) or 0):.2f}元 | "
-                    f"主力:{float(candidate.get('main_net', 0) or 0):.0f}万"
+                    f"主力:{float(candidate.get('main_net', 0) or 0):.0f}万 | "
+                    f"{candidate.get('relay_role', '候选')}"
                 )
                 execution_line = _format_intraday_execution_line(candidate)
                 if execution_line:
                     lines.append(f"    {execution_line}")
+                timing_note = candidate.get("timing_note")
+                if timing_note:
+                    lines.append(f"    {timing_note}")
 
     lines.extend(["", f"💡 {summary['advice']}"])
     return "\n".join(lines)
@@ -1722,10 +1762,21 @@ def run_intraday_checkpoint(checkpoint: str, send_notification: bool = True) -> 
         logger.warning("[%s] 交易日判断失败，按 fail-open 继续: %s", checkpoint, e)
 
     from macro_data_collector import _fetch_tencent_quote
-    from ths_scraper import fetch_sector_fund_flow_rank
 
     quotes = _fetch_tencent_quote([code for code, _ in CN_INDEX_CODES], timeout=8)
-    sectors = fetch_sector_fund_flow_rank("hy", top_n=5)
+    sectors = []
+    for sector_type, top_n in (("hy", 4), ("gn", 4)):
+        for sector in _fetch_sector_flow_cached(sector_type, top_n=top_n, ttl_seconds=20.0):
+            row = dict(sector)
+            row["sector_type"] = sector_type
+            sectors.append(row)
+    sectors = sorted(
+        sectors,
+        key=lambda item: (
+            -float(item.get("main_net", 0) or 0),
+            -float(item.get("change_pct", 0) or 0),
+        ),
+    )
     anomaly_result = check_market_anomaly()
     summary = build_intraday_checkpoint_summary(
         checkpoint=checkpoint,
