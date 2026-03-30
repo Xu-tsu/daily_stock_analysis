@@ -14,12 +14,15 @@ portfolio_bot.py — 通过聊天指令管理持仓 + 触发扫描/调仓
 
 放在项目根目录，被 bot 系统调用
 """
+import difflib
 import json, logging, os, re
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple
 
 from portfolio_manager import load_portfolio, save_portfolio
+from src.services.name_to_code_resolver import resolve_name_to_code
+from src.services.portfolio_command_llm import interpret_portfolio_command
 from src.services.trade_sizing_service import is_valid_a_share_lot
 
 logger = logging.getLogger(__name__)
@@ -36,16 +39,286 @@ SELL_PATTERN = re.compile(
     r'卖出\s*(\d{6})\s*(\d+)\s*股?\s*([\d.]+)\s*元?', re.IGNORECASE
 )
 CLEAR_PATTERN = re.compile(r'清仓\s*(\d{6})', re.IGNORECASE)
+LOT_PATTERN = re.compile(r'(\d+)\s*(手|股)', re.IGNORECASE)
+CODE_PATTERN = re.compile(r'(?<!\d)(\d{6})(?!\d)')
+PRICE_PATTERN = re.compile(r'(?<![\d.])(\d+(?:\.\d{1,3})?)(?:\s*元)?', re.IGNORECASE)
+NAME_TOKEN_PATTERN = re.compile(r'[\u4e00-\u9fffA-Za-z]{2,}')
+
+SHOW_PORTFOLIO_PHRASES = {
+    "持仓",
+    "查看持仓",
+    "持仓查看",
+    "我的持仓",
+    "看看持仓",
+    "查询持仓",
+    "持仓查询",
+}
+
+PORTFOLIO_COMMAND_PREFIXES = [
+    "调仓", "扫描", "主线", "回测", "预警", "分析", "全量分析", "战绩", "复盘", "交易记录",
+]
+
+TRADE_ACTION_MAP = {
+    "买入": "buy",
+    "加仓": "buy",
+    "卖出": "sell",
+    "减仓": "sell",
+    "清仓": "clear",
+}
+
+TRADE_FILLER_WORDS = (
+    "买入", "加仓", "卖出", "减仓", "清仓",
+    "查看持仓", "持仓查看", "我的持仓", "持仓",
+    "查看", "查询", "看看", "显示", "一下",
+    "按", "以", "在", "于", "加", "元", "股", "手",
+)
+
+LLM_PORTFOLIO_HINT_WORDS = (
+    "加仓", "减仓", "清仓", "补仓", "建仓", "买入", "卖出", "卖掉", "卖光", "全卖",
+    "仓位", "持仓", "仓", "调仓", "再买", "再补", "做t", "做T", "出掉",
+)
+
+_PORTFOLIO_LLM_CACHE: dict[str, Optional[dict]] = {}
+
+
+def _compact_text(text: str) -> str:
+    return re.sub(r"\s+", "", (text or "").replace("\u3000", " ").strip())
+
+
+def _get_holdings_snapshot() -> list[dict]:
+    try:
+        portfolio = load_portfolio()
+    except Exception:
+        return []
+    return list(portfolio.get("holdings", []) or [])
+
+
+def _should_try_llm_portfolio_interpretation(text: str) -> bool:
+    compact = _compact_text(text)
+    if not compact or len(compact) > 80:
+        return False
+
+    if _is_show_portfolio_command(compact):
+        return True
+
+    has_hint_word = any(word in compact for word in LLM_PORTFOLIO_HINT_WORDS)
+    has_lot_or_price = LOT_PATTERN.search(compact) is not None or re.search(r"\d+(?:\.\d+)?(?:元|块)?", compact)
+
+    holdings = _get_holdings_snapshot()
+    has_holding_reference = any(
+        str(item.get("code", "") or "").strip() in compact
+        or str(item.get("name", "") or "").strip() in compact
+        for item in holdings
+        if item
+    )
+
+    return bool(has_hint_word and (has_lot_or_price or has_holding_reference or "仓位" in compact or "持仓" in compact))
+
+
+def _get_llm_portfolio_command(text: str) -> Optional[dict]:
+    compact = _compact_text(text)
+    if not compact:
+        return None
+    if compact in _PORTFOLIO_LLM_CACHE:
+        return _PORTFOLIO_LLM_CACHE[compact]
+
+    interpretation = interpret_portfolio_command(text, holdings=_get_holdings_snapshot())
+    if len(_PORTFOLIO_LLM_CACHE) >= 128:
+        _PORTFOLIO_LLM_CACHE.pop(next(iter(_PORTFOLIO_LLM_CACHE)))
+    _PORTFOLIO_LLM_CACHE[compact] = interpretation
+    return interpretation
+
+
+def _clear_portfolio_llm_cache() -> None:
+    _PORTFOLIO_LLM_CACHE.clear()
+
+
+def _is_show_portfolio_command(text: str) -> bool:
+    compact = _compact_text(text)
+    if compact in SHOW_PORTFOLIO_PHRASES:
+        return True
+    return compact.startswith("持仓") and any(word in compact for word in ("查看", "查询", "看看", "显示"))
+
+
+def _extract_price(text: str) -> Optional[float]:
+    working = text or ""
+    code_match = CODE_PATTERN.search(working)
+    if code_match:
+        working = working.replace(code_match.group(1), " ", 1)
+
+    lot_match = LOT_PATTERN.search(working)
+    if lot_match:
+        working = f"{working[:lot_match.start()]} {working[lot_match.end():]}"
+
+    matches = list(PRICE_PATTERN.finditer(working))
+    if not matches:
+        return None
+
+    # 优先取小数价格；如果只有整数，取最后一个数字。
+    preferred = next((m for m in matches if "." in m.group(1)), matches[-1])
+    try:
+        return float(preferred.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_stock_identifier(text: str) -> Optional[str]:
+    code_match = CODE_PATTERN.search(text or "")
+    if code_match:
+        return code_match.group(1)
+
+    cleaned = text or ""
+    cleaned = LOT_PATTERN.sub(" ", cleaned)
+    cleaned = re.sub(r'(?<![\d.])\d+(?:\.\d{1,3})?\s*元?', " ", cleaned)
+    for word in TRADE_FILLER_WORDS:
+        cleaned = cleaned.replace(word, " ")
+    cleaned = re.sub(r'[，,。；;:：@/\\+*=（）()【】\[\]_\-—]+', " ", cleaned)
+
+    candidates = [token for token in NAME_TOKEN_PATTERN.findall(cleaned) if token]
+    if not candidates:
+        return None
+    return max(candidates, key=len)
+
+
+def _looks_like_trade_instruction(text: str) -> bool:
+    compact = _compact_text(text)
+    has_action = any(word in compact for word in ("买入", "加仓", "卖出", "减仓"))
+    has_quantity = LOT_PATTERN.search(compact) is not None
+    has_price = _extract_price(compact) is not None
+    has_symbol = _extract_stock_identifier(compact) is not None
+    return has_action and has_quantity and has_price and has_symbol
+
+
+def _detect_trade_action(text: str) -> Optional[str]:
+    compact = _compact_text(text)
+    for keyword, action in TRADE_ACTION_MAP.items():
+        if compact.startswith(keyword):
+            return action
+
+    if "清仓" in compact:
+        return "clear"
+
+    if _looks_like_trade_instruction(compact):
+        if "加仓" in compact or "买入" in compact:
+            return "buy"
+        if "减仓" in compact or "卖出" in compact:
+            return "sell"
+    return None
+
+
+def _resolve_stock_code(identifier: str) -> Optional[str]:
+    if not identifier:
+        return None
+    if CODE_PATTERN.fullmatch(identifier):
+        return identifier
+    return resolve_name_to_code(identifier)
+
+
+def _resolve_portfolio_holding_code(identifier: str, holdings: list[dict]) -> Optional[str]:
+    if not identifier:
+        return None
+
+    normalized = identifier.strip()
+    if not normalized:
+        return None
+
+    for holding in holdings:
+        code = str(holding.get("code", "") or "").strip()
+        name = str(holding.get("name", "") or "").strip()
+        if normalized == code or normalized == name:
+            return code
+
+    try:
+        from pypinyin import lazy_pinyin
+
+        identifier_pinyin = "".join(lazy_pinyin(normalized)).lower()
+        if identifier_pinyin:
+            for holding in holdings:
+                code = str(holding.get("code", "") or "").strip()
+                name = str(holding.get("name", "") or "").strip()
+                if not name:
+                    continue
+                holding_pinyin = "".join(lazy_pinyin(name)).lower()
+                if identifier_pinyin == holding_pinyin:
+                    return code
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    names = [str(h.get("name", "") or "").strip() for h in holdings if h.get("name")]
+    matches = difflib.get_close_matches(normalized, names, n=1, cutoff=0.75)
+    if matches:
+        matched_name = matches[0]
+        for holding in holdings:
+            if str(holding.get("name", "") or "").strip() == matched_name:
+                return str(holding.get("code", "") or "").strip()
+    return None
+
+
+def _parse_trade_order(text: str) -> Tuple[Optional[dict], Optional[str]]:
+    identifier = _extract_stock_identifier(text)
+    if not identifier:
+        return None, "无法识别股票名称或代码，请写成“协鑫集成 加仓 3手 5.05元”或“买入 002506 300股 5.05元”。"
+
+    portfolio = load_portfolio()
+    holdings = portfolio.get("holdings", [])
+    code = _resolve_portfolio_holding_code(identifier, holdings) or _resolve_stock_code(identifier)
+    if not code:
+        return None, f"无法识别股票名称：{identifier}"
+
+    lot_match = LOT_PATTERN.search(text or "")
+    if not lot_match:
+        return None, "无法识别买卖数量，请写成“3手”或“300股”。"
+
+    quantity = int(lot_match.group(1))
+    unit = lot_match.group(2)
+    shares = quantity * 100 if unit == "手" else quantity
+
+    price = _extract_price(text)
+    if price is None:
+        return None, "无法识别成交价格，请写成“5.05元”或“5.05”。"
+
+    return {
+        "code": code,
+        "identifier": identifier,
+        "shares": shares,
+        "price": price,
+    }, None
+
+
+def _parse_clear_target(text: str) -> Tuple[Optional[str], Optional[str]]:
+    match = CLEAR_PATTERN.search(text)
+    if match:
+        return match.group(1), None
+
+    identifier = _extract_stock_identifier(text)
+    if not identifier:
+        return None, "格式错误，请输入：清仓 002506 或 清仓 协鑫集成"
+
+    portfolio = load_portfolio()
+    holdings = portfolio.get("holdings", [])
+    code = _resolve_portfolio_holding_code(identifier, holdings) or _resolve_stock_code(identifier)
+    if not code:
+        return None, f"无法识别股票名称：{identifier}"
+    return code, None
 
 
 def is_portfolio_command(text: str) -> bool:
     """判断是否是持仓管理指令"""
     text = text.strip()
-    keywords = [
-        "买入", "卖出", "清仓", "持仓", "调仓", "扫描", "主线",
-        "回测", "预警", "分析", "全量分析", "战绩", "复盘", "交易记录",
-    ]
-    return any(text.startswith(kw) for kw in keywords)
+    if not text:
+        return False
+    if _is_show_portfolio_command(text):
+        return True
+    if any(text.startswith(kw) for kw in PORTFOLIO_COMMAND_PREFIXES):
+        return True
+    if _detect_trade_action(text) is not None:
+        return True
+    if _should_try_llm_portfolio_interpretation(text):
+        llm_command = _get_llm_portfolio_command(text)
+        return bool(llm_command and llm_command.get("is_portfolio_command"))
+    return False
 
 
 def _pick_quote_price(quote: dict) -> float:
@@ -67,13 +340,21 @@ def handle_portfolio_command(text: str) -> str:
     text = text.strip()
 
     try:
-        if text.startswith("买入"):
+        llm_command = None
+        if _should_try_llm_portfolio_interpretation(text):
+            llm_command = _get_llm_portfolio_command(text)
+            llm_result = _handle_llm_portfolio_command(llm_command, raw_text=text)
+            if llm_result is not None:
+                return llm_result
+
+        trade_action = _detect_trade_action(text)
+        if trade_action == "buy":
             return _handle_buy(text)
-        elif text.startswith("卖出"):
+        elif trade_action == "sell":
             return _handle_sell(text)
-        elif text.startswith("清仓"):
+        elif trade_action == "clear":
             return _handle_clear(text)
-        elif text.startswith("持仓"):
+        elif _is_show_portfolio_command(text):
             return _handle_show_portfolio()
         elif text.startswith("调仓"):
             return _handle_rebalance()
@@ -102,6 +383,54 @@ def handle_portfolio_command(text: str) -> str:
         return f"执行失败: {str(e)}"
 
 
+def _handle_llm_portfolio_command(command: Optional[dict], raw_text: str) -> Optional[str]:
+    if not command or not command.get("is_portfolio_command"):
+        return None
+
+    action = command.get("action", "other")
+    if command.get("needs_clarification"):
+        clarification = command.get("clarification") or "识别到了持仓指令，但缺少必要的价格或数量，请补充后再发一次。"
+        return clarification
+
+    if action == "show_portfolio":
+        return _handle_show_portfolio()
+    if action == "rebalance":
+        return _handle_rebalance()
+    if action == "scan":
+        return _handle_scan()
+    if action == "mainline":
+        return _handle_mainline()
+    if action == "backtest":
+        return _handle_backtest()
+    if action == "alert":
+        return _handle_alert()
+    if action == "performance":
+        return _handle_performance()
+    if action == "pattern_review":
+        return _handle_pattern_review()
+    if action == "trade_history":
+        return _handle_trade_history()
+    if action in {"buy", "sell", "clear"}:
+        holdings = _get_holdings_snapshot()
+        stock_hint = str(command.get("stock_hint", "") or "").strip()
+        code = _resolve_portfolio_holding_code(stock_hint, holdings) or _resolve_stock_code(stock_hint)
+        if not code:
+            return f"无法识别股票名称：{stock_hint or raw_text}"
+
+        if action == "clear":
+            return _execute_clear_order(code)
+
+        shares = int(command.get("shares", 0) or 0)
+        price = float(command.get("price", 0) or 0)
+        if shares <= 0 or price <= 0:
+            return "识别到了持仓操作，但缺少有效的数量或价格，请补充后再发一次。"
+        if action == "buy":
+            return _execute_buy_order(code, shares, price, raw_text=raw_text)
+        return _execute_sell_order(code, shares, price)
+
+    return None
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 买入
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -117,13 +446,17 @@ def _get_stock_name(code: str) -> str:
 
 
 def _handle_buy(text: str) -> str:
-    m = BUY_PATTERN.search(text)
-    if not m:
-        return "格式错误，请输入：买入 002506 500股 5.4元"
+    parsed, error = _parse_trade_order(text)
+    if error:
+        return error
 
-    code = m.group(1)
-    shares = int(m.group(2))
-    price = float(m.group(3))
+    code = parsed["code"]
+    shares = int(parsed["shares"])
+    price = float(parsed["price"])
+    return _execute_buy_order(code, shares, price, raw_text=text)
+
+
+def _execute_buy_order(code: str, shares: int, price: float, raw_text: str = "") -> str:
     if not is_valid_a_share_lot(code, shares):
         return "❌ A股买入数量必须是100股整数倍（1手=100股），例如 100股、200股。"
     name = _get_stock_name(code)
@@ -170,6 +503,7 @@ def _handle_buy(text: str) -> str:
     portfolio["cash"] = round(portfolio.get("cash", 0) - cost, 2)
     portfolio["holdings"] = holdings
     save_portfolio(portfolio)
+    _clear_portfolio_llm_cache()
 
     return (
         f"✅ {action}成功\n"
@@ -195,13 +529,17 @@ def _guess_sector(text: str, code: str) -> str:
 # 卖出
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def _handle_sell(text: str) -> str:
-    m = SELL_PATTERN.search(text)
-    if not m:
-        return "格式错误，请输入：卖出 002506 200股 5.8元"
+    parsed, error = _parse_trade_order(text)
+    if error:
+        return error
 
-    code = m.group(1)
-    shares = int(m.group(2))
-    price = float(m.group(3))
+    code = parsed["code"]
+    shares = int(parsed["shares"])
+    price = float(parsed["price"])
+    return _execute_sell_order(code, shares, price)
+
+
+def _execute_sell_order(code: str, shares: int, price: float) -> str:
     if not is_valid_a_share_lot(code, shares):
         return "❌ A股卖出数量必须是100股整数倍（1手=100股），例如 100股、200股。"
 
@@ -235,6 +573,7 @@ def _handle_sell(text: str) -> str:
     portfolio["cash"] = round(portfolio.get("cash", 0) + income, 2)
     portfolio["holdings"] = holdings
     save_portfolio(portfolio)
+    _clear_portfolio_llm_cache()
 
     emoji = "🟢" if pnl >= 0 else "🔴"
     return (
@@ -250,11 +589,13 @@ def _handle_sell(text: str) -> str:
 # 清仓
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def _handle_clear(text: str) -> str:
-    m = CLEAR_PATTERN.search(text)
-    if not m:
-        return "格式错误，请输入：清仓 002506"
+    code, error = _parse_clear_target(text)
+    if error:
+        return error
+    return _execute_clear_order(code)
 
-    code = m.group(1)
+
+def _execute_clear_order(code: str) -> str:
     portfolio = load_portfolio()
     holdings = portfolio.get("holdings", [])
 
@@ -283,6 +624,7 @@ def _handle_clear(text: str) -> str:
     portfolio["cash"] = round(portfolio.get("cash", 0) + income, 2)
     portfolio["holdings"] = holdings
     save_portfolio(portfolio)
+    _clear_portfolio_llm_cache()
 
     emoji = "🟢" if pnl >= 0 else "🔴"
     return (

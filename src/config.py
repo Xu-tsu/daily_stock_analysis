@@ -858,7 +858,7 @@ class Config:
                     "model_name": _om,
                     "litellm_params": {
                         "model": _om,
-                        "api_base": f"{_ollama_base}/v1",
+                        "api_base": _ollama_base,
                         "api_key": "ollama",  # Ollama 不需要真实 key
                     },
                 })
@@ -1781,7 +1781,7 @@ def extra_litellm_params(model: str, config: Config) -> Dict[str, Any]:
         return params
     if model.startswith("ollama/"):
         ollama_base = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
-        params["api_base"] = f"{ollama_base}/v1"
+        params["api_base"] = ollama_base
         params["api_key"] = "ollama"
         return params
     if model.startswith("openai/") or "/" not in model:

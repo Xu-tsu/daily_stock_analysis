@@ -42,7 +42,7 @@ class TestLLMToolAdapterLegacyMode(unittest.TestCase):
                     "model_name": "ollama/qwen2.5:14b-instruct-q4_K_M",
                     "litellm_params": {
                         "model": "ollama/qwen2.5:14b-instruct-q4_K_M",
-                        "api_base": "http://localhost:11434/v1",
+                        "api_base": "http://localhost:11434",
                         "api_key": "ollama",
                     },
                 },
@@ -74,7 +74,7 @@ class TestLegacyOllamaParams(unittest.TestCase):
     def test_extra_litellm_params_adds_ollama_base_and_key(self):
         params = extra_litellm_params("ollama/qwen2.5:14b-instruct-q4_K_M", SimpleNamespace(openai_base_url=None))
 
-        self.assertEqual(params["api_base"], "http://127.0.0.1:11434/v1")
+        self.assertEqual(params["api_base"], "http://127.0.0.1:11434")
         self.assertEqual(params["api_key"], "ollama")
 
 

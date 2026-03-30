@@ -23,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- 飞书 Stream 持仓口令拦截新增本地模型识别层：`portfolio_bot.py` 现在会优先复用 `REBALANCE_LOCAL_MODEL` / 本地 Ollama 把自由表达识别成结构化动作，再回退到原有规则解析，因此不再只接受“买入/卖出 + 6位代码 + 股数 + 价格”的死格式；像“帮我把协鑫集成再补三手，挂5块05”“看下我现在仓位”这类自然语言也能落到加仓/减仓/清仓/查看持仓。对当前已持仓个股还会结合持仓名称、拼音和近似名称做纠错，降低 `协鑫集成` 被语音转成 `写信继承` 后无法落账的问题。
+- 修正 LiteLLM 直连本地 Ollama 时的 `api_base`：`src/config.py` 不再把 `OLLAMA_BASE_URL` 强行拼成 `/v1`，避免本地模型调用落到错误地址返回 `404 page not found`，从而让持仓口令识别、本地辩论模型和其他 `ollama/...` 路径都能真正打到本机 Ollama。
 - `src/scheduler.py` 现在会把 `SCHEDULE_TIME`、`10:15`、`12:30` 这些 A 股固定时点先按北京时间解释，再换算成本机时区注册到 `schedule`；海外主机运行时，不会再出现“10:15 盘中节点实际在 09:15 触发、报告时间和执行时间对不上”的问题。
 - `macro_data_collector.py` 的 SearXNG 宏观快讯链路新增短时冷却：本地实例连接失败后会暂时跳过后续查询，避免同一轮盘中分析里连续刷出多条 `127.0.0.1:8888` 连接拒绝 warning，冷却结束后自动恢复探测。
 - 修复 `src/agent/llm_adapter.py` 在 legacy `GEMINI_API_KEY` / `OPENAI_API_KEY` 配置并自动探测到本地 Ollama 兜底模型时，误把包含 `__legacy_gemini__` 的 `llm_model_list` 当作 channel/YAML Router 配置加载，导致飞书/聊天命令初始化阶段抛出 `LLM Provider NOT provided` 的问题；同时补齐 legacy 路径下 `ollama/...` 直连所需的 `api_base` / `api_key` 参数。
