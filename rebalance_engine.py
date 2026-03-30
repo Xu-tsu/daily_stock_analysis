@@ -37,7 +37,7 @@ DISTILL_DIR = Path("data/distillation")
 # LLM 调用封装（区分本地 / 云端）
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def _call_local_llm(prompt: str, agent_name: str = "") -> str:
+def _call_local_llm(prompt: str, agent_name: str = "", return_model: bool = False):
     """
     调用本地 Ollama 模型（Agent 1-3 用）
     使用 REBALANCE_LOCAL_MODEL 环境变量，不碰主项目的 LITELLM_MODEL
@@ -54,13 +54,17 @@ def _call_local_llm(prompt: str, agent_name: str = "") -> str:
         )
         result = response.choices[0].message.content
         logger.debug(f"[{agent_name}] 本地模型返回 {len(result)} 字符")
+        if return_model:
+            return result, model
         return result
     except Exception as e:
         logger.error(f"[{agent_name}] 本地 LLM 调用失败: {e}")
+        if return_model:
+            return "{}", model
         return "{}"
 
 
-def _call_debate_llm(prompt: str, agent_name: str = "") -> str:
+def _call_debate_llm(prompt: str, agent_name: str = "", return_model: bool = False):
     """
     调用本地第二模型（DeepSeek-R1，辩论用）
     使用 REBALANCE_DEBATE_MODEL 环境变量
@@ -84,13 +88,17 @@ def _call_debate_llm(prompt: str, agent_name: str = "") -> str:
             if final_part:
                 result = final_part
         logger.info(f"[{agent_name}] 辩论模型返回 {len(result)} 字符")
+        if return_model:
+            return result, model
         return result
     except Exception as e:
         logger.error(f"[{agent_name}] 辩论模型调用失败: {e}")
+        if return_model:
+            return "{}", model
         return "{}"
 
 
-def _call_cloud_llm(prompt: str, agent_name: str = "") -> str:
+def _call_cloud_llm(prompt: str, agent_name: str = "", return_model: bool = False):
     """
     调用云端强模型（Agent 4c 仲裁用）
     降级链：REBALANCE_CLOUD_MODEL → REBALANCE_CLOUD_FALLBACK → LITELLM_MODEL → 本地DeepSeek
@@ -111,7 +119,11 @@ def _call_cloud_llm(prompt: str, agent_name: str = "") -> str:
 
     if not candidates:
         logger.warning(f"[{agent_name}] 未配置任何云端模型，回退到本地辩论模型")
-        return _call_debate_llm(prompt, f"{agent_name}_本地回退")
+        return _call_debate_llm(
+            prompt,
+            f"{agent_name}_本地回退",
+            return_model=return_model,
+        )
 
     # 逐个尝试云端模型
     last_error = None
@@ -128,6 +140,8 @@ def _call_cloud_llm(prompt: str, agent_name: str = "") -> str:
             )
             result = response.choices[0].message.content
             logger.info(f"[{agent_name}] 云端模型({tag})返回 {len(result)} 字符")
+            if return_model:
+                return result, model
             return result
         except Exception as e:
             last_error = e
@@ -139,7 +153,11 @@ def _call_cloud_llm(prompt: str, agent_name: str = "") -> str:
         f"[{agent_name}] 所有云端模型({len(candidates)}个)均失败，"
         f"最后错误: {last_error}，回退到本地辩论模型"
     )
-    return _call_debate_llm(prompt, f"{agent_name}_本地回退")
+    return _call_debate_llm(
+        prompt,
+        f"{agent_name}_本地回退",
+        return_model=return_model,
+    )
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -258,6 +276,316 @@ def _parse_llm_json(response: str) -> dict:
                 pass
         logger.error(f"JSON 解析失败，原始响应前300字: {text[:300]}...")
         return {}
+
+
+def _truncate_discussion_text(value, limit: int = 140) -> str:
+    """压缩日志/报告里的讨论文本，避免单行过长。"""
+    text = str(value or "").replace("\n", " ").strip()
+    text = " ".join(text.split())
+    if not text:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[: max(limit - 3, 0)] + "..."
+
+
+def _action_to_cn(action: str) -> str:
+    return {
+        "buy": "加仓",
+        "hold": "持有",
+        "reduce": "减仓",
+        "sell": "清仓",
+    }.get(action or "", action or "待定")
+
+
+def _safe_numeric(value, default: float = 999.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _summarize_actions(actions: list, limit: int = 4) -> str:
+    if not actions:
+        return "未生成个股操作建议"
+
+    counts = {"buy": 0, "hold": 0, "reduce": 0, "sell": 0}
+    for item in actions:
+        action = item.get("action", "")
+        if action in counts:
+            counts[action] += 1
+
+    parts = []
+    if counts["sell"]:
+        parts.append(f"清仓{counts['sell']}只")
+    if counts["reduce"]:
+        parts.append(f"减仓{counts['reduce']}只")
+    if counts["hold"]:
+        parts.append(f"持有{counts['hold']}只")
+    if counts["buy"]:
+        parts.append(f"加仓{counts['buy']}只")
+    if not parts:
+        parts.append(f"共{len(actions)}个动作")
+
+    focus = []
+    for item in actions[:limit]:
+        name = item.get("name") or item.get("code") or "未知标的"
+        focus.append(f"{name}{_action_to_cn(item.get('action', ''))}")
+
+    if focus:
+        parts.append("重点: " + "、".join(focus))
+    return "；".join(parts)
+
+
+def _summarize_holdings_ratings(holdings_ratings: list, limit: int = 4) -> str:
+    if not holdings_ratings:
+        return "持仓扫描未返回有效评级"
+
+    counts = {}
+    for item in holdings_ratings:
+        rating = item.get("rating", "待定")
+        counts[rating] = counts.get(rating, 0) + 1
+
+    count_text = "，".join(f"{rating}{count}只" for rating, count in counts.items())
+    priority = {"清仓": 0, "减仓": 1, "持有": 2, "加仓": 3}
+    sorted_items = sorted(
+        holdings_ratings,
+        key=lambda item: (
+            priority.get(item.get("rating", ""), 9),
+            _safe_numeric(item.get("score", 999)),
+        ),
+    )
+
+    focus = []
+    for item in sorted_items[:limit]:
+        name = item.get("name") or item.get("code") or "未知标的"
+        rating = item.get("rating", "待定")
+        score = item.get("score")
+        score_text = f"({score}分)" if score not in (None, "") else ""
+        focus.append(f"{name}{rating}{score_text}")
+
+    if focus:
+        return f"{count_text}；重点: {'、'.join(focus)}"
+    return count_text
+
+
+def _extract_disagreements(critique: dict, limit: int = 4) -> list:
+    if not critique:
+        return []
+
+    disagreements = []
+    for item in critique.get("position_disagreements", [])[:limit]:
+        name = item.get("name") or item.get("code") or "未知标的"
+        original = item.get("original_action") or "原方案"
+        suggestion = item.get("my_suggestion") or "调整建议"
+        reason = _truncate_discussion_text(item.get("reason", ""), 70)
+        text = f"{name}: {original} → {suggestion}"
+        if reason:
+            text += f"（{reason}）"
+        disagreements.append(text)
+
+    if disagreements:
+        return disagreements
+
+    for issue in critique.get("critical_issues", [])[:limit]:
+        text = _truncate_discussion_text(issue, 90)
+        if text:
+            disagreements.append(text)
+    return disagreements
+
+
+def _build_rebalance_discussion(
+    *,
+    market_judge: dict,
+    sector_judge: dict,
+    holdings_ratings: list,
+    proposal: dict,
+    critique: dict,
+    rebalance: dict,
+    debate_mode: str,
+    market_model: str,
+    sector_model: str,
+    holdings_model: str,
+    proposal_model: str,
+    critique_model: str,
+    arbiter_model: str,
+) -> dict:
+    """把调仓链路中的多模型观点整理成可展示的讨论轨迹。"""
+    rounds = []
+
+    market_signal = market_judge.get("market_stage") or market_judge.get("position_advice") or "待确认"
+    if market_judge:
+        if market_judge.get("position_advice"):
+            market_signal = f"{market_signal} | 仓位{market_judge.get('position_advice')}"
+        rounds.append(
+            {
+                "agent_label": "Agent1 大盘研判",
+                "role_label": "宏观/指数",
+                "model": market_model or "unknown",
+                "signal_label": _truncate_discussion_text(market_signal, 80),
+                "reasoning": _truncate_discussion_text(
+                    market_judge.get("summary")
+                    or "；".join(market_judge.get("key_signals", [])[:3]),
+                    160,
+                ),
+            }
+        )
+
+    if sector_judge:
+        hot_sectors = "、".join(sector_judge.get("hot_sectors", [])[:3])
+        sector_signal = hot_sectors and f"热点偏向 {hot_sectors}" or sector_judge.get("rotation_direction", "")
+        rounds.append(
+            {
+                "agent_label": "Agent2 板块轮动",
+                "role_label": "题材/资金",
+                "model": sector_model or "unknown",
+                "signal_label": _truncate_discussion_text(sector_signal or "板块轮动待确认", 80),
+                "reasoning": _truncate_discussion_text(
+                    sector_judge.get("summary")
+                    or "；".join(
+                        f"{item.get('sector', '未知')}{item.get('status', '')}"
+                        for item in sector_judge.get("holding_sector_assessment", [])[:3]
+                    ),
+                    160,
+                ),
+            }
+        )
+
+    if holdings_ratings:
+        rounds.append(
+            {
+                "agent_label": "Agent3 持仓扫描",
+                "role_label": "个股扫描",
+                "model": holdings_model or "unknown",
+                "signal_label": f"完成{len(holdings_ratings)}只持仓评级",
+                "reasoning": _truncate_discussion_text(
+                    _summarize_holdings_ratings(holdings_ratings),
+                    180,
+                ),
+            }
+        )
+
+    if proposal:
+        proposal_reason = []
+        if proposal.get("market_assessment"):
+            proposal_reason.append(proposal.get("market_assessment"))
+        if proposal.get("sector_assessment"):
+            proposal_reason.append(proposal.get("sector_assessment"))
+        proposal_reason.append(_summarize_actions(proposal.get("actions", [])))
+        rounds.append(
+            {
+                "agent_label": "Agent4a 激进派提案",
+                "role_label": "进攻方案",
+                "model": proposal_model or "unknown",
+                "signal_label": _truncate_discussion_text(
+                    proposal.get("overall_position_advice") or "已给出提案",
+                    80,
+                ),
+                "reasoning": _truncate_discussion_text("；".join(filter(None, proposal_reason)), 180),
+            }
+        )
+
+    disagreements = _extract_disagreements(critique)
+    if critique:
+        critique_reason = []
+        if critique.get("critical_issues"):
+            critique_reason.append(
+                "关键问题: " + "；".join(
+                    _truncate_discussion_text(item, 60)
+                    for item in critique.get("critical_issues", [])[:2]
+                )
+            )
+        if critique.get("warnings"):
+            critique_reason.append(
+                "警告: " + "；".join(
+                    _truncate_discussion_text(item, 60)
+                    for item in critique.get("warnings", [])[:2]
+                )
+            )
+        if disagreements:
+            critique_reason.append("分歧: " + "；".join(disagreements[:2]))
+        rounds.append(
+            {
+                "agent_label": "Agent4b 保守派质疑",
+                "role_label": "风控审查",
+                "model": critique_model or "unknown",
+                "signal_label": f"方案评分 {critique.get('overall_assessment', 'N/A')}/10",
+                "reasoning": _truncate_discussion_text("；".join(filter(None, critique_reason)), 180),
+            }
+        )
+
+    final_label = {
+        "full_debate": "Agent4c 云端仲裁",
+        "local_merge": "本地合并裁决",
+        "proposal_only": "硬规则过滤",
+        "single_fallback": "云端单模型裁决",
+        "rules_only": "规则引擎兜底",
+    }.get(debate_mode, "最终调仓结论")
+    final_reason = []
+    if rebalance.get("market_assessment"):
+        final_reason.append(rebalance.get("market_assessment"))
+    if rebalance.get("sector_assessment"):
+        final_reason.append(rebalance.get("sector_assessment"))
+    if rebalance.get("debate_summary"):
+        final_reason.append(rebalance.get("debate_summary"))
+    final_reason.append(_summarize_actions(rebalance.get("actions", [])))
+    rounds.append(
+        {
+            "agent_label": final_label,
+            "role_label": "最终裁决",
+            "model": arbiter_model or ("rules_only" if debate_mode == "rules_only" else "local"),
+            "signal_label": _truncate_discussion_text(
+                rebalance.get("overall_position_advice") or "已生成最终调仓建议",
+                80,
+            ),
+            "reasoning": _truncate_discussion_text("；".join(filter(None, final_reason)), 200),
+        }
+    )
+
+    summary = rebalance.get("debate_summary") or ""
+    if not summary:
+        if disagreements:
+            summary = f"激进派先给出调仓草案，保守派提出{len(disagreements)}处关键分歧，最终按{final_label}收敛。"
+        elif proposal:
+            summary = f"多模型已完成调仓讨论，最终由{final_label}输出结论。"
+        else:
+            summary = "本次调仓建议由降级链路生成，缺少完整辩论记录。"
+
+    return {
+        "summary": _truncate_discussion_text(summary, 180),
+        "debate_mode": debate_mode,
+        "rounds": rounds,
+        "disagreements": disagreements,
+    }
+
+
+def _log_rebalance_discussion(discussion: dict) -> None:
+    """把多模型讨论轨迹打进日志，方便盘中回看。"""
+    if not discussion:
+        return
+
+    summary = discussion.get("summary")
+    if summary:
+        logger.info("[Discussion] %s", summary)
+
+    rounds = discussion.get("rounds", [])
+    total = len(rounds)
+    for idx, item in enumerate(rounds, start=1):
+        logger.info(
+            "[Discussion][%s/%s] %s | role=%s | model=%s | signal=%s",
+            idx,
+            total,
+            item.get("agent_label", "Agent"),
+            item.get("role_label", "未知"),
+            item.get("model", "unknown"),
+            item.get("signal_label", "N/A"),
+        )
+        reasoning = item.get("reasoning")
+        if reasoning:
+            logger.info("[Discussion][%s/%s] reasoning: %s", idx, total, reasoning)
+
+    for item in discussion.get("disagreements", [])[:5]:
+        logger.info("[Discussion][分歧] %s", item)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -753,9 +1081,12 @@ def run_rebalance_analysis(config: Config = None) -> dict:
         config = get_config()
 
     start_time = time.time()
+    local_model = os.getenv("REBALANCE_LOCAL_MODEL", "unknown")
+    debate_model = os.getenv("REBALANCE_DEBATE_MODEL", "unknown")
     logger.info("=" * 60)
     logger.info("开始执行多Agent调仓分析...")
-    logger.info(f"本地模型: {os.getenv('REBALANCE_LOCAL_MODEL', '未配置')}")
+    logger.info(f"本地模型: {local_model}")
+    logger.info(f"辩论模型: {debate_model}")
     cloud_model = os.getenv("REBALANCE_CLOUD_MODEL") or os.getenv("LITELLM_MODEL") or "未配置"
     logger.info(f"云端模型: {cloud_model}")
     logger.info("=" * 60)
@@ -824,7 +1155,11 @@ def run_rebalance_analysis(config: Config = None) -> dict:
         sensitive_news=json.dumps(sensitive_news, ensure_ascii=False, indent=2),
         trump_news=json.dumps(trump_news, ensure_ascii=False, indent=2),
     )
-    market_judge_raw = _call_local_llm(prompt_market, "Agent1_大盘")
+    market_judge_raw, market_model_used = _call_local_llm(
+        prompt_market,
+        "Agent1_大盘",
+        return_model=True,
+    )
     market_judge = _parse_llm_json(market_judge_raw)
     _save_agent_local_sample("agent1_market", prompt_market, market_judge_raw, market_judge)
     logger.info(
@@ -847,7 +1182,11 @@ def run_rebalance_analysis(config: Config = None) -> dict:
         ),
         holding_sectors=json.dumps(holding_sectors, ensure_ascii=False),
     )
-    sector_judge_raw = _call_local_llm(prompt_sector, "Agent2_板块")
+    sector_judge_raw, sector_model_used = _call_local_llm(
+        prompt_sector,
+        "Agent2_板块",
+        return_model=True,
+    )
     sector_judge = _parse_llm_json(sector_judge_raw)
     _save_agent_local_sample("agent2_sector", prompt_sector, sector_judge_raw, sector_judge)
     logger.info(f"  热门板块: {sector_judge.get('hot_sectors', [])}")
@@ -888,7 +1227,11 @@ def run_rebalance_analysis(config: Config = None) -> dict:
             stock_news=json.dumps(s_news, ensure_ascii=False, indent=2),
             code=code, name=name,
         )
-        rating_raw = _call_local_llm(prompt_holding, f"Agent3_{name}")
+        rating_raw, _ = _call_local_llm(
+            prompt_holding,
+            f"Agent3_{name}",
+            return_model=True,
+        )
         rating = _parse_llm_json(rating_raw)
         _save_agent_local_sample(f"agent3_{code}", prompt_holding, rating_raw, rating)
 
@@ -1004,7 +1347,11 @@ def run_rebalance_analysis(config: Config = None) -> dict:
     if risk_alerts_text:
         prompt_proposal = prompt_proposal + risk_alerts_text
 
-    proposal_raw = _call_local_llm(prompt_proposal, "Agent4a_激进派")
+    proposal_raw, proposal_model_used = _call_local_llm(
+        prompt_proposal,
+        "Agent4a_激进派",
+        return_model=True,
+    )
     proposal = _parse_llm_json(proposal_raw)
     if proposal:
         logger.info(f"  激进派方案: {proposal.get('overall_position_advice', 'N/A')}")
@@ -1022,6 +1369,7 @@ def run_rebalance_analysis(config: Config = None) -> dict:
 
     critique = {}
     critique_raw = "{}"
+    critique_model_used = ""
     if proposal:
         prompt_critique = PROMPT_DEBATE_CRITIQUE.format(
             proposal=json.dumps(proposal, ensure_ascii=False, indent=2),
@@ -1029,7 +1377,11 @@ def run_rebalance_analysis(config: Config = None) -> dict:
             market_summary=market_judge.get("summary", ""),
             sector_summary=sector_judge.get("summary", ""),
         )
-        critique_raw = _call_debate_llm(prompt_critique, "Agent4b_保守派")
+        critique_raw, critique_model_used = _call_debate_llm(
+            prompt_critique,
+            "Agent4b_保守派",
+            return_model=True,
+        )
         critique = _parse_llm_json(critique_raw)
         if critique:
             score = critique.get("overall_assessment", "?")
@@ -1056,6 +1408,7 @@ def run_rebalance_analysis(config: Config = None) -> dict:
 
     debate_mode = "none"
     prompt_used = ""
+    arbiter_model_used = ""
 
     if proposal and critique:
         # ✅ 完整辩论 → 仲裁模式
@@ -1071,13 +1424,18 @@ def run_rebalance_analysis(config: Config = None) -> dict:
         prompt_used = prompt_arbitrate
 
         # 仲裁模型降级链：云端 → DeepSeek → Qwen
-        rebalance_raw = _call_cloud_llm(prompt_arbitrate, "Agent4c_仲裁")
+        rebalance_raw, arbiter_model_used = _call_cloud_llm(
+            prompt_arbitrate,
+            "Agent4c_仲裁",
+            return_model=True,
+        )
         rebalance = _parse_llm_json(rebalance_raw)
 
         if not rebalance or not rebalance.get("actions"):
             logger.warning("[仲裁] 云端仲裁失败或返回空，尝试本地投票合并...")
             debate_mode = "local_merge"
             rebalance = _merge_proposal_and_critique(proposal, critique)
+            arbiter_model_used = "local_merge"
 
     elif proposal:
         # ⚠️ 只有激进派方案，保守派挂了 → 直接用方案但加风控过滤
@@ -1085,6 +1443,7 @@ def run_rebalance_analysis(config: Config = None) -> dict:
         logger.warning("  保守派审查失败，使用激进派方案 + 硬规则风控过滤...")
         rebalance = _apply_hard_rules(proposal, portfolio)
         rebalance_raw = json.dumps(rebalance, ensure_ascii=False)
+        arbiter_model_used = "hard_rules"
 
     else:
         # ❌ 全挂了 → 单模型直接决策
@@ -1100,7 +1459,11 @@ def run_rebalance_analysis(config: Config = None) -> dict:
         if risk_alerts_text:
             prompt_fallback = prompt_fallback + risk_alerts_text
         prompt_used = prompt_fallback
-        rebalance_raw = _call_cloud_llm(prompt_fallback, "Agent4_仲裁_fallback")
+        rebalance_raw, arbiter_model_used = _call_cloud_llm(
+            prompt_fallback,
+            "Agent4_仲裁_fallback",
+            return_model=True,
+        )
         rebalance = _parse_llm_json(rebalance_raw)
 
     # 最终兜底：如果解析全失败，至少给出风控硬规则的建议
@@ -1109,6 +1472,7 @@ def run_rebalance_analysis(config: Config = None) -> dict:
         debate_mode = "rules_only"
         rebalance = _generate_rules_only_advice(portfolio)
         rebalance_raw = json.dumps(rebalance, ensure_ascii=False)
+        arbiter_model_used = "rules_only"
 
     logger.info(f"[仲裁] 决策模式: {debate_mode}, 返回长度: {len(rebalance_raw) if isinstance(rebalance_raw, str) else 'N/A'}")
 
@@ -1154,13 +1518,37 @@ def run_rebalance_analysis(config: Config = None) -> dict:
     except Exception as e:
         logger.warning("[执行数量规划] 生成整手数量失败，保留原始建议: %s", e)
 
+    discussion = _build_rebalance_discussion(
+        market_judge=market_judge,
+        sector_judge=sector_judge,
+        holdings_ratings=holdings_ratings,
+        proposal=proposal,
+        critique=critique,
+        rebalance=rebalance,
+        debate_mode=debate_mode,
+        market_model=market_model_used,
+        sector_model=sector_model_used,
+        holdings_model=local_model,
+        proposal_model=proposal_model_used,
+        critique_model=critique_model_used or debate_model,
+        arbiter_model=arbiter_model_used,
+    )
+    rebalance["agent_discussion"] = discussion
+    _log_rebalance_discussion(discussion)
+
     rebalance["_meta"] = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "elapsed_seconds": elapsed,
         "holdings_count": len(holding_codes),
         "agents_used": debate_mode,
-        "local_model": os.getenv("REBALANCE_LOCAL_MODEL", "unknown"),
+        "local_model": local_model,
+        "debate_model": debate_model,
         "cloud_model": cloud_model,
+        "market_model_used": market_model_used,
+        "sector_model_used": sector_model_used,
+        "proposal_model_used": proposal_model_used,
+        "critique_model_used": critique_model_used or debate_model,
+        "arbiter_model_used": arbiter_model_used,
         **rebalance.get("_meta", {}),
     }
 

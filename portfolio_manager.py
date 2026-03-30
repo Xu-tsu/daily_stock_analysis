@@ -217,8 +217,95 @@ def _append_execution_plan(lines: list, item: dict, indent: str = "   ") -> None
     elif quantity_reason:
         lines.append(f"{indent}📐 数量约束: {quantity_reason}")
 
+def _truncate_report_text(value, limit: int = 150) -> str:
+    text = str(value or "").replace("\n", " ").strip()
+    text = " ".join(text.split())
+    if not text:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[: max(limit - 3, 0)] + "..."
 
-def format_rebalance_report(rebalance: dict) -> str:
+
+def _append_agent_discussion_legacy(lines: list, discussion: dict) -> None:
+    if not discussion:
+        return
+
+    lines.append("馃 **澶氭ā鍨嬭京璁?*:")
+
+    summary = _truncate_report_text(discussion.get("summary", ""), 180)
+    if summary:
+        lines.append(f"   鎽樿: {summary}")
+
+    for item in discussion.get("rounds", []):
+        label = item.get("agent_label", "Agent")
+        role = item.get("role_label", "")
+        model = item.get("model", "")
+        signal = _truncate_report_text(item.get("signal_label", ""), 90)
+
+        header_parts = [label]
+        if role:
+            header_parts.append(role)
+        header = " | ".join(header_parts)
+        if model:
+            header += f" [{model}]"
+        if signal:
+            header += f" 鈫?{signal}"
+        lines.append(f"   鈥?{header}")
+
+        reasoning = _truncate_report_text(item.get("reasoning", ""), 180)
+        if reasoning:
+            lines.append(f"     {reasoning}")
+
+    disagreements = discussion.get("disagreements", [])
+    if disagreements:
+        lines.append("   鈿旓笍 鍒嗘鐒︾偣:")
+        for item in disagreements[:5]:
+            lines.append(f"   鈥?{_truncate_report_text(item, 140)}")
+
+    lines.append("")
+
+
+def _append_agent_discussion(lines: list, discussion: dict) -> None:
+    if not discussion:
+        return
+
+    lines.append("🤖 **多模型讨论**:")
+
+    summary = _truncate_report_text(discussion.get("summary", ""), 180)
+    if summary:
+        lines.append(f"   摘要: {summary}")
+
+    for item in discussion.get("rounds", []):
+        label = item.get("agent_label", "Agent")
+        role = item.get("role_label", "")
+        model = item.get("model", "")
+        signal = _truncate_report_text(item.get("signal_label", ""), 90)
+
+        header_parts = [label]
+        if role:
+            header_parts.append(role)
+        header = " | ".join(header_parts)
+        if model:
+            header += f" [{model}]"
+        if signal:
+            header += f" → {signal}"
+        lines.append(f"   • {header}")
+
+        reasoning = _truncate_report_text(item.get("reasoning", ""), 180)
+        if reasoning:
+            lines.append(f"     {reasoning}")
+
+    disagreements = discussion.get("disagreements", [])
+    if disagreements:
+        lines.append("   ⚔️ 分歧焦点:")
+        for item in disagreements[:5]:
+            lines.append(f"   • {_truncate_report_text(item, 140)}")
+
+    lines.append("")
+
+
+def _format_rebalance_report_legacy(rebalance: dict) -> str:
     """把 LLM 返回的调仓 JSON 格式化为推送文本"""
     lines = []
     lines.append("📊 **调仓建议报告**")
@@ -307,6 +394,101 @@ def format_rebalance_report(rebalance: dict) -> str:
         lines.append("")
 
     # 风险提示
+    risk = rebalance.get("risk_warning", "")
+    if risk:
+        lines.append(f"⚠️ **风险提示**: {risk}")
+
+    return "\n".join(lines)
+
+
+def format_rebalance_report(rebalance: dict) -> str:
+    """把调仓 JSON 格式化为可推送的文本报告。"""
+    lines = [
+        "📊 **调仓建议报告**",
+        f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        "",
+    ]
+
+    pos = rebalance.get("overall_position_advice", "")
+    if pos:
+        lines.append(f"🎯 **仓位建议**: {pos}")
+        lines.append("")
+
+    market = rebalance.get("market_assessment", "")
+    if market:
+        lines.append(f"📈 **大盘研判**: {market}")
+        lines.append("")
+
+    sector = rebalance.get("sector_assessment", "")
+    if sector:
+        lines.append(f"🔥 **板块轮动**: {sector}")
+        lines.append("")
+
+    debate = rebalance.get("debate_summary", "")
+    if debate:
+        lines.append(f"🤖 **多模型辩论**: {debate}")
+        lines.append("")
+
+    _append_agent_discussion(lines, rebalance.get("agent_discussion", {}))
+
+    actions = rebalance.get("actions", [])
+    if actions:
+        lines.append("📋 **操作建议**:")
+        for action in actions:
+            emoji = {
+                "buy": "🟢",
+                "hold": "🟡",
+                "reduce": "🟠",
+                "sell": "🔴",
+            }.get(action.get("action", "hold"), "ℹ️")
+            action_cn = {
+                "buy": "加仓",
+                "hold": "持有",
+                "reduce": "减仓",
+                "sell": "清仓",
+            }.get(action.get("action", "hold"), action.get("action", ""))
+            lines.append(f"{emoji} **{action.get('name', action.get('code', ''))}** → {action_cn}")
+            if action.get("detail"):
+                lines.append(f"   {action['detail']}")
+            if action.get("reason"):
+                lines.append(f"   💡 {action['reason']}")
+            _append_execution_plan(lines, action)
+
+            target_price = action.get("target_sell_price")
+            stop_loss = action.get("stop_loss_price")
+            sell_timing = action.get("sell_timing")
+            if target_price or stop_loss:
+                price_info = []
+                if target_price:
+                    price_info.append(f"目标卖出价: {target_price}")
+                if stop_loss:
+                    price_info.append(f"止损价: {stop_loss}")
+                lines.append(f"   🎯 {' | '.join(price_info)}")
+            if sell_timing:
+                lines.append(f"   ⏰ 卖出时机: {sell_timing}")
+        lines.append("")
+
+    candidates = rebalance.get("new_candidates", [])
+    if candidates:
+        lines.append("🔍 **换股候选**:")
+        for candidate in candidates:
+            line = f"  • {candidate.get('name', '')}({candidate.get('code', '')}) — {candidate.get('reason', '')}"
+            buy_range = candidate.get("buy_price_range")
+            target_price = candidate.get("target_sell_price")
+            stop_loss = candidate.get("stop_loss_price")
+            if buy_range or target_price or stop_loss:
+                prices = []
+                if buy_range:
+                    prices.append(f"买入区间:{buy_range}")
+                if target_price:
+                    prices.append(f"目标:{target_price}")
+                if stop_loss:
+                    prices.append(f"止损:{stop_loss}")
+                line += f"\n    🎯 {' | '.join(prices)}"
+            lines.append(line)
+            _append_execution_plan(lines, candidate, indent="    ")
+        lines.append("")
+
     risk = rebalance.get("risk_warning", "")
     if risk:
         lines.append(f"⚠️ **风险提示**: {risk}")

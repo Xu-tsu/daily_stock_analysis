@@ -113,9 +113,20 @@ class LLMToolAdapter:
 
     def _has_channel_config(self) -> bool:
         """Check if multi-channel config (channels / YAML) is active."""
-        return bool(self._config.llm_model_list) and not all(
-            e.get('model_name', '').startswith('__legacy_') for e in self._config.llm_model_list
-        )
+        model_list = list(getattr(self._config, "llm_model_list", []) or [])
+        if not model_list:
+            return False
+
+        source = str(getattr(self._config, "llm_models_source", "") or "").strip().lower()
+        if source in {"llm_channels", "litellm_config"}:
+            return True
+        if source == "legacy_env":
+            return False
+
+        names = [str(entry.get("model_name", "") or "").strip() for entry in model_list]
+        has_legacy = any(name.startswith("__legacy_") for name in names)
+        has_non_legacy = any(name and not name.startswith("__legacy_") for name in names)
+        return has_non_legacy and not has_legacy
 
     def _init_litellm(self) -> None:
         """Initialize litellm Router from channels / YAML / legacy keys."""

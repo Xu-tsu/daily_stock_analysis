@@ -304,6 +304,13 @@ python main.py --monitor --interval 5
 - 决策仪表盘、企业微信精简报告和单股报告会新增“多 Agent 讨论”区块，统一展示讨论摘要、分歧焦点和阶段观点，不需要再去翻原始 JSON。
 
 ---
+
+## 🤖 调仓辩论可见性
+
+- `rebalance_engine.py` 这条调仓链路现在也会输出多模型讨论过程，不再只保留一行 `debate_summary`。
+- 调仓建议报告会展开显示 `Agent1 大盘研判 / Agent2 板块轮动 / Agent3 持仓扫描 / Agent4a 激进派提案 / Agent4b 保守派质疑 / Agent4c 云端仲裁` 的阶段观点、所用模型、关键信号和分歧焦点。
+- 运行日志里会新增 `[Discussion]` 相关条目，方便盘中回看“为什么从提案收敛到最终调仓结论”。
+- 旧版 `GEMINI_API_KEY` / `OPENAI_API_KEY` 兼容路径下，即使自动探测到本地 Ollama 兜底模型，也不会再把 legacy placeholder 模型名错误地直接交给 LiteLLM Router，飞书/聊天命令可继续正常初始化。
 生成时间: 18:00
 ```
 

@@ -11,7 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- `rebalance_engine.py` 调仓辩论链路新增结构化 `agent_discussion` 输出：调仓建议报告和运行日志都会展开显示大盘研判、板块轮动、持仓扫描、激进派提案、保守派质疑与云端仲裁的阶段观点、所用模型和分歧焦点，不再只保留单行 `debate_summary`。
+
 - 澶?Agent 涓绘祦鍒嗘瀽鐜板湪浼氬湪 `AgentOrchestrator` 鏃ュ織涓墦鍑烘瘡涓樁娈电殑淇″彿銆佺疆淇″害鍜岀悊鐢憋紝骞跺湪鏈€缁堟姤鍛?Markdown / 浼佷笟寰俊 / 鍗曡偂鎶ュ憡锛変腑鏂板鈥滃 Agent 璁ㄨ鈥濆尯鍧楋紝缁熶竴灞曠ず璁ㄨ鎽樿銆佸垎姝х劍鐐瑰拰鍚勯樁娈电粨璁恒€?
+
+### Fixed
+
+- 修复 `src/agent/llm_adapter.py` 在 legacy `GEMINI_API_KEY` / `OPENAI_API_KEY` 配置并自动探测到本地 Ollama 兜底模型时，误把包含 `__legacy_gemini__` 的 `llm_model_list` 当作 channel/YAML Router 配置加载，导致飞书/聊天命令初始化阶段抛出 `LLM Provider NOT provided` 的问题；同时补齐 legacy 路径下 `ollama/...` 直连所需的 `api_base` / `api_key` 参数。
 
 - 持仓天数相关判断现统一改为按 A 股交易日计算：`risk_control.py`、`rebalance_engine.py`、`trade_journal.py`、`pdf_parser.py` 中的 `hold_days` 不再按自然日累计，周末和休市日不会再把短线持仓误判为超期。
 - 调仓建议、盘中做 T 建议与换股候选新增 A 股整手数量规划：买卖数量统一按 `100股=1手` 取整，优先复用交割单 / 交易导入中的真实手续费、印花税和过户费样本估算执行成本，并在调仓报告里直接展示建议股数、手数和预计到账 / 支出。

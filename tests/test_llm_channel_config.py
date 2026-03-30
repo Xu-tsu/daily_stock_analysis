@@ -65,7 +65,8 @@ class LLMChannelConfigTestCase(unittest.TestCase):
 
     @patch("src.config.setup_env")
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])
-    def test_disabled_channel_is_skipped(self, _mock_parse_yaml, _mock_setup_env) -> None:
+    @patch("src.config.detect_local_ollama_models", return_value=[])
+    def test_disabled_channel_is_skipped(self, _mock_detect_ollama, _mock_parse_yaml, _mock_setup_env) -> None:
         env = {
             "LLM_CHANNELS": "primary",
             "LLM_PRIMARY_PROTOCOL": "openai",

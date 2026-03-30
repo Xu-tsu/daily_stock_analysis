@@ -1779,6 +1779,11 @@ def extra_litellm_params(model: str, config: Config) -> Dict[str, Any]:
     # deepseek/ provider: litellm auto-resolves api_base, no manual override needed
     if model.startswith("deepseek/"):
         return params
+    if model.startswith("ollama/"):
+        ollama_base = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+        params["api_base"] = f"{ollama_base}/v1"
+        params["api_key"] = "ollama"
+        return params
     if model.startswith("openai/") or "/" not in model:
         if config.openai_base_url:
             params["api_base"] = config.openai_base_url
