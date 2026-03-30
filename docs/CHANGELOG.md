@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- 澶?Agent 涓绘祦鍒嗘瀽鐜板湪浼氬湪 `AgentOrchestrator` 鏃ュ織涓墦鍑烘瘡涓樁娈电殑淇″彿銆佺疆淇″害鍜岀悊鐢憋紝骞跺湪鏈€缁堟姤鍛?Markdown / 浼佷笟寰俊 / 鍗曡偂鎶ュ憡锛変腑鏂板鈥滃 Agent 璁ㄨ鈥濆尯鍧楋紝缁熶竴灞曠ず璁ㄨ鎽樿銆佸垎姝х劍鐐瑰拰鍚勯樁娈电粨璁恒€?
+
 - 持仓天数相关判断现统一改为按 A 股交易日计算：`risk_control.py`、`rebalance_engine.py`、`trade_journal.py`、`pdf_parser.py` 中的 `hold_days` 不再按自然日累计，周末和休市日不会再把短线持仓误判为超期。
 - 调仓建议、盘中做 T 建议与换股候选新增 A 股整手数量规划：买卖数量统一按 `100股=1手` 取整，优先复用交割单 / 交易导入中的真实手续费、印花税和过户费样本估算执行成本，并在调仓报告里直接展示建议股数、手数和预计到账 / 支出。
 
@@ -28,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### 修复
 
+- 🔔 修复飞书 Stream 模式读取 `FEISHU_PORTFOLIO_COMMAND_INTERCEPT` 时缺少 `os` 导入导致的 `NameError`，恢复群聊消息进入持仓口令拦截与正常 dispatcher 分发。
 - 📧 **邮件中文发件人名编码**（#708）— 邮件通知现在会对包含中文的 `EMAIL_SENDER_NAME` 自动做 RFC 2047 编码，并在异常路径补充 SMTP 连接清理，修复 GitHub Actions / QQ SMTP 下 `'ascii' codec can't encode characters` 导致的发送失败。
 - 🐛 **港股 Agent 实时行情去重与快速路由** — 统一 `HK01810` / `1810.HK` / `01810` 等港股代码归一规则；港股实时行情改为直接走单次 `akshare_hk` 路径，避免按 A 股 source priority 重复触发同一失败接口；Agent 运行期对显式 `retriable=false` 的工具失败增加短路缓存，减少同轮分析中的重复失败调用。
 - 📰 **新闻时效硬过滤与策略分窗**（#697）— 新增 `NEWS_STRATEGY_PROFILE`（`ultra_short/short/medium/long`）并与 `NEWS_MAX_AGE_DAYS` 统一计算有效窗口；搜索结果在返回后执行发布时间硬过滤（时间未知剔除、超窗剔除、未来仅容忍 1 天），并在历史 fallback 链路追加相同约束，避免旧闻再次进入“最新动态/风险警报”。

@@ -301,7 +301,9 @@ class AgentOrchestrator:
                     "message": f"Starting {agent.agent_name} analysis...",
                 })
 
+            opinion_count_before = len(ctx.opinions)
             result: StageResult = agent.run(ctx, progress_callback=progress_callback)
+            self._log_new_opinions(ctx, opinion_count_before, agent.agent_name)
             stats.record_stage(result)
             all_tool_calls.extend(
                 tc for tc in (result.meta.get("tool_calls_log") or [])
@@ -364,6 +366,7 @@ class AgentOrchestrator:
         total_duration = round(time.time() - t0, 2)
         stats.total_duration_s = total_duration
         stats.models_used = list(dict.fromkeys(models_used))
+        self._log_discussion_summary(ctx)
 
         dashboard, content = self._resolve_final_output(ctx, parse_dashboard=parse_dashboard)
 
@@ -485,6 +488,7 @@ class AgentOrchestrator:
                     "confidence": consensus.confidence,
                     "reasoning": consensus.reasoning,
                 })
+                self._log_opinion(consensus, len(ctx.opinions), "strategy_consensus")
                 logger.info(
                     "[Orchestrator] strategy consensus: signal=%s confidence=%.2f",
                     consensus.signal, consensus.confidence,
@@ -552,6 +556,63 @@ class AgentOrchestrator:
                 lines.append(f"- [{rf['severity']}] {rf['description']}")
         return "\n".join(lines)
 
+    def _log_new_opinions(
+        self,
+        ctx: AgentContext,
+        opinion_count_before: int,
+        stage_name: str,
+    ) -> None:
+        """Emit structured logs for opinions produced by a stage."""
+        new_opinions = ctx.opinions[opinion_count_before:]
+        for offset, opinion in enumerate(new_opinions, start=opinion_count_before + 1):
+            self._log_opinion(opinion, offset, stage_name)
+
+    def _log_opinion(
+        self,
+        opinion: Any,
+        round_index: int,
+        stage_name: str,
+    ) -> None:
+        """Log one agent opinion in a compact, discussion-oriented format."""
+        if opinion is None:
+            return
+
+        agent_label = _agent_display_name(getattr(opinion, "agent_name", ""))
+        signal_label = _signal_to_discussion_label(getattr(opinion, "signal", ""))
+        confidence = _format_confidence_pct(getattr(opinion, "confidence", 0.0))
+        reasoning = _truncate_text(getattr(opinion, "reasoning", ""), 180) or "No reasoning"
+        logger.info(
+            "[Orchestrator][Discussion][Round %s][%s] %s -> %s (%s) | %s",
+            round_index,
+            stage_name,
+            agent_label,
+            signal_label,
+            confidence,
+            reasoning,
+        )
+
+        highlights = _extract_opinion_highlights(opinion)
+        if highlights:
+            logger.info(
+                "[Orchestrator][Discussion][Round %s][%s] highlights=%s",
+                round_index,
+                stage_name,
+                " | ".join(highlights[:3]),
+            )
+
+    def _log_discussion_summary(self, ctx: AgentContext) -> None:
+        """Emit the final multi-agent discussion summary into logs."""
+        discussion = self._build_agent_discussion(ctx)
+        summary = str(discussion.get("summary") or "").strip()
+        disagreements = discussion.get("disagreements") if isinstance(discussion, dict) else []
+        if summary:
+            logger.info("[Orchestrator][Discussion] summary=%s", summary)
+        if isinstance(disagreements, list):
+            for item in disagreements[:3]:
+                text = str(item or "").strip()
+                if text:
+                    logger.info("[Orchestrator][Discussion] divergence=%s", text)
+
     def _resolve_final_output(
         self,
         ctx: AgentContext,
@@ -614,13 +675,17 @@ class AgentOrchestrator:
             return None
 
         ctx.set_data("final_dashboard", dashboard)
-        # Apply risk override (idempotent — safe to call even if already
+        # Apply risk override (idempotent – safe to call even if already
         # applied in _execute_pipeline after the decision stage).
         self._apply_risk_override(ctx)
         overridden = ctx.get_data("final_dashboard")
         if isinstance(overridden, dict):
-            return overridden
-        return dashboard
+            refreshed = self._attach_agent_discussion(overridden, ctx)
+            ctx.set_data("final_dashboard", refreshed)
+            return refreshed
+        refreshed = self._attach_agent_discussion(dashboard, ctx)
+        ctx.set_data("final_dashboard", refreshed)
+        return refreshed
 
     def _normalize_dashboard_payload(
         self,
@@ -834,7 +899,136 @@ class AgentOrchestrator:
         payload["key_points"] = key_points
         payload["risk_warning"] = risk_warning
         payload["dashboard"] = dashboard_block
-        return payload
+        return self._attach_agent_discussion(payload, ctx)
+
+    def _attach_agent_discussion(
+        self,
+        payload: Dict[str, Any],
+        ctx: AgentContext,
+    ) -> Dict[str, Any]:
+        """Attach a structured multi-agent discussion block to the payload."""
+        enriched = dict(payload or {})
+        dashboard_block = enriched.get("dashboard")
+        if not isinstance(dashboard_block, dict):
+            dashboard_block = {}
+        else:
+            dashboard_block = dict(dashboard_block)
+
+        discussion = self._build_agent_discussion(ctx)
+        if not discussion:
+            enriched["dashboard"] = dashboard_block
+            return enriched
+
+        dashboard_block["agent_discussion"] = discussion
+        enriched["dashboard"] = dashboard_block
+        enriched["agent_discussion"] = discussion
+        enriched["agent_discussion_summary"] = discussion.get("summary", "")
+        ctx.meta["agent_discussion"] = discussion
+        ctx.set_data("agent_discussion", discussion)
+        return enriched
+
+    def _build_agent_discussion(self, ctx: AgentContext) -> Dict[str, Any]:
+        """Build a report-friendly trace of the multi-agent discussion."""
+        if not ctx.opinions and not ctx.risk_flags:
+            return {}
+
+        rounds: List[Dict[str, Any]] = []
+        signal_groups: Dict[str, List[str]] = {}
+        for idx, opinion in enumerate(ctx.opinions, start=1):
+            round_item = self._build_discussion_round(opinion, idx)
+            rounds.append(round_item)
+            canonical_signal = _normalize_discussion_signal(opinion.signal)
+            signal_groups.setdefault(canonical_signal, []).append(round_item["agent_label"])
+
+        disagreements: List[str] = []
+        active_groups = {signal: names for signal, names in signal_groups.items() if names}
+        if len(active_groups) > 1:
+            parts = []
+            for signal, names in active_groups.items():
+                parts.append(
+                    f"{_signal_to_discussion_label(signal)}: {' / '.join(dict.fromkeys(names))}"
+                )
+            disagreements.append(f"阶段信号存在分歧，{'; '.join(parts)}")
+
+        risk_opinion = self._latest_opinion(ctx, {"risk"})
+        risk_raw = risk_opinion.raw_data if risk_opinion and isinstance(risk_opinion.raw_data, dict) else {}
+        if risk_raw.get("veto_buy"):
+            disagreements.append("Risk Agent 触发买入否决，最终结论以防守和风险优先。")
+        else:
+            adjustment = str(risk_raw.get("signal_adjustment") or "").strip()
+            if adjustment:
+                disagreements.append(f"Risk Agent 建议对最终信号执行 {adjustment} 修正。")
+
+        decision = self._latest_opinion(ctx, {"decision"})
+        decision_signal = _normalize_discussion_signal(decision.signal) if decision else ""
+        prior_signals = [
+            _normalize_discussion_signal(op.signal)
+            for op in ctx.opinions
+            if op.agent_name != "decision"
+        ]
+        majority_signal = _majority_signal(prior_signals)
+        if decision and majority_signal and decision_signal and majority_signal != decision_signal:
+            disagreements.append(
+                f"Decision Agent 将阶段主导观点从{_signal_to_discussion_label(majority_signal)}收敛为"
+                f"{_signal_to_discussion_label(decision_signal)}。"
+            )
+
+        summary_parts: List[str] = []
+        if rounds:
+            preview = " -> ".join(
+                f"{item['agent_label']}:{item['signal_label']}" for item in rounds[:4]
+            )
+            if preview:
+                summary_parts.append(preview)
+        if decision:
+            summary_parts.append(
+                f"最终由{_agent_display_name(decision.agent_name)}给出"
+                f"{_signal_to_discussion_label(decision.signal)}({ _format_confidence_pct(decision.confidence) })"
+            )
+        elif rounds:
+            tail = rounds[-1]
+            summary_parts.append(
+                f"当前主导观点为{tail['agent_label']}的{tail['signal_label']}"
+            )
+        if disagreements:
+            summary_parts.append(disagreements[0])
+        if ctx.risk_flags:
+            risk_brief = _truncate_text(
+                "；".join(
+                    str(flag.get("description") or "").strip()
+                    for flag in ctx.risk_flags[:2]
+                    if str(flag.get("description") or "").strip()
+                ),
+                80,
+            )
+            if risk_brief:
+                summary_parts.append(f"附加风险提示：{risk_brief}")
+
+        return {
+            "summary": _truncate_text("；".join(part for part in summary_parts if part), 260),
+            "rounds": rounds[:8],
+            "disagreements": disagreements[:4],
+            "agent_count": len(rounds),
+            "has_disagreement": bool(disagreements),
+        }
+
+    def _build_discussion_round(
+        self,
+        opinion: Any,
+        round_index: int,
+    ) -> Dict[str, Any]:
+        """Normalize a single opinion into a report/log friendly shape."""
+        return {
+            "round": round_index,
+            "agent_name": getattr(opinion, "agent_name", ""),
+            "agent_label": _agent_display_name(getattr(opinion, "agent_name", "")),
+            "signal": getattr(opinion, "signal", ""),
+            "signal_label": _signal_to_discussion_label(getattr(opinion, "signal", "")),
+            "confidence": round(float(getattr(opinion, "confidence", 0.0) or 0.0), 2),
+            "confidence_pct": _format_confidence_pct(getattr(opinion, "confidence", 0.0)),
+            "reasoning": _truncate_text(getattr(opinion, "reasoning", ""), 160),
+            "highlights": _extract_opinion_highlights(opinion),
+        }
 
     def _collect_key_levels(
         self,
@@ -1383,3 +1577,128 @@ def _extract_latest_news_title(intelligence: Dict[str, Any]) -> str:
     if isinstance(latest_news, str) and latest_news.strip():
         return latest_news.strip()
     return ""
+
+
+def _agent_display_name(agent_name: str) -> str:
+    """Map internal agent ids to user-facing labels."""
+    name = str(agent_name or "").strip()
+    mapping = {
+        "technical": "Technical Agent",
+        "intel": "Intel Agent",
+        "risk": "Risk Agent",
+        "decision": "Decision Agent",
+        "strategy_consensus": "Strategy Consensus",
+    }
+    if name in mapping:
+        return mapping[name]
+    if name.startswith("strategy_"):
+        strategy_name = name[len("strategy_"):].replace("_", " ").strip()
+        if strategy_name:
+            return f"Strategy Agent ({strategy_name})"
+    return name or "Agent"
+
+
+def _normalize_discussion_signal(signal: Any) -> str:
+    """Normalize stage opinions into buy/hold/sell buckets for discussion."""
+    raw = str(signal or "").strip().lower()
+    if not raw:
+        return "hold"
+    if raw in {"strong_buy", "buy"}:
+        return "buy"
+    if raw in {"strong_sell", "sell"}:
+        return "sell"
+    if raw == "hold":
+        return "hold"
+    if "buy" in raw or "bull" in raw or "long" in raw:
+        return "buy"
+    if "sell" in raw or "bear" in raw or "short" in raw:
+        return "sell"
+    return "hold"
+
+
+def _signal_to_discussion_label(signal: Any) -> str:
+    """Return a discussion-friendly Chinese label for an opinion signal."""
+    raw = str(signal or "").strip().lower()
+    mapping = {
+        "strong_buy": "强烈看多",
+        "buy": "偏多",
+        "hold": "中性观望",
+        "sell": "偏空",
+        "strong_sell": "强烈偏空",
+    }
+    if raw in mapping:
+        return mapping[raw]
+    normalized = _normalize_discussion_signal(raw)
+    return {
+        "buy": "偏多",
+        "hold": "中性观望",
+        "sell": "偏空",
+    }.get(normalized, raw or "中性观望")
+
+
+def _format_confidence_pct(confidence: Any) -> str:
+    """Format confidence as an integer percentage string."""
+    try:
+        value = float(confidence or 0.0)
+    except (TypeError, ValueError):
+        value = 0.0
+    return f"{round(max(0.0, min(1.0, value)) * 100):.0f}%"
+
+
+def _extract_opinion_highlights(opinion: Any) -> List[str]:
+    """Extract short structured highlights from an opinion raw payload."""
+    if opinion is None:
+        return []
+
+    raw = opinion.raw_data if isinstance(getattr(opinion, "raw_data", None), dict) else {}
+    highlights: List[str] = []
+
+    risk_alerts = raw.get("risk_alerts")
+    if isinstance(risk_alerts, list) and risk_alerts:
+        highlights.append(f"风险: {_truncate_text('；'.join(str(item) for item in risk_alerts[:2]), 60)}")
+
+    positive_catalysts = raw.get("positive_catalysts")
+    if isinstance(positive_catalysts, list) and positive_catalysts:
+        highlights.append(
+            f"催化: {_truncate_text('；'.join(str(item) for item in positive_catalysts[:2]), 60)}"
+        )
+
+    flags = raw.get("flags")
+    if isinstance(flags, list) and flags:
+        highlights.append(f"风控标记: {_truncate_text('；'.join(str(item) for item in flags[:2]), 60)}")
+
+    if raw.get("veto_buy"):
+        highlights.append("触发买入否决")
+
+    signal_adjustment = str(raw.get("signal_adjustment") or "").strip()
+    if signal_adjustment:
+        highlights.append(f"信号修正: {signal_adjustment}")
+
+    latest_news = str(raw.get("latest_news") or "").strip()
+    if latest_news:
+        highlights.append(f"最新消息: {_truncate_text(latest_news, 50)}")
+
+    key_levels = getattr(opinion, "key_levels", {})
+    if isinstance(key_levels, dict) and key_levels:
+        level_parts = []
+        for key in ("support", "resistance", "stop_loss", "take_profit"):
+            if key in key_levels:
+                level_parts.append(f"{key}={key_levels[key]}")
+        if level_parts:
+            highlights.append(f"关键位: {', '.join(level_parts[:3])}")
+
+    return highlights[:4]
+
+
+def _majority_signal(signals: List[str]) -> str:
+    """Return the dominant signal bucket, or empty string when tied/unknown."""
+    counts: Dict[str, int] = {}
+    for signal in signals:
+        normalized = _normalize_discussion_signal(signal)
+        counts[normalized] = counts.get(normalized, 0) + 1
+    if not counts:
+        return ""
+    ordered = sorted(counts.items(), key=lambda item: item[1], reverse=True)
+    if len(ordered) > 1 and ordered[0][1] == ordered[1][1]:
+        return ""
+    return ordered[0][0]

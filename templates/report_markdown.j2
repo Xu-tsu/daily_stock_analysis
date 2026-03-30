@@ -18,6 +18,7 @@
 {% set core = dashboard.get('core_conclusion') or {} %}
 {% set battle = dashboard.get('battle_plan') or {} %}
 {% set data_persp = dashboard.get('data_perspective') or {} %}
+{% set discussion = dashboard.get('agent_discussion') or {} %}
 
 ## {{ e.signal_emoji }} {{ e.stock_name }} ({{ result.code }})
 
@@ -68,6 +69,29 @@
 {% endif %}
 
 {{ market_snapshot(result) }}
+
+{% if discussion %}
+### 🤖 多 Agent 讨论
+
+{% if discussion.get('summary') %}
+**讨论摘要**: {{ discussion.summary }}
+{% endif %}
+{% if discussion.get('disagreements') %}
+
+**分歧焦点**:
+{% for item in discussion.disagreements[:4] %}
+- {{ item }}
+{% endfor %}
+{% endif %}
+{% if discussion.get('rounds') %}
+
+**阶段观点**:
+{% for item in discussion.rounds[:5] %}
+- {{ item.agent_label or item.agent_name }}: {{ item.signal_label or item.signal }}{% if item.confidence_pct %} ({{ item.confidence_pct }}){% endif %}{% if item.reasoning %} | {{ item.reasoning }}{% endif %}
+{% endfor %}
+{% endif %}
+
+{% endif %}
 
 {% if data_persp %}
 ### 📊 数据透视

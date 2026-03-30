@@ -67,6 +67,37 @@ class TestReportRenderer(unittest.TestCase):
         self.assertIn("核心结论", out)
         self.assertIn("作战计划", out)
 
+    def test_render_markdown_full_includes_agent_discussion(self) -> None:
+        """Markdown template renders the multi-agent discussion block."""
+        r = _make_result(
+            dashboard={
+                "core_conclusion": {"one_sentence": "鍏堢瓑纭"},
+                "intelligence": {"risk_alerts": []},
+                "battle_plan": {"sniper_points": {"stop_loss": "110"}},
+                "agent_discussion": {
+                    "summary": "Technical Agent 偏多，但 Risk Agent 暂时偏空。",
+                    "rounds": [
+                        {
+                            "agent_label": "Technical Agent",
+                            "signal_label": "偏多",
+                            "confidence_pct": "82%",
+                            "reasoning": "Trend breakout",
+                        },
+                        {
+                            "agent_label": "Risk Agent",
+                            "signal_label": "偏空",
+                            "confidence_pct": "74%",
+                            "reasoning": "Quant pressure",
+                        },
+                    ],
+                },
+            }
+        )
+        out = render("markdown", [r], summary_only=False)
+        self.assertIsNotNone(out)
+        self.assertIn("多 Agent 讨论", out)
+        self.assertIn("Technical Agent", out)
+
     def test_render_wechat(self) -> None:
         """Wechat platform renders."""
         r = _make_result()

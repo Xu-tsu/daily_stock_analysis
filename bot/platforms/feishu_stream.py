@@ -23,6 +23,7 @@ https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/server-side-sdk/python--sd
 
 import json
 import logging
+import os
 import threading
 from datetime import datetime
 from typing import Optional, Callable

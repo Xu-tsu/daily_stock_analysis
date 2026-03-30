@@ -552,7 +552,8 @@ class NotificationService(
             for result in sorted_results:
                 emoji = result.get_emoji()
                 confidence_stars = result.get_confidence_stars() if hasattr(result, 'get_confidence_stars') else '⭐⭐'
-                
+                dashboard = result.dashboard if hasattr(result, 'dashboard') and result.dashboard else {}
+
                 report_lines.extend([
                     f"### {emoji} {result.name} ({result.code})",
                     "",
@@ -561,6 +562,7 @@ class NotificationService(
                 ])
 
                 self._append_market_snapshot(report_lines, result)
+                self._append_agent_discussion(report_lines, dashboard)
                 
                 # 核心看点
                 if hasattr(result, 'key_points') and result.key_points:
@@ -897,6 +899,7 @@ class NotificationService(
                 self._append_market_snapshot(report_lines, result)
                 
                 # ========== 数据透视 ==========
+                self._append_agent_discussion(report_lines, dashboard)
                 data_persp = dashboard.get('data_perspective', {}) if dashboard else {}
                 if data_persp:
                     trend_data = data_persp.get('trend_status', {})
@@ -1123,6 +1126,7 @@ class NotificationService(
                     lines.append("")
                 
                 # 风险警报（最重要，醒目显示）
+                self._append_agent_discussion(lines, dashboard, compact=True)
                 risks = intel.get('risk_alerts', []) if intel else []
                 if risks:
                     lines.append("🚨 **风险**:")
@@ -1396,6 +1400,7 @@ class NotificationService(
             lines.append("")
         
         # 狙击点位
+        self._append_agent_discussion(lines, dashboard)
         sniper = battle.get('sniper_points', {}) if battle else {}
         if sniper:
             lines.extend([
@@ -1470,6 +1475,64 @@ class NotificationService(
             ])
 
         lines.append("")
+
+    def _append_agent_discussion(
+        self,
+        lines: List[str],
+        dashboard: Dict[str, Any],
+        *,
+        compact: bool = False,
+    ) -> None:
+        """Append a concise multi-agent discussion section when available."""
+        if not isinstance(dashboard, dict) or not dashboard:
+            return
+
+        discussion = dashboard.get("agent_discussion")
+        if not isinstance(discussion, dict):
+            return
+
+        summary = str(discussion.get("summary") or "").strip()
+        rounds = discussion.get("rounds") if isinstance(discussion.get("rounds"), list) else []
+        disagreements = (
+            discussion.get("disagreements")
+            if isinstance(discussion.get("disagreements"), list)
+            else []
+        )
+        if not summary and not rounds and not disagreements:
+            return
+
+        lines.extend([
+            "### 🤖 多 Agent 讨论",
+            "",
+        ])
+        if summary:
+            lines.append(f"**讨论摘要**: {summary}")
+            lines.append("")
+
+        if disagreements:
+            lines.append("**分歧焦点**:")
+            for item in disagreements[: (2 if compact else 4)]:
+                text = str(item or "").strip()
+                if text:
+                    lines.append(f"- {text[:80 if compact else 160]}")
+            lines.append("")
+
+        if rounds:
+            lines.append("**阶段观点**:")
+            for item in rounds[: (2 if compact else 5)]:
+                if not isinstance(item, dict):
+                    continue
+                agent_label = str(item.get("agent_label") or item.get("agent_name") or "Agent")
+                signal_label = str(item.get("signal_label") or item.get("signal") or "中性观望")
+                confidence = str(item.get("confidence_pct") or "").strip()
+                reasoning = str(item.get("reasoning") or "").strip()
+                line = f"- {agent_label}: {signal_label}"
+                if confidence:
+                    line += f" ({confidence})"
+                if reasoning:
+                    line += f" | {reasoning[:50 if compact else 120]}"
+                lines.append(line)
+            lines.append("")
 
     def _should_use_image_for_channel(
         self, channel: NotificationChannel, image_bytes: Optional[bytes]

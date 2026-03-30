@@ -14,6 +14,7 @@
 {% set core = dashboard.get('core_conclusion') or {} %}
 {% set battle = dashboard.get('battle_plan') or {} %}
 {% set intel = dashboard.get('intelligence') or {} %}
+{% set discussion = dashboard.get('agent_discussion') or {} %}
 
 ### {{ e.signal_emoji }} **{{ e.signal_text }}** | {{ e.stock_name }}({{ result.code }})
 
@@ -40,6 +41,15 @@
 ✨ **利好**:
 {% for cat in intel.positive_catalysts[:2] %}
    • {{ cat[:50] }}{{ '...' if cat|length > 50 else '' }}
+{% endfor %}
+{% endif %}
+
+{% if discussion.get('summary') %}
+🤖 讨论: {{ discussion.summary[:80] }}{{ '...' if discussion.summary|length > 80 else '' }}
+{% endif %}
+{% if discussion.get('rounds') %}
+{% for item in discussion.rounds[:2] %}
+   - {{ item.agent_label or item.agent_name }}: {{ item.signal_label or item.signal }}{% if item.confidence_pct %} ({{ item.confidence_pct }}){% endif %}
 {% endfor %}
 {% endif %}
 

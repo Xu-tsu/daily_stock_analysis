@@ -221,6 +221,48 @@ class TestNotificationServiceReportGeneration(unittest.TestCase):
         self.assertIn("600519", out)
 
     @mock.patch("src.notification.get_config")
+    def test_generate_dashboard_report_includes_agent_discussion(self, mock_get_config: mock.MagicMock):
+        mock_get_config.return_value = _make_config(report_renderer_enabled=False)
+        service = NotificationService()
+        result = AnalysisResult(
+            code="600519",
+            name="璐靛窞鑼呭彴",
+            sentiment_score=72,
+            trend_prediction="鐪嬪",
+            operation_advice="鎸佹湁",
+            analysis_summary="绋冲仴",
+            dashboard={
+                "core_conclusion": {"one_sentence": "鍏堢瓑纭"},
+                "intelligence": {"risk_alerts": []},
+                "battle_plan": {"sniper_points": {"stop_loss": "1760"}},
+                "agent_discussion": {
+                    "summary": "Technical Agent 偏多，但 Risk Agent 明显偏空，Decision Agent 暂时收敛为观望。",
+                    "disagreements": ["Risk Agent 触发买入否决。"],
+                    "rounds": [
+                        {
+                            "agent_label": "Technical Agent",
+                            "signal_label": "偏多",
+                            "confidence_pct": "82%",
+                            "reasoning": "Trend breakout",
+                        },
+                        {
+                            "agent_label": "Risk Agent",
+                            "signal_label": "偏空",
+                            "confidence_pct": "74%",
+                            "reasoning": "Quant selling pressure",
+                        },
+                    ],
+                },
+            },
+        )
+
+        out = service.generate_dashboard_report([result])
+
+        self.assertIn("多 Agent 讨论", out)
+        self.assertIn("Technical Agent", out)
+        self.assertIn("Risk Agent 触发买入否决", out)
+
+    @mock.patch("src.notification.get_config")
     def test_history_compare_context_uses_cache(self, mock_get_config: mock.MagicMock):
         mock_get_config.return_value = _make_config(report_history_compare_n=3)
         service = NotificationService()

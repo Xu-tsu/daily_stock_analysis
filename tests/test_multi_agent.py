@@ -839,6 +839,85 @@ class TestOrchestratorExecution(unittest.TestCase):
         strategy.run.assert_called_once()
 
 
+class TestOrchestratorDiscussion(unittest.TestCase):
+    """Discussion trace helpers for orchestrator."""
+
+    @staticmethod
+    def _make_orchestrator():
+        from src.agent.orchestrator import AgentOrchestrator
+        return AgentOrchestrator(
+            tool_registry=MagicMock(),
+            llm_adapter=MagicMock(),
+        )
+
+    def test_normalize_dashboard_attaches_agent_discussion(self):
+        orch = self._make_orchestrator()
+        ctx = AgentContext(query="test", stock_code="600519", stock_name="Maotai")
+        ctx.add_opinion(AgentOpinion(
+            agent_name="technical",
+            signal="buy",
+            confidence=0.82,
+            reasoning="Trend breakout with strong volume",
+            key_levels={"support": 1780, "resistance": 1860},
+        ))
+        ctx.add_opinion(AgentOpinion(
+            agent_name="risk",
+            signal="sell",
+            confidence=0.74,
+            reasoning="Quant selling pressure is rising",
+            raw_data={"veto_buy": True, "signal_adjustment": "veto"},
+        ))
+        ctx.add_opinion(AgentOpinion(
+            agent_name="decision",
+            signal="hold",
+            confidence=0.68,
+            reasoning="Wait for the open to confirm direction",
+        ))
+
+        payload = orch._normalize_dashboard_payload(
+            {
+                "decision_type": "hold",
+                "analysis_summary": "Wait for confirmation",
+                "dashboard": {
+                    "core_conclusion": {"one_sentence": "Wait first"},
+                    "intelligence": {"risk_alerts": []},
+                    "battle_plan": {"sniper_points": {"stop_loss": "1760"}},
+                },
+            },
+            ctx,
+        )
+
+        discussion = payload["dashboard"].get("agent_discussion", {})
+        self.assertEqual(discussion["agent_count"], 3)
+        self.assertTrue(discussion["has_disagreement"])
+        self.assertEqual(discussion["rounds"][0]["agent_label"], "Technical Agent")
+        self.assertIn("Decision Agent", discussion["summary"])
+
+    def test_log_discussion_summary_emits_summary_and_divergence(self):
+        orch = self._make_orchestrator()
+        ctx = AgentContext(query="test", stock_code="600519")
+        ctx.add_opinion(AgentOpinion(
+            agent_name="technical",
+            signal="buy",
+            confidence=0.8,
+            reasoning="Technical breakout",
+        ))
+        ctx.add_opinion(AgentOpinion(
+            agent_name="risk",
+            signal="sell",
+            confidence=0.7,
+            reasoning="Risk is elevated",
+            raw_data={"veto_buy": True},
+        ))
+
+        with patch("src.agent.orchestrator.logger.info") as mock_info:
+            orch._log_discussion_summary(ctx)
+
+        logged = " ".join(str(call.args) for call in mock_info.call_args_list)
+        self.assertIn("summary=", logged)
+        self.assertIn("divergence=", logged)
+
+
 class TestDecisionAgentChatMode(unittest.TestCase):
     """Test DecisionAgent chat-mode output path."""
 
