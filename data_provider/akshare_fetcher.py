@@ -62,6 +62,17 @@ SINA_REALTIME_ENDPOINT = "hq.sinajs.cn/list"
 TENCENT_REALTIME_ENDPOINT = "qt.gtimg.cn/q"
 
 
+def _should_use_sina_history_fallback() -> bool:
+    """
+    Return whether Sina history fallback should be enabled.
+
+    Windows 上 `ak.stock_zh_a_daily()` 偶发直接触发 py_mini_racer / V8 致命
+    崩溃，进程无法捕获异常后继续切换到腾讯历史接口，因此这里对 Windows
+    默认跳过新浪历史兜底，保留更稳的东方财富 -> 腾讯回退链。
+    """
+    return os.name != "nt"
+
+
 # User-Agent 池，用于随机轮换
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -437,6 +448,11 @@ class AkshareFetcher(BaseFetcher):
         获取普通 A 股历史数据 (新浪财经)
         数据来源：ak.stock_zh_a_daily()
         """
+        if not _should_use_sina_history_fallback():
+            raise DataFetchError(
+                "Akshare Sina history fallback is disabled on Windows to avoid py_mini_racer fatal crashes"
+            )
+
         import akshare as ak
 
         # 转换代码格式：sh600000, sz000001, bj920748

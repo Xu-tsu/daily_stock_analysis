@@ -261,7 +261,7 @@ python main.py --monitor --interval 5
 > Docker 部署、定时任务配置请参考 [完整指南](docs/full-guide.md)
 > 桌面客户端打包请参考 [桌面端打包说明](docs/desktop-package.md)
 
-启用 `--schedule` / `SCHEDULE_ENABLED=true` 后，程序除了在 `SCHEDULE_TIME` 执行原有日终分析，还会在 A 股交易日固定增加两个轻量盘中节点：
+启用 `--schedule` / `SCHEDULE_ENABLED=true` 后，程序除了在 `SCHEDULE_TIME` 执行原有日终分析，还会在 A 股交易日固定增加两个轻量盘中节点。`SCHEDULE_TIME`、`10:15`、`12:30` 都按 A 股北京时间解释；如果程序跑在日本/海外主机上，会自动换算成本机时间再注册任务，所以不会再出现“10:15 节点实际在 09:15 触发”的错位：
 
 - `10:15`：早盘复判，检查指数强弱、热点资金、持仓风险与盘中调仓动作
 - `12:30`：午后方向判断，用于辅助判断下午盘偏强 / 震荡 / 偏弱，并给出强势回踩加仓 / 板块回流型补仓 / 龙头错杀型补仓 / 弱转强切换 / 防守锁利建议
@@ -269,6 +269,8 @@ python main.py --monitor --interval 5
 盘中调仓建议会明确区分策略标签：`强势回踩加仓` 优先用于主线热点中的盈利回踩仓位；`板块回流型补仓` 用于板块资金重新回流、个股跟随性深跌的保守试探；`龙头错杀型补仓` 用于指数和主线仍强、但高辨识度个股被异常压低时的小额试探补仓；`弱转强切换` 表示主动把利润从落后板块切到更强主线；`防守锁利` 表示在震荡或偏弱环境里先把利润收回，保留机动仓位。
 
 其中集合竞价本身仍然是 `09:15-09:25`，如果需要盘前竞价监控，继续使用 `python main.py --monitor --interval 5`。
+
+如果本地 `SearXNG` 实例临时不可用，宏观快讯链路会自动进入短时冷却，避免在一次盘中判断里连续刷出多条连接失败 warning；冷却结束后会自动恢复探测。
 
 ## 📱 推送效果
 
@@ -311,6 +313,8 @@ python main.py --monitor --interval 5
 - 调仓建议报告会展开显示 `Agent1 大盘研判 / Agent2 板块轮动 / Agent3 持仓扫描 / Agent4a 激进派提案 / Agent4b 保守派质疑 / Agent4c 云端仲裁` 的阶段观点、所用模型、关键信号和分歧焦点。
 - 运行日志里会新增 `[Discussion]` 相关条目，方便盘中回看“为什么从提案收敛到最终调仓结论”。
 - 旧版 `GEMINI_API_KEY` / `OPENAI_API_KEY` 兼容路径下，即使自动探测到本地 Ollama 兜底模型，也不会再把 legacy placeholder 模型名错误地直接交给 LiteLLM Router，飞书/聊天命令可继续正常初始化。
+- Azure / OpenAI 兼容部署里如果使用带日期后缀的版本化模型名（如 `azure/gpt-5.4-nano-2026-03-17`），运行时会自动注册为 LiteLLM 可识别别名，减少反复出现的 “model isn't mapped yet / provider not provided” 调试噪音。
+- Windows 上 A 股历史数据的 AkShare 兜底链路会对新浪历史接口做保护性短路，避免 `py_mini_racer` 触发进程级崩溃；东方财富失败后仍会继续回退到腾讯历史接口。
 生成时间: 18:00
 ```
 
@@ -383,6 +387,7 @@ python main.py --monitor --interval 5
 - **分阶段模型路由**：当 `.env` 中已配置 `REBALANCE_LOCAL_MODEL` / `REBALANCE_DEBATE_MODEL` / `REBALANCE_CLOUD_MODEL` 时，主分析 Multi-Agent 也会自动继承这套分工：Technical / Intel / Strategy 优先走本地模型，Risk 优先走本地辩论模型，Decision 优先走云端仲裁模型；`LITELLM_MODEL` 退回通用默认 / 兜底角色。
 - **市场总览约束**：多 Agent 模式现在会把市场总览直接注入到各阶段，包括特朗普/关税等突发、`09:15-09:25` 集合竞价方向、热门题材滚动资金、游资试板强弱、量化砸盘压力、当前持仓与板块强确认。
 - **自适应风控**：`-5%` 现在默认视为“风险复核线”而不是机械清仓线；只有在市场偏弱、板块不确认、宏观突发或量化压力偏高时才优先清仓。若市场偏强且主线资金、板块确认和仓位结构都支持，系统才会建议减仓后保留底仓做T。
+- **逆向执行偏好**：调仓和盘中建议会更偏向“买在分歧、卖在高潮”。同等条件下，系统会优先挑选大盘回落时仍有主线资金确认、处于轻微回调/平盘承接的标的低吸；当个股红盘冲高、题材一致加速、情绪明显升温时，则优先分批兑现，不鼓励在人声鼎沸时继续追涨。
 
 > **注意**：配置了任意 AI API Key 后，Agent 对话功能自动可用，无需手动设置 `AGENT_MODE=true`。如需显式关闭可设置 `AGENT_MODE=false`。每次对话会产生 LLM API 调用费用。若你手动修改了 `.env` 中的模型主备配置（如 `LITELLM_MODEL` / `LITELLM_FALLBACK_MODELS` / `LLM_CHANNELS`），需要重启服务或触发配置重载后，新进程才会按新模型生效。
 

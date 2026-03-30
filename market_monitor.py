@@ -1211,6 +1211,32 @@ def build_intraday_portfolio_advice(
             and position_pct <= 10.0
             and not alert
         )
+        crowded_take_profit_ready = (
+            sellable > 0
+            and pnl_pct >= 3.0
+            and change_pct >= 2.6
+            and (
+                in_hot_sector
+                or sector_change_pct >= 2.0
+                or sector_main_net >= 4000
+                or market_strength >= 0.6
+            )
+        )
+        contrarian_dip_probe_ready = (
+            bias in ("negative", "neutral")
+            and market_strength >= -0.2
+            and high_risk_count == 0
+            and actual_ratio < lower
+            and cash > 0
+            and cash_ratio >= 0.18
+            and in_hot_sector
+            and sector_change_pct >= 1.0
+            and sector_main_net >= 3500
+            and -3.2 <= change_pct <= -0.8
+            and pnl_pct >= -1.5
+            and position_pct < (MAX_SINGLE_POSITION_PCT - 4.0)
+            and not alert
+        )
 
         action = "hold"
         ratio = "维持"
@@ -1236,6 +1262,54 @@ def build_intraday_portfolio_advice(
                 strategy = "risk_reduce"
                 strategy_label = "风险减仓"
             reason = alert.message
+        elif crowded_take_profit_ready:
+            if pnl_pct >= TAKE_PROFIT_FULL_PCT or change_pct >= 4.5:
+                action = "sell"
+                ratio = "姝㈢泩娓呬粨"
+            else:
+                action = "reduce"
+                ratio = "鍑忎粨30%-50%"
+            if sector_is_lagging and has_rotation_pool:
+                strategy = "weak_to_strong_rotation"
+                strategy_label = "寮辫浆寮哄垏鎹?"
+                reason = "涓偂绾㈢洏鍐查珮涓斿綋鍓嶆澘鍧楀凡寮€濮嬭惤鍚庯紝鍙互瓒佷汉澹伴紟娌告椂鍏堝厬鐜帮紝鍐嶅垏鍚戞洿寮轰富绾裤€?"
+            else:
+                strategy = "crowded_strength_exit"
+                strategy_label = "楂樻疆鍏戠幇"
+                reason = "涓偂绾㈢洏鍐查珮涓旈鏉愭嫢鎸ゅ害鍋忛珮锛屾洿閫傚悎鍗栧湪浜哄０榧庢哺锛岃€屼笉鏄户缁拷鐫€鎯呯华璺戙€?"
+        elif contrarian_dip_probe_ready:
+            buy_amount = min(
+                cash * 0.25,
+                get_position_sizing(
+                    total_asset=max(total_asset, cash),
+                    current_positions=len(holdings),
+                    signal_strength="medium",
+                ),
+            )
+            permission = check_buy_permission(
+                code=code,
+                name=name,
+                holdings=holdings,
+                total_asset=max(total_asset, cash),
+                buy_amount=buy_amount,
+                current_change_pct=change_pct,
+            )
+            if permission["allowed"] and buy_amount >= 500:
+                action = "buy"
+                ratio = f"浣庡惛绾?{int(buy_amount)}鍏?"
+                strategy = "contrarian_dip_probe"
+                strategy_label = "鍒嗘浣庡惛"
+                reason = "澶х洏鍥炶惤浣嗕富绾挎澘鍧楄祫閲戜粛鍦紝涓偂鏄洖韪╄€屼笉鏄蛋鍧忥紝鍙互瓒佹棤浜洪棶娲ユ椂鍏堝仛灏忛浣庡惛銆?"
+                if permission["warnings"]:
+                    reason = f"{reason} 椋庨櫓鎻愮ず: {permission['warnings'][0]}"
+            elif permission["reasons"]:
+                strategy = "wait_for_base"
+                strategy_label = "绛夊緟鏇村ソ涔扮偣"
+                reason = permission["reasons"][0]
+            elif permission["warnings"]:
+                strategy = "wait_for_base"
+                strategy_label = "绛夊緟鏇村ソ涔扮偣"
+                reason = permission["warnings"][0]
         elif bias == "negative":
             if pnl_pct >= TAKE_PROFIT_HALF_PCT and sellable > 0:
                 action = "reduce"

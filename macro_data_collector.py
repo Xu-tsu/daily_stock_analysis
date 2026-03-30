@@ -567,6 +567,7 @@ def _searxng_search(query: str, max_results: int = 10) -> list:
             return results
         _mark_searxng_unavailable(f"HTTP {r.status_code} @ {SEARXNG_URL}")
     except Exception as e:
+        _mark_searxng_unavailable(f"{type(e).__name__}: {e}")
         logger.warning(f"SearXNG 搜索失败: {e}")
     return []
 

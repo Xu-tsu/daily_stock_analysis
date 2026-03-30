@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Runtime
+
+- LiteLLM 运行时现在会自动为 `azure/gpt-5.4-nano-2026-03-17` 这类带日期后缀的版本化模型名注册 alias，并压低 `litellm` / `LiteLLM` 默认 debug 噪音，避免能力探测、成本估算阶段反复刷出 “model isn't mapped yet / provider not provided” 的日志。
+- Windows 上 A 股历史数据的 AkShare 新浪兜底分支现在会先做保护性短路，再继续回退到腾讯历史接口，避免 `ak.stock_zh_a_daily()` 触发 `py_mini_racer` / V8 fatal crash 把整个 Python 进程直接打掉。
+- 调仓与盘中建议新增“买在分歧、卖在高潮”的逆向执行偏好：弱市但主线未坏时允许小仓低吸，红盘冲高且题材拥挤时优先兑现；换股候选也会更偏向轻微回调/平盘承接的标的，而不是当天最热最挤的票。
+
 ### Changed
 
 - `rebalance_engine.py` 调仓辩论链路新增结构化 `agent_discussion` 输出：调仓建议报告和运行日志都会展开显示大盘研判、板块轮动、持仓扫描、激进派提案、保守派质疑与云端仲裁的阶段观点、所用模型和分歧焦点，不再只保留单行 `debate_summary`。
@@ -17,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `src/scheduler.py` 现在会把 `SCHEDULE_TIME`、`10:15`、`12:30` 这些 A 股固定时点先按北京时间解释，再换算成本机时区注册到 `schedule`；海外主机运行时，不会再出现“10:15 盘中节点实际在 09:15 触发、报告时间和执行时间对不上”的问题。
+- `macro_data_collector.py` 的 SearXNG 宏观快讯链路新增短时冷却：本地实例连接失败后会暂时跳过后续查询，避免同一轮盘中分析里连续刷出多条 `127.0.0.1:8888` 连接拒绝 warning，冷却结束后自动恢复探测。
 - 修复 `src/agent/llm_adapter.py` 在 legacy `GEMINI_API_KEY` / `OPENAI_API_KEY` 配置并自动探测到本地 Ollama 兜底模型时，误把包含 `__legacy_gemini__` 的 `llm_model_list` 当作 channel/YAML Router 配置加载，导致飞书/聊天命令初始化阶段抛出 `LLM Provider NOT provided` 的问题；同时补齐 legacy 路径下 `ollama/...` 直连所需的 `api_base` / `api_key` 参数。
 
 - 持仓天数相关判断现统一改为按 A 股交易日计算：`risk_control.py`、`rebalance_engine.py`、`trade_journal.py`、`pdf_parser.py` 中的 `hold_days` 不再按自然日累计，周末和休市日不会再把短线持仓误判为超期。

@@ -469,6 +469,99 @@ class TestOpeningAuctionMonitor(unittest.TestCase):
         self.assertEqual(action_by_code["600519"]["strategy"], "defensive_lock_profit")
         self.assertIn("先把利润锁住", action_by_code["600519"]["reason"])
 
+    def test_build_intraday_portfolio_advice_prefers_crowded_take_profit(self) -> None:
+        summary = {
+            "bias": "positive",
+            "bias_label": "鍗堝悗鍋忓己",
+            "avg_change_pct": 1.08,
+            "high_risk_count": 0,
+        }
+        portfolio = {
+            "cash": 12000,
+            "total_asset": 50000,
+            "actual_position_ratio": 0.58,
+            "holdings": [
+                {
+                    "code": "300750",
+                    "name": "瀹佸痉鏃朵唬",
+                    "sector": "鏈哄櫒浜?",
+                    "shares": 100,
+                    "sellable_shares": 100,
+                    "cost_price": 100.0,
+                    "current_price": 103.5,
+                    "market_value": 10350.0,
+                    "pnl_pct": 3.5,
+                }
+            ],
+        }
+        holding_quotes = {
+            "300750": {"change_pct": 3.4},
+        }
+        sectors = [
+            {"name": "鏈哄櫒浜?", "change_pct": 2.6, "main_net": 8800},
+            {"name": "绠楀姏", "change_pct": 1.9, "main_net": 6200},
+            {"name": "CPO", "change_pct": 1.2, "main_net": 4100},
+        ]
+
+        advice = build_intraday_portfolio_advice(
+            summary=summary,
+            portfolio=portfolio,
+            holding_quotes=holding_quotes,
+            sectors=sectors,
+            risk_alerts=[],
+            rotation_candidates=[],
+        )
+
+        action = {item["code"]: item for item in advice["actions"]}["300750"]
+        self.assertEqual(action["action"], "reduce")
+        self.assertEqual(action["strategy"], "crowded_strength_exit")
+
+    def test_build_intraday_portfolio_advice_allows_contrarian_dip_probe(self) -> None:
+        summary = {
+            "bias": "negative",
+            "bias_label": "涓婂崍鍋忓急",
+            "avg_change_pct": -0.05,
+            "high_risk_count": 0,
+        }
+        portfolio = {
+            "cash": 46000,
+            "total_asset": 50000,
+            "actual_position_ratio": 0.08,
+            "holdings": [
+                {
+                    "code": "600011",
+                    "name": "鍗庤兘鍥介檯",
+                    "sector": "鐢靛姏",
+                    "shares": 100,
+                    "sellable_shares": 100,
+                    "cost_price": 10.0,
+                    "current_price": 10.1,
+                    "market_value": 1010.0,
+                    "pnl_pct": 1.0,
+                }
+            ],
+        }
+        holding_quotes = {
+            "600011": {"change_pct": -1.6},
+        }
+        sectors = [
+            {"name": "鐢靛姏", "change_pct": 1.5, "main_net": 6200},
+            {"name": "绠楀姏", "change_pct": 0.8, "main_net": 3800},
+            {"name": "CPO", "change_pct": 0.4, "main_net": 2500},
+        ]
+
+        advice = build_intraday_portfolio_advice(
+            summary=summary,
+            portfolio=portfolio,
+            holding_quotes=holding_quotes,
+            sectors=sectors,
+            risk_alerts=[],
+            rotation_candidates=[],
+        )
+
+        action = {item["code"]: item for item in advice["actions"]}["600011"]
+        self.assertEqual(action["action"], "buy")
+        self.assertEqual(action["strategy"], "contrarian_dip_probe")
 
     def test_compose_market_decision_context_merges_macro_flow_and_auction_signals(self) -> None:
         summary = {

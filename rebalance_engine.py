@@ -900,6 +900,8 @@ PROMPT_DEBATE_CRITIQUE = """你是一位严谨保守的A股风控专家，你的
 5. **补仓禁忌**：有没有建议对亏损股加仓？
 6. **换股质量**：推荐的新股是否真的符合低价小盘+缩量回踩+板块资金流入？
 7. **卖点合理性**：目标卖出价和止损价是否合理？止盈太贪或止损太松都不行
+8. **低吸机会**：如果大盘下跌但主线板块资金仍在、个股只是回踩支撑，方案是否错过“买在分歧”的低吸机会？
+9. **高潮兑现**：如果个股红盘冲高、题材一致加速、人气过热，方案是否应该更主动止盈，而不是继续恋战？
 
 请严格按以下 JSON 格式回复：
 {{
@@ -939,6 +941,7 @@ PROMPT_DEBATE_ARBITRATE = """你是最终仲裁者，需要综合激进派交易
 4. 卖出股数不能超过 sellable_shares（T+1约束）
 5. 每只股必须给出 target_sell_price 和 stop_loss_price
 6. 换股只能从热门股列表中选，不能自己编造
+7. 同等条件下，优先“买在分歧、卖在高潮”：指数回落但主线未坏时允许小仓低吸；红盘冲高且人气拥挤时优先兑现
 
 请严格按以下 JSON 格式回复：
 {{
@@ -983,6 +986,11 @@ PROMPT_REBALANCE_FINAL = """你是一位经验丰富的A股短线交易员，擅
 - 买入条件：缩量回踩MA5支撑 + 板块资金持续流入 + 乖离率<2% + 当日涨幅<3%
 - 卖出条件：盈利5-8%止盈 / 亏损5%止损 / 持仓超3天 / 板块转弱
 - 绝对禁止：不买大盘蓝筹白马股，不做价值投资，不补仓亏损股
+
+### 逆向执行偏好：买在分歧，卖在高潮
+- 更高胜率的买点通常出现在大盘回落、盘面转冷、个股回踩支撑、市场“无人问津”时；前提是主线板块资金确认仍在，不能把下跌趋势误当低吸机会
+- 如果个股红盘冲高、题材一致加速、讨论度和跟风情绪明显升温，要优先考虑分批止盈/减仓，做到“卖在人声鼎沸”
+- 同等条件下，优先选择轻微回调或平盘承接的候选，而不是当天最热、最拥挤、最接近涨停的票
 
 ### A股T+1追高禁令（最重要的规则！）
 - 绝对禁止买入当日涨幅超5%的股票
@@ -1287,8 +1295,19 @@ def run_rebalance_analysis(config: Config = None) -> dict:
             except (ValueError, TypeError):
                 chg = 0
         if chg < 5.0:  # 涨幅<5%才推荐（T+1安全）
-            filtered_hot.append(pick)
-    hot_picks = filtered_hot[:10]
+            candidate = dict(pick)
+            candidate["_rebalance_change_pct"] = float(chg or 0)
+            filtered_hot.append(candidate)
+    hot_picks = sorted(
+        filtered_hot,
+        key=lambda item: (
+            0 if -2.5 <= float(item.get("_rebalance_change_pct", 0) or 0) <= 1.5 else 1,
+            abs(float(item.get("_rebalance_change_pct", 0) or 0) + 0.2),
+            -float(item.get("main_net", 0) or 0),
+        ),
+    )[:10]
+    for pick in hot_picks:
+        pick.pop("_rebalance_change_pct", None)
 
     # 构建持仓JSON（三步辩论共用）
     portfolio_holdings = []

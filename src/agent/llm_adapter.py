@@ -8,6 +8,7 @@ interface consumed by the AgentExecutor, via LiteLLM.
 
 import json
 import logging
+import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -18,6 +19,86 @@ from litellm import Router
 from src.config import get_config, get_api_keys_for_model, extra_litellm_params, get_configured_llm_models
 
 logger = logging.getLogger(__name__)
+_VERSIONED_MODEL_ALIAS_RE = re.compile(
+    r"^(?:(?P<provider>[a-z0-9_.-]+)/)?(?P<base>.+)-(?P<release>\d{4}-\d{2}-\d{2})$",
+    re.IGNORECASE,
+)
+_REGISTERED_LITELLM_MODEL_ALIASES: set[str] = set()
+
+
+def _configure_litellm_runtime() -> None:
+    """Reduce LiteLLM debug noise in normal runtime."""
+    if hasattr(litellm, "set_verbose"):
+        litellm.set_verbose = False
+    if hasattr(litellm, "suppress_debug_info"):
+        litellm.suppress_debug_info = True
+
+
+def _copy_model_info(model_info: Any, provider_override: Optional[str] = None) -> Optional[dict]:
+    if not isinstance(model_info, dict):
+        return None
+    copied = dict(model_info)
+    if provider_override:
+        copied["litellm_provider"] = provider_override
+    return copied
+
+
+def _register_versioned_model_alias(model: Optional[str]) -> None:
+    """
+    Register dated model aliases like `azure/gpt-5.4-nano-2026-03-17`.
+
+    LiteLLM already knows the base model (`azure/gpt-5.4-nano`) but not the
+    version-suffixed deployment alias, which causes repeated debug warnings for
+    cost calculation and capability checks.
+    """
+    if not model or model in _REGISTERED_LITELLM_MODEL_ALIASES:
+        return
+
+    match = _VERSIONED_MODEL_ALIAS_RE.match(model.strip())
+    if not match:
+        return
+
+    provider = (match.group("provider") or "").strip()
+    base_model = (match.group("base") or "").strip()
+    if not base_model:
+        return
+
+    registrations: Dict[str, dict] = {}
+    short_alias = model.split("/", 1)[-1] if provider else model
+
+    if provider:
+        try:
+            provider_info = _copy_model_info(
+                litellm.get_model_info(f"{provider}/{base_model}"),
+                provider_override=provider,
+            )
+            if provider_info:
+                registrations[model] = provider_info
+        except Exception:
+            provider_info = None
+    else:
+        provider_info = None
+
+    try:
+        plain_info = _copy_model_info(litellm.get_model_info(base_model))
+    except Exception:
+        plain_info = None
+
+    if plain_info and short_alias not in registrations:
+        registrations[short_alias] = plain_info
+        if model not in registrations:
+            registrations[model] = _copy_model_info(plain_info, provider_override=provider or plain_info.get("litellm_provider"))
+
+    if not registrations:
+        return
+
+    litellm.register_model(registrations)
+    _REGISTERED_LITELLM_MODEL_ALIASES.update(registrations.keys())
+    logger.info(
+        "Agent LLM: registered LiteLLM model alias %s -> %s",
+        model,
+        ", ".join(sorted(registrations.keys())),
+    )
 
 
 # ============================================================
@@ -132,11 +213,19 @@ class LLMToolAdapter:
         """Initialize litellm Router from channels / YAML / legacy keys."""
         config = self._config
         litellm_model = config.litellm_model
+        _configure_litellm_runtime()
         if not litellm_model:
             logger.warning("Agent LLM: LITELLM_MODEL not configured")
             return
 
         self._litellm_available = True
+        configured_models = [litellm_model] + list(config.litellm_fallback_models or [])
+        configured_models.extend(
+            str((entry.get("litellm_params") or {}).get("model", "") or "")
+            for entry in (getattr(config, "llm_model_list", []) or [])
+        )
+        for model_name in configured_models:
+            _register_versioned_model_alias(model_name)
 
         # --- Channel / YAML path ---
         if self._has_channel_config():
@@ -325,6 +414,8 @@ class LLMToolAdapter:
         timeout: Optional[float] = None,
     ) -> LLMResponse:
         """Call a specific litellm model with OpenAI-format messages and tools."""
+        _configure_litellm_runtime()
+        _register_versioned_model_alias(model)
         openai_messages = self._convert_messages(messages)
 
         # Use short model name (without provider prefix) for thinking model lookup
