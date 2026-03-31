@@ -72,9 +72,13 @@ def analyze_stock_node(state: dict) -> dict:
         return {"response": "请指定股票代码：分析 002506"}
 
     try:
-        from market_scanner import analyze_kline, get_stock_name_fast
-
-        name = get_stock_name_fast(code) or code
+        from market_scanner import analyze_kline
+        try:
+            from src.analyzer import get_stock_name_multi_source
+            name = get_stock_name_multi_source(code) or code
+        except Exception:
+            from src.data.stock_mapping import STOCK_NAME_MAP
+            name = STOCK_NAME_MAP.get(code, code)
         logger.info(f"[LangGraph] 分析 {name}({code})...")
         result = analyze_kline(code)
 

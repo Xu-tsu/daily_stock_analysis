@@ -499,34 +499,94 @@ class FeishuStreamClient:
         self._background_thread: Optional[threading.Thread] = None
         self._running = False
 
+    # ── 长耗时意图集合 —— 这些走「立即回复 + 后台执行 + 异步推送」模式 ──
+    _SLOW_INTENTS = {"rebalance", "scan"}
+
     def _create_message_handler(self) -> Callable[[BotMessage], BotResponse]:
-        """创建消息处理函数（LangGraph 对话引擎 / 传统指令拦截）"""
+        """
+        创建消息处理函数（LangGraph 对话引擎 / 传统指令拦截）
+
+        核心逻辑:
+        1. 所有消息先经过 LangGraph 意图分类
+        2. 快速意图（持仓/买卖/分析/做T/对话等）同步执行并返回
+        3. 慢速意图（调仓/扫描）立即返回"处理中…"，后台线程执行完后异步推送结果
+        4. LangGraph 导入失败 → 回退到传统 portfolio_bot + dispatcher
+        """
+        reply_client = self._reply_client  # 闭包捕获用于异步推送
 
         def handle_message(message: BotMessage) -> BotResponse:
             text = (message.content or "").replace("\u3000", " ").strip()
             intercept_enabled = os.getenv(
                 "FEISHU_PORTFOLIO_COMMAND_INTERCEPT", "true"
             ).lower() == "true"
+            langgraph_enabled = os.getenv(
+                "LANGGRAPH_ENABLED", "false"
+            ).lower() == "true"
 
             # ── 优先尝试 LangGraph 对话引擎 ──
-            langgraph_enabled = os.getenv("LANGGRAPH_ENABLED", "false").lower() == "true"
             if langgraph_enabled and intercept_enabled:
                 try:
                     from src.langgraph.graph import invoke_graph
                     from src.langgraph.nodes.entry import classify_intent
-                    intent, _ = classify_intent(text)
-                    # LangGraph 处理所有持仓/交易/分析相关意图
-                    if intent != "chat" or text:
-                        session_id = f"{message.platform}_{message.user_id}"
-                        thread_id = f"{message.platform}_{message.chat_id}_{message.user_id}"
-                        reply = invoke_graph(text, session_id, thread_id)
-                        logger.info(
-                            "[Feishu LangGraph] 意图=%s, 文本=%s",
-                            intent, text[:32]
+
+                    # 先加载持仓（供名称解析用）
+                    portfolio = None
+                    try:
+                        from portfolio_manager import load_portfolio
+                        portfolio = load_portfolio()
+                    except Exception:
+                        pass
+
+                    intent, _ = classify_intent(text, portfolio)
+                    session_id = f"{message.platform}_{message.user_id}"
+                    thread_id = f"{message.platform}_{message.chat_id}_{message.user_id}"
+                    chat_id = message.chat_id
+
+                    logger.info(
+                        "[Feishu LangGraph] 意图=%s, 文本=%s",
+                        intent, text[:40]
+                    )
+
+                    # ── 慢速意图 → 后台执行 + 异步推送 ──
+                    if intent in self._SLOW_INTENTS:
+                        intent_label = {"rebalance": "调仓分析", "scan": "市场扫描"}.get(intent, intent)
+
+                        def _run_slow():
+                            try:
+                                result = invoke_graph(text, session_id, thread_id)
+                                if reply_client and chat_id:
+                                    reply_client.send_to_chat(chat_id, result)
+                                    logger.info("[Feishu LangGraph] 异步推送完成: %s", intent)
+                            except Exception as exc:
+                                logger.error(f"[Feishu LangGraph] 后台执行失败: {exc}", exc_info=True)
+                                if reply_client and chat_id:
+                                    reply_client.send_to_chat(chat_id, f"⚠️ {intent_label}执行失败: {exc}")
+
+                        t = threading.Thread(target=_run_slow, daemon=True, name=f"lg-{intent}")
+                        t.start()
+                        return BotResponse.text_response(
+                            f"⏳ 正在执行{intent_label}，请稍候（约1-3分钟）...",
+                            at_user=False,
                         )
-                        return BotResponse.text_response(reply, at_user=False)
+
+                    # ── 快速意图 → 同步执行（超时保护 60s）──
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                        future = pool.submit(invoke_graph, text, session_id, thread_id)
+                        try:
+                            reply = future.result(timeout=60)
+                            return BotResponse.text_response(reply, at_user=False)
+                        except concurrent.futures.TimeoutError:
+                            logger.warning("[Feishu LangGraph] 快速意图超时(60s): %s", intent)
+                            return BotResponse.text_response(
+                                "⏳ 处理时间较长，正在后台继续，完成后会主动推送结果。",
+                                at_user=False,
+                            )
+
+                except ImportError as e:
+                    logger.warning(f"LangGraph 未安装，回退传统模式: {e}")
                 except Exception as e:
-                    logger.warning(f"LangGraph 处理失败，回退传统模式: {e}")
+                    logger.warning(f"LangGraph 处理失败，回退传统模式: {e}", exc_info=True)
 
             # ── 回退：传统 portfolio_bot 指令拦截 ──
             try:
@@ -539,10 +599,21 @@ class FeishuStreamClient:
             except Exception as e:
                 logger.warning(f"持仓指令处理失败: {e}")
 
-            # ── 其他消息 → 原有 Dispatcher ──
+            # ── 其他消息 → 原有 Dispatcher（也加超时保护）──
             from bot.dispatcher import get_dispatcher
             dispatcher = get_dispatcher()
-            return dispatcher.dispatch(message)
+
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(dispatcher.dispatch, message)
+                try:
+                    return future.result(timeout=90)
+                except concurrent.futures.TimeoutError:
+                    logger.warning("[Feishu] Dispatcher 超时(90s): %s", text[:32])
+                    return BotResponse.text_response(
+                        "⏳ 分析中，完成后会推送结果，请稍候。",
+                        at_user=False,
+                    )
 
         return handle_message
 

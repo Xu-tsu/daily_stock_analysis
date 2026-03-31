@@ -26,6 +26,7 @@ class PortfolioGraphState(TypedDict):
     #   "strategy"        — 策略调整
     #   "analyze"         — 个股分析
     #   "trade_history"   — 战绩/复盘
+    #   "update_portfolio" — 持仓修正（口语更新）
     #   "chat"            — 自由对话
 
     # ── 交易参数（由意图解析器填充）──

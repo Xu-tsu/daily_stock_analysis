@@ -25,6 +25,7 @@ from src.langgraph.nodes.rebalance import (
     rebalance_node, scan_node, analyze_stock_node,
 )
 from src.langgraph.nodes.chat import chat_node, strategy_node
+from src.langgraph.nodes.portfolio_update import update_portfolio_node
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,7 @@ def route_intent(state: dict) -> str:
         "analyze": "analyze",
         "trade_history": "trade_history",
         "strategy": "strategy",
+        "update_portfolio": "update_portfolio",
         "alert": "chat",      # 暂时用chat处理
         "mainline": "chat",   # 暂时用chat处理
         "chat": "chat",
@@ -126,6 +128,7 @@ def build_portfolio_graph() -> StateGraph:
     graph.add_node("scan", scan_node)
     graph.add_node("analyze", analyze_stock_node)
     graph.add_node("strategy", strategy_node)
+    graph.add_node("update_portfolio", update_portfolio_node)
     graph.add_node("chat", chat_node)
 
     # 入口
@@ -153,6 +156,7 @@ def build_portfolio_graph() -> StateGraph:
         "analyze": "analyze",
         "trade_history": "trade_history",
         "strategy": "strategy",
+        "update_portfolio": "update_portfolio",
         "chat": "chat",
         "end": END,
     })
@@ -164,6 +168,7 @@ def build_portfolio_graph() -> StateGraph:
     graph.add_edge("scan", END)
     graph.add_edge("analyze", END)
     graph.add_edge("strategy", END)
+    graph.add_edge("update_portfolio", END)
     graph.add_edge("chat", END)
 
     # 交易流程: risk_check → confirm → (等待) → execute_trade → END
