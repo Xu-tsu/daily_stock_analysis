@@ -500,14 +500,38 @@ class FeishuStreamClient:
         self._running = False
 
     def _create_message_handler(self) -> Callable[[BotMessage], BotResponse]:
-        """创建消息处理函数（含持仓管理指令拦截）"""
+        """创建消息处理函数（LangGraph 对话引擎 / 传统指令拦截）"""
 
         def handle_message(message: BotMessage) -> BotResponse:
-            intercept_enabled = os.getenv("FEISHU_PORTFOLIO_COMMAND_INTERCEPT", "true").lower() == "true"
+            text = (message.content or "").replace("\u3000", " ").strip()
+            intercept_enabled = os.getenv(
+                "FEISHU_PORTFOLIO_COMMAND_INTERCEPT", "true"
+            ).lower() == "true"
+
+            # ── 优先尝试 LangGraph 对话引擎 ──
+            langgraph_enabled = os.getenv("LANGGRAPH_ENABLED", "false").lower() == "true"
+            if langgraph_enabled and intercept_enabled:
+                try:
+                    from src.langgraph.graph import invoke_graph
+                    from src.langgraph.nodes.entry import classify_intent
+                    intent, _ = classify_intent(text)
+                    # LangGraph 处理所有持仓/交易/分析相关意图
+                    if intent != "chat" or text:
+                        session_id = f"{message.platform}_{message.user_id}"
+                        thread_id = f"{message.platform}_{message.chat_id}_{message.user_id}"
+                        reply = invoke_graph(text, session_id, thread_id)
+                        logger.info(
+                            "[Feishu LangGraph] 意图=%s, 文本=%s",
+                            intent, text[:32]
+                        )
+                        return BotResponse.text_response(reply, at_user=False)
+                except Exception as e:
+                    logger.warning(f"LangGraph 处理失败，回退传统模式: {e}")
+
+            # ── 回退：传统 portfolio_bot 指令拦截 ──
             try:
                 if intercept_enabled:
                     from portfolio_bot import is_portfolio_command, handle_portfolio_command
-                    text = (message.content or "").replace("\u3000", " ").strip()
                     if is_portfolio_command(text):
                         reply = handle_portfolio_command(text)
                         logger.info("[Feishu Stream] 持仓指令已拦截: %s", text[:32])
@@ -515,6 +539,7 @@ class FeishuStreamClient:
             except Exception as e:
                 logger.warning(f"持仓指令处理失败: {e}")
 
+            # ── 其他消息 → 原有 Dispatcher ──
             from bot.dispatcher import get_dispatcher
             dispatcher = get_dispatcher()
             return dispatcher.dispatch(message)

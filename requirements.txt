@@ -29,6 +29,10 @@ chromadb>=0.5.0             # 向量数据库（本地知识库）
 numpy>=1.24.0               # 数值计算
 json-repair>=0.55.1         # JSON 修复
 
+# LangGraph 对话引擎（飞书机器人增强）
+langgraph>=0.2.0            # 状态图对话引擎
+langchain-core>=0.3.0       # LangGraph 核心依赖
+
 # AI 分析
 litellm>=1.80.10            # Unified LLM client (Gemini/Anthropic/OpenAI/DeepSeek etc.)
 tiktoken>=0.8.0,<0.12.0    # BPE tokenizer for LLM token counting (pin <0.12 to avoid plugin registration issues, #537)
