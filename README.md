@@ -2,491 +2,233 @@
 
 # 📈 股票智能分析系统
 
-[![GitHub stars](https://img.shields.io/github/stars/ZhuLinsen/daily_stock_analysis?style=social)](https://github.com/ZhuLinsen/daily_stock_analysis/stargazers)
-[![CI](https://github.com/ZhuLinsen/daily_stock_analysis/actions/workflows/ci.yml/badge.svg)](https://github.com/ZhuLinsen/daily_stock_analysis/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![GitHub Actions](https://img.shields.io/badge/GitHub%20Actions-Ready-2088FF?logo=github-actions&logoColor=white)](https://github.com/features/actions)
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white)](https://hub.docker.com/)
 
-> 🤖 基于 AI 大模型的 A股/港股/美股自选股智能分析系统，每日自动分析并推送「决策仪表盘」到企业微信/飞书/Telegram/Discord/邮箱
+> 基于 AI 大模型的 A股/港股/美股自选股智能分析系统，每日自动分析并推送「决策仪表盘」到企业微信/飞书/Telegram/Discord/邮箱
 
-[**功能特性**](#-功能特性) · [**快速开始**](#-快速开始) · [**推送效果**](#-推送效果) · [**完整指南**](docs/full-guide.md) · [**常见问题**](docs/FAQ.md) · [**更新日志**](docs/CHANGELOG.md)
+[**功能特性**](#-功能特性) · [**快速开始**](#-快速开始) · [**多模型辩论**](#-多模型辩论架构) · [**对话式交易**](#-飞书对话式交易bot) · [**推送效果**](#-推送效果)
 
 简体中文 | [English](docs/README_EN.md) | [繁體中文](docs/README_CHT.md) | [日本語](docs/README_JA.md)
 
 </div>
 
-## 💖 赞助商 (Sponsors)
-<div align="center">
-  <a href="https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis" target="_blank">
-    <img src="./sources/serpapi_banner_zh.png" alt="轻松抓取搜索引擎上的实时金融新闻数据 - SerpApi" height="160">
-  </a>
-</div>
-<br>
-
+---
 
 ## ✨ 功能特性
 
 | 模块 | 功能 | 说明 |
 |------|------|------|
 | AI | 决策仪表盘 | 一句话核心结论 + 精确买卖点位 + 操作检查清单 |
-| 分析 | 多维度分析 | 技术面（盘中实时 MA/多头排列）+ 筹码分布 + 舆情情报 + 实时行情 |
-| 市场 | 全球市场 | 支持 A股、港股、美股及美股指数（SPX、DJI、IXIC 等） |
-| 基本面 | 结构化聚合 | 新增 `fundamental_context`（valuation/growth/earnings/institution/capital_flow/dragon_tiger/boards，其中 `boards` 表示板块涨跌榜），主链路 fail-open 降级 |
-| 策略 | 市场策略系统 | 内置 A股「三段式复盘策略」与美股「Regime Strategy」，输出进攻/均衡/防守或 risk-on/neutral/risk-off 计划，并附“仅供参考，不构成投资建议”提示 |
-| 复盘 | 大盘复盘 | 每日市场概览、板块涨跌；支持 cn(A股)/us(美股)/both(两者) 切换 |
-| 监控 | 集合竞价资金监控 | `--monitor` 模式会在 09:15-09:25 跟踪候选股/持仓的竞价成交额与买卖盘强弱，并在开盘前推送强弱摘要 |
-| 智能导入 | 多源导入 | 支持图片、CSV/Excel 文件、剪贴板粘贴；Vision LLM 提取代码+名称；置信度分层确认；名称→代码解析（本地+拼音+AkShare） |
-| 历史记录 | 批量管理 | 支持多选、全选及批量删除历史分析记录，优化管理效率与 UI/UX 体验 |
+| 分析 | 多维度分析 | 技术面（MA/MACD/RSI/多头排列）+ 筹码分布 + 舆情情报 + 实时行情 |
+| 市场 | 全球市场 | A股、港股、美股及指数（SPX、DJI、IXIC 等） |
+| 基本面 | 结构化聚合 | 估值/成长/业绩/机构动向/资金流/板块涨跌，fail-open 降级 |
+| 策略 | 市场策略系统 | 内置 A股「三段式复盘」与美股「Regime Strategy」 |
+| 复盘 | 大盘复盘 | 每日市场概览、板块涨跌、主线题材追踪 |
+| 监控 | 集合竞价监控 | 09:15-09:25 跟踪候选股/持仓的竞价成交额与买卖盘强弱 |
 | 回测 | AI 回测验证 | 自动评估历史分析准确率，方向胜率、止盈止损命中率 |
-| **Agent 问股** | **策略对话** | **多轮策略问答，支持均线金叉/缠论/波浪等 11 种内置策略，Web/Bot/API 全链路** |
-| 推送 | 多渠道通知 | 企业微信、飞书、Telegram、Discord、钉钉、邮件、Pushover |
-| 自动化 | 定时运行 | GitHub Actions 定时执行，无需服务器 |
+| Agent | 策略问股 | 多轮策略问答，11 种内置策略（Web/Bot/API 全链路） |
+| 通知 | 多渠道推送 | 企业微信、飞书、Telegram、Discord、钉钉、邮件 |
+| 自动化 | 定时运行 | GitHub Actions / cron / Docker，无需服务器 |
 
-> 历史报告详情会优先展示 AI 返回的原始「狙击点位」文本，避免区间价、条件说明等复杂内容在历史回看时被压缩成单个数字。
-
-> 盘中主线判断现在会同时参考行业榜和概念榜，并把“龙头加速 / 副龙承接 / 低吸窗口是否已错过”写进换股候选与盘中调仓提示里；如果盘中价格已经明显脱离原低吸区间，报告会明确提示“等待回踩，不追高”，避免继续给过期买点。
-
-> 飞书/钉钉持仓口令现在除了单条 `买入/卖出/清仓`，也支持“批量持仓同步”自然表达，例如 `协鑫集成现在是5.24元13手，赤天化4.3加仓3手，雷科防务13.256 2手`；但带 `明天/计划/准备` 的语句会被识别成未来计划，只提示不改当前持仓，避免把次日计划误落成当下成交。
-
-> Web 管理认证支持运行时开关；如果系统中已保留管理员密码，重新开启认证时必须提供当前密码，避免在认证关闭窗口内直接获取新的管理员会话。
-> 多进程/多 worker 部署时，认证开关仅在当前进程即时生效；需重启或滚动重启全部 worker 以统一状态。
-
-### 技术栈与数据来源
+### 技术栈
 
 | 类型 | 支持 |
 |------|------|
-| AI 模型 | [AIHubMix](https://aihubmix.com/?aff=CfMq)、Gemini、OpenAI 兼容、DeepSeek、通义千问、Claude 等（统一通过 [LiteLLM](https://github.com/BerriAI/litellm) 调用，支持多 Key 负载均衡）|
-| 行情数据 | AkShare、Tushare、Pytdx、Baostock、YFinance |
+| AI 模型 | Gemini、OpenAI 兼容、DeepSeek、通义千问、Claude、Ollama 等（LiteLLM 统一调用，多 Key 负载均衡）|
+| 行情数据 | AkShare、Tushare、Pytdx、Baostock、YFinance（5 源自动 fallback） |
 | 新闻搜索 | Tavily、SerpAPI、Bocha、Brave、MiniMax |
-| 社交舆情 | [Stock Sentiment API](https://api.adanos.org/docs)（Reddit / X / Polymarket，仅美股，可选） |
-
-> 注：美股历史数据与实时行情统一使用 YFinance，确保复权一致性
+| 对话引擎 | LangGraph（18 节点状态图，确认工作流） |
+| 本地推理 | Ollama（Qwen 14B + DeepSeek-R1 14B，RTX 5070 12GB 同时运行） |
 
 ### 内置交易纪律
 
 | 规则 | 说明 |
 |------|------|
-| 严禁追高 | 乖离率超阈值（默认 5%，可配置）自动提示风险；强势趋势股自动放宽 |
+| 严禁追高 | 乖离率 > 5% 自动警告，强势趋势股自动放宽 |
 | 趋势交易 | MA5 > MA10 > MA20 多头排列 |
 | 精确点位 | 买入价、止损价、目标价 |
-| 检查清单 | 每项条件以「满足 / 注意 / 不满足」标记 |
-| 新闻时效 | 可配置新闻最大时效（默认 3 天），避免使用过时信息 |
+| 检查清单 | 每项条件标记「满足 / 注意 / 不满足」 |
+
+---
+
+## 🤖 多模型辩论架构
+
+单一 LLM 易产生偏见（如对某只股票始终建议卖出）。本系统让**多个模型「辩论」后达成共识**：
+
+```
+┌─────────────┐    ┌──────────────┐    ┌─────────────────┐
+│  Qwen 14B   │    │ DeepSeek-R1  │    │  Azure GPT /    │
+│ （激进派提案）│ →  │ （保守派批评）  │ →  │  Gemini（裁定）  │
+│  本地 GPU    │    │  本地 GPU     │    │   云端 API       │
+└─────────────┘    └──────────────┘    └─────────────────┘
+```
+
+| 阶段 | 模型 | 职责 |
+|------|------|------|
+| Agent 1-3 | Qwen 2.5 14B（本地） | 大盘研判、板块轮动、持仓扫描 |
+| Agent 4a | Qwen 2.5 14B | 激进派调仓提案 |
+| Agent 4b | DeepSeek-R1 14B | 保守派质疑（Chain-of-Thought 推理） |
+| Agent 4c | Azure GPT / Gemini（云端） | 综合双方观点做最终裁定 |
+
+**5 级降级链**: 云端限流时自动回退
+
+```
+完全辩论 → 本地合并 → 仅提案 → 规则判断 → 硬规则
+```
+
+**蒸馏管线**: 云端 LLM 的响应自动保存为 JSONL，用于未来微调本地模型（目标 500+ 样本）。
+
+---
+
+## 💬 飞书对话式交易 Bot
+
+基于 LangGraph 状态图（18 节点）的**对话式持仓管理引擎**，支持自然语言交易：
+
+| 功能 | 命令示例 | 说明 |
+|------|---------|------|
+| 查看持仓 | `持仓` | 显示全部持仓、盈亏、持仓天数 |
+| 买入 | `买入 002506 500 5.4` | 代码 + 数量 + 价格 |
+| 用名称买入 | `买入 协鑫集成 500 5.2` | 名称→代码自动解析（拼音/模糊匹配） |
+| 名称查询 | `赤天化呢？` | 用股票名即时触发技术分析 |
+| 修正持仓 | `协鑫集成是5.2 有13手` | 口语修正持仓数量和成本 |
+| 做T | `做T 002506` | T+0 高卖低买工作流 |
+| 调仓 | `调仓` | 触发多模型辩论调仓分析（异步） |
+| 市场扫描 | `扫描` | 全市场技术面筛选 |
+| 战绩 | `战绩` | 历史交易记录和胜率 |
+
+**核心特性**:
+- **确认工作流**: 交易执行前必须用户确认（Human-in-the-loop）
+- **T+1 管理**: A 股当日买入不可卖出，自动分离可卖余额
+- **FIFO 追踪**: 从交易日志自动先进先出计算真实成本和持仓天数
+- **异步执行**: 耗时操作（调仓/扫描）立即返回「处理中」，完成后异步推送结果（防 WebSocket 超时）
+- **批量口令**: `协鑫集成5.24元13手，赤天化4.3加仓3手` 一句话批量更新
+
+---
+
+## 🛡️ 风控体系
+
+| 项目 | 内容 |
+|------|------|
+| 硬止损 | -8% 强制清仓 |
+| 风险复核 | -5% 触发复核（非机械清仓，结合市场/板块/趋势综合判断） |
+| 移动止盈 | 盈利达标后自动抬高止损线 |
+| 仓位上限 | 单只 ≤15%，最多 5 只 |
+| T+1 管理 | 当日买入自动标记为不可卖 |
+| FIFO 追踪 | 从交易日志先进先出匹配真实成本/持仓天数 |
+| 保有日数 | 3天+上升趋势→移动止盈持有；7天+利润<5%→考虑卖出 |
+| 自适应 | 市场偏强+主线确认→保留底仓做T；市场偏弱→优先清仓 |
+
+---
 
 ## 🚀 快速开始
 
-### 方式一：GitHub Actions（推荐）
+### 方式一：GitHub Actions（零成本）
 
-> 5 分钟完成部署，零成本，无需服务器。
+```
+1. Fork 本仓库 → 2. Settings > Secrets 配置 → 3. Actions 启用 → 4. Run workflow
+```
 
+**必要 Secrets:**
 
-#### 1. Fork 本仓库
+| Secret | 说明 |
+|--------|------|
+| `GEMINI_API_KEY` 或 `OPENAI_API_KEY` | AI 模型 Key（至少一个） |
+| `STOCK_LIST` | 自选股代码（如 `600519,AAPL,hk00700`） |
+| 通知渠道 | `TELEGRAM_BOT_TOKEN` / `DISCORD_WEBHOOK_URL` / `FEISHU_WEBHOOK_URL` 等至少一个 |
 
-点击右上角 `Fork` 按钮（顺便点个 Star⭐ 支持一下）
+> 详细配置见 [LLM 配置指南](docs/LLM_CONFIG_GUIDE.md)
 
-#### 2. 配置 Secrets
+默认每个工作日 18:00（北京时间）自动执行，非交易日自动跳过。
 
-`Settings` → `Secrets and variables` → `Actions` → `New repository secret`
-
-**AI 模型配置（至少配置一个）**
-
-> 详细配置说明见 [LLM 配置指南](docs/LLM_CONFIG_GUIDE.md)（三层配置、渠道模式、YAML高级配置、Vision、Agent、排错），GitHub Actions用户也可以实现YAML高级配置。进阶用户可配置 `LITELLM_MODEL`、`LITELLM_FALLBACK_MODELS` 或 `LLM_CHANNELS` 多渠道模式。
-
-> 现在推荐把多模型配置统一写成 `LLM_CHANNELS + LLM_<NAME>_PROTOCOL/BASE_URL/API_KEY/MODELS/ENABLED`。Web 设置页和 `.env` 使用同一套字段，便于相互切换。
-
-> 💡 **推荐 [AIHubMix](https://aihubmix.com/?aff=CfMq)**：一个 Key 即可使用 Gemini、GPT、Claude、DeepSeek 等全球主流模型，无需科学上网，含免费模型（glm-5、gpt-4o-free 等），付费模型高稳定性无限并发。本项目可享 **10% 充值优惠**。
-
-| Secret 名称 | 说明 | 必填 |
-|------------|------|:----:|
-| `AIHUBMIX_KEY` | [AIHubMix](https://aihubmix.com/?aff=CfMq) API Key，一 Key 切换使用全系模型，免费模型可用 | 可选 |
-| `GEMINI_API_KEY` | [Google AI Studio](https://aistudio.google.com/) 获取免费 Key（需科学上网） | 可选 |
-| `ANTHROPIC_API_KEY` | [Anthropic Claude](https://console.anthropic.com/) API Key | 可选 |
-| `ANTHROPIC_MODEL` | Claude 模型（如 `claude-3-5-sonnet-20241022`） | 可选 |
-| `OPENAI_API_KEY` | OpenAI 兼容 API Key（支持 DeepSeek、通义千问等） | 可选 |
-| `OPENAI_BASE_URL` | OpenAI 兼容 API 地址（如 `https://api.deepseek.com/v1`） | 可选 |
-| `OPENAI_MODEL` | 模型名称（如 `gemini-3.1-pro-preview`、`gemini-3-flash-preview`、`gpt-5.2`） | 可选 |
-| `OPENAI_VISION_MODEL` | 图片识别专用模型（部分第三方模型不支持图像；不填则用 `OPENAI_MODEL`） | 可选 |
-
-> 注：AI 优先级 Gemini > Anthropic > OpenAI（含 AIHubmix），至少配置一个。`AIHUBMIX_KEY` 无需配置 `OPENAI_BASE_URL`，系统自动适配。图片识别需 Vision 能力模型。DeepSeek 思考模式（deepseek-reasoner、deepseek-r1、qwq、deepseek-chat）按模型名自动识别，无需额外配置。
-
-<details>
-<summary><b>通知渠道配置</b>（点击展开，至少配置一个）</summary>
-
-
-| Secret 名称 | 说明 | 必填 |
-|------------|------|:----:|
-| `WECHAT_WEBHOOK_URL` | 企业微信 Webhook URL | 可选 |
-| `FEISHU_WEBHOOK_URL` | 飞书 Webhook URL | 可选 |
-| `FEISHU_PORTFOLIO_COMMAND_INTERCEPT` | 飞书 Stream 模式下是否优先拦截持仓类口令（默认 `true`，命中后不走原 dispatcher） | 可选 |
-| `TELEGRAM_BOT_TOKEN` | Telegram Bot Token（@BotFather 获取） | 可选 |
-| `TELEGRAM_CHAT_ID` | Telegram Chat ID | 可选 |
-| `TELEGRAM_MESSAGE_THREAD_ID` | Telegram Topic ID (用于发送到子话题) | 可选 |
-| `DISCORD_WEBHOOK_URL` | Discord Webhook URL | 可选 |
-| `DISCORD_BOT_TOKEN` | Discord Bot Token（与 Webhook 二选一） | 可选 |
-| `DISCORD_MAIN_CHANNEL_ID` | Discord Channel ID（使用 Bot 时需要） | 可选 |
-| `EMAIL_SENDER` | 发件人邮箱（如 `xxx@qq.com`） | 可选 |
-| `EMAIL_PASSWORD` | 邮箱授权码（非登录密码） | 可选 |
-| `EMAIL_RECEIVERS` | 收件人邮箱（多个用逗号分隔，留空则发给自己） | 可选 |
-| `EMAIL_SENDER_NAME` | 邮件发件人显示名称（默认：daily_stock_analysis股票分析助手，支持中文并自动编码邮件头） | 可选 |
-| `STOCK_GROUP_N` / `EMAIL_GROUP_N` | 股票分组发往不同邮箱（如 `STOCK_GROUP_1=600519,300750` `EMAIL_GROUP_1=user1@example.com`） | 可选 |
-| `PUSHPLUS_TOKEN` | PushPlus Token（[获取地址](https://www.pushplus.plus)，国内推送服务） | 可选 |
-| `PUSHPLUS_TOPIC` | PushPlus 群组编码（一对多推送，配置后消息推送给群组所有订阅用户） | 可选 |
-| `SERVERCHAN3_SENDKEY` | Server酱³ Sendkey（[获取地址](https://sc3.ft07.com/)，手机APP推送服务） | 可选 |
-| `CUSTOM_WEBHOOK_URLS` | 自定义 Webhook（支持钉钉等，多个用逗号分隔） | 可选 |
-| `CUSTOM_WEBHOOK_BEARER_TOKEN` | 自定义 Webhook 的 Bearer Token（用于需要认证的 Webhook） | 可选 |
-| `WEBHOOK_VERIFY_SSL` | Webhook HTTPS 证书校验（默认 true）。设为 false 可支持自签名证书。警告：关闭有严重安全风险，仅限可信内网 | 可选 |
-| `SINGLE_STOCK_NOTIFY` | 单股推送模式：设为 `true` 则每分析完一只股票立即推送 | 可选 |
-| `REPORT_TYPE` | 报告类型：`simple`(精简)、`full`(完整)、`brief`(3-5句概括)，Docker环境推荐设为 `full` | 可选 |
-| `REPORT_SUMMARY_ONLY` | 仅分析结果摘要：设为 `true` 时只推送汇总，不含个股详情 | 可选 |
-| `REPORT_TEMPLATES_DIR` | Jinja2 模板目录（相对项目根，默认 `templates`） | 可选 |
-| `REPORT_RENDERER_ENABLED` | 启用 Jinja2 模板渲染（默认 `false`，保证零回归） | 可选 |
-| `REPORT_INTEGRITY_ENABLED` | 启用报告完整性校验，缺失必填字段时重试或占位补全（默认 `true`） | 可选 |
-| `REPORT_INTEGRITY_RETRY` | 完整性校验重试次数（默认 `1`，`0` 表示仅占位不重试） | 可选 |
-| `REPORT_HISTORY_COMPARE_N` | 历史信号对比条数，`0` 关闭（默认），`>0` 启用 | 可选 |
-| `ANALYSIS_DELAY` | 个股分析和大盘分析之间的延迟（秒），避免API限流，如 `10` | 可选 |
-| `MERGE_EMAIL_NOTIFICATION` | 个股与大盘复盘合并推送（默认 false），减少邮件数量 | 可选 |
-| `MARKDOWN_TO_IMAGE_CHANNELS` | 将 Markdown 转为图片发送的渠道（逗号分隔）：`telegram,wechat,custom,email` | 可选 |
-| `MARKDOWN_TO_IMAGE_MAX_CHARS` | 超过此长度不转图片，避免超大图片（默认 `15000`） | 可选 |
-| `MD2IMG_ENGINE` | 转图引擎：`wkhtmltoimage`（默认）或 `markdown-to-file`（emoji 更好） | 可选 |
-
-> 至少配置一个渠道，配置多个则同时推送。图片发送与引擎安装细节请参考 [完整指南](docs/full-guide.md)
-> 飞书 Stream 模式下，`FEISHU_PORTFOLIO_COMMAND_INTERCEPT` 会直接从环境变量读取；未配置时默认开启持仓口令拦截。
-
-> 持仓口令现在会优先用本地模型（默认复用 `REBALANCE_LOCAL_MODEL` / 本地 Ollama）做结构化识别，再回退到规则解析，所以不必再严格按固定格式输入。像 `买入 002506 300股 5.05元`、`协鑫集成 加仓 3手 5.05`、`帮我把协鑫集成再补三手，挂5块05`、`减仓 协鑫集成 1手 5.30`、`持仓查看` 都可以识别。对当前已经在持仓里的股票，还会结合持仓名称、拼音和近似名称做纠错，降低飞书语音转文字把“协鑫集成”写成“写信继承”这类口误时的失败率。A 股数量仍会统一按 `100股=1手` 校验。
-
-> 飞书里现在还支持“交易后反馈回灌”。像 `7.61清仓后立刻被拉升到了7.77`、`5.05低吸后下午拉到5.38` 这类消息会优先走本地模型识别成 `feedback`，并结合最近交易记录自动反推出对应股票，写入 `scanner_history.db` 的 `trade_feedback` 表。后续 `调仓` / 多模型辩论时，会把最近这批真实反馈重新注入 prompt，用来纠正“卖飞、追高、左侧接早、止损后反抽”这类执行偏差。
-
-</details>
-
-**其他配置**
-
-| Secret 名称 | 说明 | 必填 |
-|------------|------|:----:|
-| `STOCK_LIST` | 自选股代码，如 `600519,hk00700,AAPL,TSLA` | ✅ |
-| `TAVILY_API_KEYS` | [Tavily](https://tavily.com/) 搜索 API（新闻搜索） | 推荐 |
-| `MINIMAX_API_KEYS` | [MiniMax](https://platform.minimaxi.com/) Coding Plan Web Search（结构化搜索结果） | 可选 |
-| `SERPAPI_API_KEYS` | [SerpAPI](https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis) 全渠道搜索 | 可选 |
-| `BOCHA_API_KEYS` | [博查搜索](https://open.bocha.cn/) Web Search API（中文搜索优化，支持AI摘要，多个key用逗号分隔） | 可选 |
-| `BRAVE_API_KEYS` | [Brave Search](https://brave.com/search/api/) API（隐私优先，美股优化，多个key用逗号分隔） | 可选 |
-| `SEARXNG_BASE_URLS` | SearXNG 自建实例（无配额兜底，需在 settings.yml 启用 format: json） | 可选 |
-| `SOCIAL_SENTIMENT_API_KEY` | [Stock Sentiment API](https://api.adanos.org/docs)（Reddit/X/Polymarket 社交舆情，仅美股） | 可选 |
-| `SOCIAL_SENTIMENT_API_URL` | 自定义社交舆情 API 地址（默认 `https://api.adanos.org`） | 可选 |
-| `TUSHARE_TOKEN` | [Tushare Pro](https://tushare.pro/weborder/#/login?reg=834638 ) Token | 可选 |
-| `PREFETCH_REALTIME_QUOTES` | 实时行情预取开关：设为 `false` 可禁用全市场预取（默认 `true`） | 可选 |
-| `WECHAT_MSG_TYPE` | 企微消息类型，默认 markdown，支持配置 text 类型，发送纯 markdown 文本 | 可选 |
-| `NEWS_STRATEGY_PROFILE` | 新闻策略窗口档位：`ultra_short`(1天) / `short`(3天) / `medium`(7天) / `long`(30天)，默认 `short` | 可选 |
-| `NEWS_MAX_AGE_DAYS` | 新闻最大时效（天），默认 3，避免使用过时信息 | 可选 |
-| `BIAS_THRESHOLD` | 乖离率阈值（%），默认 5.0，超过提示不追高；强势趋势股自动放宽 | 可选 |
-| `AGENT_MODE` | 开启 Agent 策略问股模式（`true`/`false`，默认 false） | 可选 |
-| `AGENT_SKILLS` | 激活的策略（逗号分隔），`all` 启用全部 11 个；不配置时默认 4 个，详见 `.env.example` | 可选 |
-| `AGENT_MAX_STEPS` | Agent 最大推理步数（默认 10） | 可选 |
-| `AGENT_STRATEGY_DIR` | 自定义策略目录（默认内置 `strategies/`） | 可选 |
-| `TRADING_DAY_CHECK_ENABLED` | 交易日检查（默认 `true`）：非交易日跳过执行；设为 `false` 或使用 `--force-run` 强制执行 | 可选 |
-| `ENABLE_CHIP_DISTRIBUTION` | 启用筹码分布（Actions 默认 false；需筹码数据时在 Variables 中设为 true，接口可能不稳定） | 可选 |
-| `ENABLE_FUNDAMENTAL_PIPELINE` | 基本面聚合总开关；关闭时保持主流程不变 | 可选 |
-| `FUNDAMENTAL_STAGE_TIMEOUT_SECONDS` | 基本面阶段总预算（秒） | 可选 |
-| `FUNDAMENTAL_FETCH_TIMEOUT_SECONDS` | 单能力源调用超时（秒） | 可选 |
-| `FUNDAMENTAL_RETRY_MAX` | 基本面能力重试次数（包含首次） | 可选 |
-| `FUNDAMENTAL_CACHE_TTL_SECONDS` | 基本面缓存 TTL（秒） | 可选 |
-| `FUNDAMENTAL_CACHE_MAX_ENTRIES` | 基本面缓存最大条目数（避免长时间运行内存增长） | 可选 |
-
-> 基本面超时语义（P0）：
-> - 当前采用 `best-effort` 软超时（fail-open），超时会立即降级并继续主流程；
-> - 不承诺严格硬中断第三方调用线程，因此 `P95 <= 1.5s` 是阶段目标而非硬 SLA；
-> - 若业务需要硬 SLA，可在后续阶段升级为“子进程隔离 + kill”的硬超时方案。
-> - 字段契约：
->   - `fundamental_context.boards.data` = `sector_rankings`（板块涨跌榜，结构 `{top, bottom}`）；
->   - `get_stock_info.belong_boards` = 个股所属板块列表；
->   - `get_stock_info.boards` 为兼容别名，值与 `belong_boards` 相同（未来仅在大版本考虑移除）；
->   - `get_stock_info.sector_rankings` 与 `fundamental_context.boards.data` 保持一致。
-> - 板块涨跌榜采用固定回退顺序：`AkShare(EM->Sina) -> Tushare -> efinance`。
-
-#### 3. 启用 Actions
-
-`Actions` 标签 → `I understand my workflows, go ahead and enable them`
-
-#### 4. 手动测试
-
-`Actions` → `每日股票分析` → `Run workflow` → `Run workflow`
-
-#### 完成
-
-默认每个**工作日 18:00（北京时间）**自动执行，也可手动触发。默认非交易日（含 A/H/US 节假日）不执行。
-
-> 💡 **关于跳过交易日检查的两种机制：**
-> | 机制 | 配置方式 | 生效范围 | 适用场景 |
-> |------|----------|----------|----------|
-> | `TRADING_DAY_CHECK_ENABLED=false` | 环境变量/Secrets | 全局、长期有效 | 测试环境、长期关闭检查 |
-> | `force_run` (UI 勾选) | Actions 手动触发时选择 | 单次运行 | 临时在非交易日执行一次 |
->
-> - **环境变量方式**：在 `.env` 或 GitHub Secrets 中设置，影响所有运行方式（定时触发、手动触发、本地运行）
-> - **UI 勾选方式**：仅在 GitHub Actions 手动触发时可见，不影响定时任务，适合临时需求
-
-### 方式二：本地运行 / Docker 部署
+### 方式二：本地运行
 
 ```bash
-# 克隆项目
 git clone https://github.com/ZhuLinsen/daily_stock_analysis.git && cd daily_stock_analysis
-
-# 安装依赖
 pip install -r requirements.txt
-
-# 配置环境变量
 cp .env.example .env && vim .env
-
-# 运行分析
-python main.py
 ```
-
-如果你不用 Web，推荐直接在 `.env` 里按条写渠道：
-
-```env
-LLM_CHANNELS=primary
-LLM_PRIMARY_PROTOCOL=openai
-LLM_PRIMARY_BASE_URL=https://api.deepseek.com/v1
-LLM_PRIMARY_API_KEY=sk-xxxxxxxx
-LLM_PRIMARY_MODELS=deepseek-chat
-LITELLM_MODEL=openai/deepseek-chat
-```
-
-保存后也可以在 Web 设置页继续编辑同一组字段；不会要求额外配置文件。
-
-如果同时启用了 `LITELLM_CONFIG`，YAML 仍然是运行时主模型 / fallback / Vision 的唯一来源；渠道编辑器只保存渠道条目，不会覆盖 YAML 的运行时选择。
-
-需要盘前盯竞价时，可以直接启动监控模式：
 
 ```bash
-python main.py --monitor --interval 5
+python main.py                          # 一次性分析
+python main.py --schedule               # 定时模式（每日自动）
+python main.py --stocks AAPL,TSLA       # 指定股票
+python main.py --monitor --interval 5   # 集合竞价监控
+python main.py --rebalance              # 调仓分析（多模型辩论）
+python main.py --serve                  # Web UI + API
+python main.py --webui                  # Web 界面 + 定时分析
 ```
 
-持仓相关的风控、调仓建议、交易日志与 PDF 导入中的 `hold_days` 现已统一按 A 股交易日计算，周末和休市日不会再被计入持仓天数。
+**股票代码格式**: A股 = 6位数（`600519`）、港股 = `hk` + 5位（`hk00700`）、美股 = 字母（`AAPL`）
 
-调仓建议、盘中做 T 建议和换股候选现在也会统一按 A 股 `100股=1手` 生成建议数量；程序会优先复用你导入交割单里的真实手续费 / 印花税 / 过户费样本估算买卖成本，没有历史样本时再回退到默认费率模型。
+> Docker 部署见 [完整指南](docs/full-guide.md)
 
-该模式会保留原有盘前扫描、盘中异动和收盘调仓流程，并在 `09:15-09:25` 额外跟踪候选股/持仓的集合竞价成交额与盘口差，开盘前推送一条竞价强弱摘要。
-
-> Docker 部署、定时任务配置请参考 [完整指南](docs/full-guide.md)
-> 桌面客户端打包请参考 [桌面端打包说明](docs/desktop-package.md)
-
-启用 `--schedule` / `SCHEDULE_ENABLED=true` 后，程序除了在 `SCHEDULE_TIME` 执行原有日终分析，还会在 A 股交易日固定增加两个轻量盘中节点。`SCHEDULE_TIME`、`10:15`、`12:30` 都按 A 股北京时间解释；如果程序跑在日本/海外主机上，会自动换算成本机时间再注册任务，所以不会再出现“10:15 节点实际在 09:15 触发”的错位：
-
-- `10:15`：早盘复判，检查指数强弱、热点资金、持仓风险与盘中调仓动作
-- `12:30`：午后方向判断，用于辅助判断下午盘偏强 / 震荡 / 偏弱，并给出强势回踩加仓 / 板块回流型补仓 / 龙头错杀型补仓 / 弱转强切换 / 防守锁利建议
-
-盘中调仓建议会明确区分策略标签：`强势回踩加仓` 优先用于主线热点中的盈利回踩仓位；`板块回流型补仓` 用于板块资金重新回流、个股跟随性深跌的保守试探；`龙头错杀型补仓` 用于指数和主线仍强、但高辨识度个股被异常压低时的小额试探补仓；`弱转强切换` 表示主动把利润从落后板块切到更强主线；`防守锁利` 表示在震荡或偏弱环境里先把利润收回，保留机动仓位。
-
-其中集合竞价本身仍然是 `09:15-09:25`，如果需要盘前竞价监控，继续使用 `python main.py --monitor --interval 5`。
-
-如果本地 `SearXNG` 实例临时不可用，宏观快讯链路会自动进入短时冷却，避免在一次盘中判断里连续刷出多条连接失败 warning；冷却结束后会自动恢复探测。
+---
 
 ## 📱 推送效果
 
 ### 决策仪表盘
 ```
-🎯 2026-02-08 决策仪表盘
-共分析3只股票 | 🟢买入:0 🟡观望:2 🔴卖出:1
+🎯 2026-03-31 决策仪表盘
+共分析3只股票 | 🟢买入:1 🟡观望:1 🔴卖出:1
 
-📊 分析结果摘要
-⚪ 中钨高新(000657): 观望 | 评分 65 | 看多
-⚪ 永鼎股份(600105): 观望 | 评分 48 | 震荡
-🟡 新莱应材(300260): 卖出 | 评分 35 | 看空
+🟢 协鑫集成 (002506)
+📌 核心结论: 看多 | 光伏板块轮动+量价配合
 
-⚪ 中钨高新 (000657)
-📰 重要信息速览
-💭 舆情情绪: 市场关注其AI属性与业绩高增长，情绪偏积极，但需消化短期获利盘和主力流出压力。
-📊 业绩预期: 基于舆情信息，公司2025年前三季度业绩同比大幅增长，基本面强劲，为股价提供支撑。
+🎯 狙击点位
+  理想买入: 5.10-5.20
+  止损:     4.85
+  目标价:   5.80
 
-🚨 风险警报:
-
-风险点1：2月5日主力资金大幅净卖出3.63亿元，需警惕短期抛压。
-风险点2：筹码集中度高达35.15%，表明筹码分散，拉升阻力可能较大。
-风险点3：舆情中提及公司历史违规记录及重组相关风险提示，需保持关注。
-✨ 利好催化:
-
-利好1：公司被市场定位为AI服务器HDI核心供应商，受益于AI产业发展。
-利好2：2025年前三季度扣非净利润同比暴涨407.52%，业绩表现强劲。
-📢 最新动态: 【最新消息】舆情显示公司是AI PCB微钻领域龙头，深度绑定全球头部PCB/载板厂。2月5日主力资金净卖出3.63亿元，需关注后续资金流向。
-
-## 🤖 多 Agent 讨论可见性
-
-- 多 Agent 模式现在会在运行日志中输出每个阶段的信号、置信度和简要理由，便于排查“技术面为什么看多、风控为什么转空、最终为何收敛到观望/买入/卖出”。
-- 决策仪表盘、企业微信精简报告和单股报告会新增“多 Agent 讨论”区块，统一展示讨论摘要、分歧焦点和阶段观点，不需要再去翻原始 JSON。
-
----
-
-## 🤖 调仓辩论可见性
-
-- `rebalance_engine.py` 这条调仓链路现在也会输出多模型讨论过程，不再只保留一行 `debate_summary`。
-- 调仓建议报告会展开显示 `Agent1 大盘研判 / Agent2 板块轮动 / Agent3 持仓扫描 / Agent4a 激进派提案 / Agent4b 保守派质疑 / Agent4c 云端仲裁` 的阶段观点、所用模型、关键信号和分歧焦点。
-- 运行日志里会新增 `[Discussion]` 相关条目，方便盘中回看“为什么从提案收敛到最终调仓结论”。
-- 旧版 `GEMINI_API_KEY` / `OPENAI_API_KEY` 兼容路径下，即使自动探测到本地 Ollama 兜底模型，也不会再把 legacy placeholder 模型名错误地直接交给 LiteLLM Router，飞书/聊天命令可继续正常初始化。
-- Azure / OpenAI 兼容部署里如果使用带日期后缀的版本化模型名（如 `azure/gpt-5.4-nano-2026-03-17`），运行时会自动注册为 LiteLLM 可识别别名，减少反复出现的 “model isn't mapped yet / provider not provided” 调试噪音。
-- Windows 上 A 股历史数据的 AkShare 兜底链路会对新浪历史接口做保护性短路，避免 `py_mini_racer` 触发进程级崩溃；东方财富失败后仍会继续回退到腾讯历史接口。
-生成时间: 18:00
+✅ 检查清单
+  ✅ 多头排列确认
+  ✅ 量能配合
+  ⚠️ 注意板块持续性
 ```
 
 ### 大盘复盘
 ```
-🎯 2026-01-10 大盘复盘
-
-📊 主要指数
-- 上证指数: 3250.12 (🟢+0.85%)
-- 深证成指: 10521.36 (🟢+1.02%)
-- 创业板指: 2156.78 (🟢+1.35%)
-
-📈 市场概况
-上涨: 3920 | 下跌: 1349 | 涨停: 155 | 跌停: 3
-
-🔥 板块表现
-领涨: 互联网服务、文化传媒、小金属
-领跌: 保险、航空机场、光伏设备
+🎯 大盘复盘
+📊 上证 3250.12 (+0.85%) | 深证 10521.36 (+1.02%) | 创业板 2156.78 (+1.35%)
+上涨 3920 | 下跌 1349 | 涨停 155
+🔥 领涨: 互联网服务、文化传媒、小金属
 ```
-## ⚙️ 配置说明
 
-> 📖 完整环境变量、定时任务配置请参考 [完整配置指南](docs/full-guide.md)
+### 多模型辩论报告
+```
+🤖 调仓辩论
+Agent4a 激进派: 建议加仓协鑫集成至 1500 股（板块轮动+量价配合）
+Agent4b 保守派: 持仓天数仅 1 天，建议观望确认趋势（RSI 偏高风险）
+Agent4c 裁定:   维持当前仓位，设移动止盈 5.60，跌破 4.85 止损
+```
 
+---
 
 ## 🖥️ Web 界面
 
-![img.png](sources/fastapi_server.png)
+```bash
+python main.py --webui       # Web 界面 + 定时分析
+python main.py --webui-only  # 仅启动 Web 界面
+```
 
-包含完整的配置管理、任务监控和手动分析功能。
-
-**可选密码保护**：在 `.env` 中设置 `ADMIN_AUTH_ENABLED=true` 可启用 Web 登录，首次访问在网页设置初始密码，保护 Settings 中的 API 密钥等敏感配置。系统设置现支持运行时开启或关闭认证；关闭认证不会删除已保存密码，后续可直接重新启用。详见 [完整指南](docs/full-guide.md)。
-
-### 智能导入
-
-在 **设置 → 基础设置** 中找到「智能导入」区块，支持三种方式添加自选股：
-
-1. **图片**：拖拽或选择自选股截图（如 APP 持仓页、行情列表），Vision AI 自动识别代码+名称，并给出置信度
-2. **文件**：上传 CSV 或 Excel (.xlsx)，自动解析代码/名称列
-3. **粘贴**：从 Excel 或表格复制后粘贴，点击「解析」即可
-
-**预览与合并**：高置信度默认勾选，中/低置信度需手动勾选；支持按代码去重、清空、全选；仅合并已勾选且解析成功的项。
-
-**配置与限制**：
-- 图片需配置 Vision API（`GEMINI_API_KEY`、`ANTHROPIC_API_KEY` 或 `OPENAI_API_KEY` 至少一个）
-- 图片：JPG/PNG/WebP/GIF，≤5MB；文件：≤2MB；粘贴文本：≤100KB
-
-**API**：`POST /api/v1/stocks/extract-from-image`（图片）、`POST /api/v1/stocks/parse-import`（文件/粘贴）。详见 [完整指南](docs/full-guide.md)。
-
-**LLM 用量查询**：`GET /api/v1/usage/summary?period=today|month|all`，返回按调用类型和模型分组的 token 消耗汇总（`total_calls`、`total_tokens`、`by_call_type`、`by_model`）。
-
-**分析 API 说明**：`POST /api/v1/analysis/analyze` 在 `async_mode=false` 时仅支持单只股票；批量 `stock_codes` 需要 `async_mode=true`。异步 `202` 响应对单股返回 `task_id`，对批量返回 `accepted` / `duplicates` 汇总结构；空白股票代码会在服务端过滤，若过滤后为空则返回 `400`。未知 `/api` 路径（含 `/api` 本身）返回 JSON `404`，不再回退到前端页面。详见 [API 规范](docs/architecture/api_spec.json)。
-
-### 历史报告详情
-
-在首页历史记录中选择一条分析记录后，点击「详细报告」按钮可在右侧抽屉中查看与推送通知格式一致的完整 Markdown 分析报告，包含舆情情报、核心结论、数据透视、作战计划等完整内容。
-
-### 🤖 Agent 策略问股
-
-在 `.env` 中设置 `AGENT_MODE=true` 后启动服务，访问 `/chat` 页面即可开始多轮策略问答。
-
-- **选择策略**：均线金叉、缠论、波浪理论、多头趋势等 11 种内置策略
-- **自然语言提问**：如「用缠论分析 600519」，Agent 自动调用实时行情、K线、技术指标、新闻等工具
-- **流式进度反馈**：实时展示 AI 思考路径（行情获取 → 技术分析 → 新闻搜索 → 生成结论）
-- **多轮对话**：支持追问上下文，会话历史持久化保存
-- **导出与发送**：可将会话导出为 .md 文件，或发送到已配置的通知渠道
-- **后台执行**：切换页面不中断分析，完成时 Dock 问股图标显示角标
-- **Bot 命令**：`/ask` 策略分析（支持多股对比）、`/chat` 自由对话
-- **自定义策略**：在 `strategies/` 目录下新建 YAML 文件即可添加策略，无需写代码
-- **多 Agent 架构**（实验性）：设置 `AGENT_ARCH=multi` 启用 Technical → Intel → Risk → Strategy → Decision 多 Agent 级联编排，通过 `AGENT_ORCHESTRATOR_MODE` 控制深度（quick/standard/full/strategy）。超时或中间阶段 JSON 解析失败时，系统会优先保留已完成阶段结果并降级生成最小可用仪表盘，避免整份报告直接退回默认占位。详见 [完整配置指南](docs/full-guide.md)
-- **分阶段模型路由**：当 `.env` 中已配置 `REBALANCE_LOCAL_MODEL` / `REBALANCE_DEBATE_MODEL` / `REBALANCE_CLOUD_MODEL` 时，主分析 Multi-Agent 也会自动继承这套分工：Technical / Intel / Strategy 优先走本地模型，Risk 优先走本地辩论模型，Decision 优先走云端仲裁模型；`LITELLM_MODEL` 退回通用默认 / 兜底角色。
-- **市场总览约束**：多 Agent 模式现在会把市场总览直接注入到各阶段，包括特朗普/关税等突发、`09:15-09:25` 集合竞价方向、热门题材滚动资金、游资试板强弱、量化砸盘压力、当前持仓与板块强确认。
-- **自适应风控**：`-5%` 现在默认视为“风险复核线”而不是机械清仓线；只有在市场偏弱、板块不确认、宏观突发或量化压力偏高时才优先清仓。若市场偏强且主线资金、板块确认和仓位结构都支持，系统才会建议减仓后保留底仓做T。
-- **逆向执行偏好**：调仓和盘中建议会更偏向“买在分歧、卖在高潮”。同等条件下，系统会优先挑选大盘回落时仍有主线资金确认、处于轻微回调/平盘承接的标的低吸；当个股红盘冲高、题材一致加速、情绪明显升温时，则优先分批兑现，不鼓励在人声鼎沸时继续追涨。
-
-> **注意**：配置了任意 AI API Key 后，Agent 对话功能自动可用，无需手动设置 `AGENT_MODE=true`。如需显式关闭可设置 `AGENT_MODE=false`。每次对话会产生 LLM API 调用费用。若你手动修改了 `.env` 中的模型主备配置（如 `LITELLM_MODEL` / `LITELLM_FALLBACK_MODELS` / `LLM_CHANNELS`），需要重启服务或触发配置重载后，新进程才会按新模型生效。
-
-### 启动方式
-
-1. **启动服务**（默认会自动编译前端）
-   ```bash
-   python main.py --webui       # 启动 Web 界面 + 执行定时分析
-   python main.py --webui-only  # 仅启动 Web 界面
-   ```
-   启动时会在 `apps/dsa-web` 自动执行 `npm install && npm run build`。
-   如需关闭自动构建，设置 `WEBUI_AUTO_BUILD=false`，并改为手动执行：
-   ```bash
-   cd ./apps/dsa-web
-   npm install && npm run build
-   cd ../..
-   ```
-
-访问 `http://127.0.0.1:8000` 即可使用。
-
-> 在云服务器上部署后，不知道浏览器该输入什么地址？请看 [云服务器 Web 界面访问指南](docs/deploy-webui-cloud.md)。
-
-> 也可以使用 `python main.py --serve` (等效命令)
-
-## 🗺️ Roadmap
-
-查看已支持的功能和未来规划：[更新日志](docs/CHANGELOG.md)
-
-> 有建议？欢迎 [提交 Issue](https://github.com/ZhuLinsen/daily_stock_analysis/issues)
-
+访问 `http://127.0.0.1:8000`，包含：配置管理、分析触发、历史报告、Agent 策略问股、回测验证。
 
 ---
 
-## ☕ 支持项目
+## 📖 文档
 
-如果本项目对你有帮助，欢迎支持项目的持续维护与迭代，感谢支持 🙏  
-赞赏可备注联系方式，祝股市长虹
-
-| 支付宝 (Alipay) | 微信支付 (WeChat) | Ko-fi |
-| :---: | :---: | :---: |
-| <img src="./sources/alipay.jpg" width="200" alt="Alipay"> | <img src="./sources/wechatpay.jpg" width="200" alt="WeChat Pay"> | <a href="https://ko-fi.com/mumu157" target="_blank"><img src="./sources/ko-fi.png" width="200" alt="Ko-fi"></a> |
+- [完整配置指南](docs/full-guide.md) · [FAQ](docs/FAQ.md) · [LLM 配置](docs/LLM_CONFIG_GUIDE.md) · [部署指南](docs/DEPLOY.md)
+- [飞书 Bot 配置](docs/bot/feishu-bot-config.md) · [钉钉 Bot 配置](docs/bot/dingding-bot-config.md) · [Bot 命令一览](docs/bot-command.md)
+- [更新日志](docs/CHANGELOG.md) · [贡献指南](docs/CONTRIBUTING.md)
 
 ---
-
-## 🤝 贡献
-
-欢迎提交 Issue 和 Pull Request！
-
-详见 [贡献指南](docs/CONTRIBUTING.md)
-
-### 本地门禁（建议先跑）
-
-```bash
-pip install -r requirements.txt
-pip install flake8 pytest
-./scripts/ci_gate.sh
-```
-
-如修改前端（`apps/dsa-web`）：
-
-```bash
-cd apps/dsa-web
-npm ci
-npm run lint
-npm run build
-```
 
 ## 📄 License
-[MIT License](LICENSE) © 2026 ZhuLinsen
 
-如果你在项目中使用或基于本项目进行二次开发，
-非常欢迎在 README 或文档中注明来源并附上本仓库链接。
-这将有助于项目的持续维护和社区发展。
-
-## 📬 联系与合作
-- GitHub Issues：[提交 Issue](https://github.com/ZhuLinsen/daily_stock_analysis/issues)
-- 合作邮箱：zhuls345@gmail.com
-
-## ⭐ Star History
-**如果觉得有用，请给个 ⭐ Star 支持一下！**
-
-<a href="https://star-history.com/#ZhuLinsen/daily_stock_analysis&Date">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=ZhuLinsen/daily_stock_analysis&type=Date&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=ZhuLinsen/daily_stock_analysis&type=Date" />
-   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=ZhuLinsen/daily_stock_analysis&type=Date" />
- </picture>
-</a>
+[MIT License](LICENSE)
 
 ## ⚠️ 免责声明
 
 本项目仅供学习和研究使用，不构成任何投资建议。股市有风险，投资需谨慎。作者不对使用本项目产生的任何损失负责。
-
----
