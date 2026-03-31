@@ -15,9 +15,9 @@ Analyze your watchlist daily → generate a decision dashboard → push to multi
 
 **Zero-cost deployment** · Runs on GitHub Actions · No server required
 
-[**Quick Start**](#-quick-start) · [**Key Features**](#-key-features) · [**Sample Output**](#-sample-output) · [**Full Guide**](full-guide_EN.md) · [**FAQ**](FAQ_EN.md) · [**Contributing**](CONTRIBUTING_EN.md) · [**All Docs**](INDEX_EN.md)
+[**Quick Start**](#-quick-start) · [**Key Features**](#-key-features) · [**Sample Output**](#-sample-output) · [**Full Guide**](docs/full-guide_EN.md) · [**FAQ**](docs/FAQ_EN.md) · [**Contributing**](docs/CONTRIBUTING_EN.md) · [**All Docs**](docs/INDEX_EN.md)
 
-English | [简体中文](../README.md) | [繁體中文](README_CHT.md)
+English | [简体中文](README.md) | [繁體中文](README_CHT.md)
 
 </div>
 
@@ -25,7 +25,7 @@ English | [简体中文](../README.md) | [繁體中文](README_CHT.md)
 
 <div align="center">
   <a href="https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis" target="_blank">
-    <img src="../sources/serpapi_banner_en.png" alt="Easily scrape real-time financial news data from search engines - SerpApi" height="160">
+    <img src="sources/serpapi_banner_en.png" alt="Easily scrape real-time financial news data from search engines - SerpApi" height="160">
   </a>
 </div>
 <br>
@@ -76,7 +76,7 @@ Go to your forked repo → `Settings` → `Secrets and variables` → `Actions` 
 
 **AI Model Configuration (Choose one)**
 
-> For detailed configuration, see [LLM Config Guide](LLM_CONFIG_GUIDE_EN.md) (three-tier config, channels, Vision, Agent, troubleshooting).
+> For detailed configuration, see [LLM Config Guide](docs/LLM_CONFIG_GUIDE_EN.md) (three-tier config, channels, Vision, Agent, troubleshooting).
 
 | Secret Name | Description | Required |
 |------------|------|:----:|
@@ -432,18 +432,18 @@ Enable the FastAPI service for configuration management and triggering analysis 
 
 > Note: `POST /api/v1/analysis/analyze` supports only one stock when `async_mode=false`; batch `stock_codes` requires `async_mode=true`. The async `202` response returns a single `task_id` for one stock, or an `accepted` / `duplicates` summary for batch requests.
 
-> For detailed instructions, see [Full Guide - API Service](full-guide_EN.md#fastapi-api-service)
+> For detailed instructions, see [Full Guide - API Service](docs/full-guide_EN.md#fastapi-api-service)
 
 ---
 
 ## 📖 Documentation
 
-- [Complete Configuration Guide](full-guide_EN.md)
-- [FAQ](FAQ_EN.md)
-- [Deployment Guide](DEPLOY_EN.md)
-- [Bot Command Reference](bot-command.md)
-- [Feishu Bot Setup](bot/feishu-bot-config.md)
-- [DingTalk Bot Setup](bot/dingding-bot-config.md)
+- [Complete Configuration Guide](docs/full-guide_EN.md)
+- [FAQ](docs/FAQ_EN.md)
+- [Deployment Guide](docs/DEPLOY_EN.md)
+- [Bot Command Reference](docs/bot-command.md)
+- [Feishu Bot Setup](docs/bot/feishu-bot-config.md)
+- [DingTalk Bot Setup](docs/bot/dingding-bot-config.md)
 
 ---
 
@@ -469,7 +469,7 @@ Contributions are welcome! Please:
 4. Push to the branch (`git push origin feature/AmazingFeature`)
 5. Open a Pull Request
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
+See [CONTRIBUTING.md](docs/CONTRIBUTING.md) for details.
 
 ---
 

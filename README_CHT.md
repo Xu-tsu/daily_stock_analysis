@@ -15,9 +15,9 @@
 
 **零成本部署** · GitHub Actions 免費運行 · 無需伺服器
 
-[**功能特性**](#-功能特性) · [**快速開始**](#-快速開始) · [**推送效果**](#-推送效果) · [**完整指南**](full-guide.md) · [**常見問題**](FAQ.md) · [**更新日誌**](CHANGELOG.md)
+[**功能特性**](#-功能特性) · [**快速開始**](#-快速開始) · [**推送效果**](#-推送效果) · [**完整指南**](docs/full-guide.md) · [**常見問題**](docs/FAQ.md) · [**更新日誌**](docs/CHANGELOG.md)
 
- 繁體中文[English] | (../README_EN.md) | [简体中文](../README.md)
+ 繁體中文[English] | (../README_EN.md) | [简体中文](README.md)
 
 </div>
 
@@ -25,7 +25,7 @@
 
 <div align="center">
   <a href="https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis" target="_blank">
-    <img src="../sources/serpapi_banner_zh.png" alt="輕鬆抓取搜尋引擎上的即時金融新聞數據 - SerpApi" height="160">
+    <img src="sources/serpapi_banner_zh.png" alt="輕鬆抓取搜尋引擎上的即時金融新聞數據 - SerpApi" height="160">
   </a>
 </div>
 <br>
@@ -109,7 +109,7 @@
 | `REPORT_TYPE` | 報告類型：`simple`(精簡) 或 `full`(完整)，Docker環境推薦設為 `full` | 可選 |
 | `ANALYSIS_DELAY` | 個股分析和大盤分析之間的延遲（秒），避免API限流，如 `10` | 可選 |
 
-> 至少配置一個渠道，配置多個則同時推送。更多配置請參考 [完整指南](full-guide.md)
+> 至少配置一個渠道，配置多個則同時推送。更多配置請參考 [完整指南](docs/full-guide.md)
 
 </details>
 
@@ -142,7 +142,7 @@
 
 ### 方式二：本地運行 / Docker 部署
 
-> 📖 本地運行、Docker 部署詳細步驟請參考 [完整配置指南](full-guide.md)
+> 📖 本地運行、Docker 部署詳細步驟請參考 [完整配置指南](docs/full-guide.md)
 
 ## 📱 推送效果
 
@@ -184,7 +184,7 @@
 
 ## 配置說明
 
-> 📖 完整環境變量、定時任務配置請參考 [完整配置指南](full-guide.md)
+> 📖 完整環境變量、定時任務配置請參考 [完整配置指南](docs/full-guide.md)
 
 ## 🧩 FastAPI Web 服務（可選）
 
@@ -261,7 +261,7 @@ daily_stock_analysis/
 - [x] 郵件通知（SMTP）
 - [x] 自定義 Webhook（支持釘釘、Discord、Slack、Bark 等）
 - [x] iOS/Android 推送（Pushover）
-- [x] 釘釘機器人 （已支持命令交互 >> [相關配置](bot/dingding-bot-config.md)）
+- [x] 釘釘機器人 （已支持命令交互 >> [相關配置](docs/bot/dingding-bot-config.md)）
 ### 🤖 AI 模型支持
 - [x] Google Gemini（主力，免費額度）
 - [x] OpenAI 兼容 API（支持 GPT-4/DeepSeek/通義千問/Claude/文心一言 等）
@@ -299,10 +299,10 @@ daily_stock_analysis/
 
 歡迎提交 Issue 和 Pull Request！
 
-詳見 [貢獻指南](CONTRIBUTING.md)
+詳見 [貢獻指南](docs/CONTRIBUTING.md)
 
 ## License
-[MIT License](../LICENSE) © 2026 ZhuLinsen
+[MIT License](LICENSE) © 2026 ZhuLinsen
 
 如果你在項目中使用或基於本项目进行二次开发，
 非常歡迎在 README 或文檔中註明來源並附上本倉庫鏈接。

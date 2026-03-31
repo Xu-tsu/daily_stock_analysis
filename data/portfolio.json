@@ -1,7 +1,7 @@
 {
-  "updated_at": "2026-03-31 14:16:34",
-  "cash": 5882.08,
-  "total_asset": 22536.28,
+  "updated_at": "2026-03-30 18:35:39",
+  "cash": 8533.28,
+  "total_asset": 20582.28,
   "target_position_ratio": 0.7,
   "holdings": [
     {
@@ -20,16 +20,15 @@
     {
       "code": "002506",
       "name": "协鑫集成",
-      "shares": 600,
-      "cost_price": 5.075,
-      "current_price": 5.24,
-      "market_value": 6812.0,
+      "shares": 1300,
+      "cost_price": 5.239,
+      "current_price": 5.075,
+      "market_value": 6597.5,
       "pnl": -17.78,
       "pnl_pct": -0.74,
       "sector": "光伏",
-      "buy_date": "2026-03-30",
-      "strategy_tag": "趋势",
-      "sellable_shares": 600
+      "buy_date": "2026-03-24",
+      "strategy_tag": "趋势"
     },
     {
       "code": "603949",
@@ -43,19 +42,6 @@
       "sector": "消防设备",
       "buy_date": "2026-03-25",
       "strategy_tag": "中线"
-    },
-    {
-      "code": "002413",
-      "name": "雷科防务",
-      "shares": 200,
-      "cost_price": 13.256,
-      "current_price": 13.256,
-      "market_value": 2651.2,
-      "sector": "未分类",
-      "buy_date": "2026-03-30",
-      "strategy_tag": "短线",
-      "sellable_shares": 200
     }
-  ],
-  "actual_position_ratio": 0.739
+  ]
 }

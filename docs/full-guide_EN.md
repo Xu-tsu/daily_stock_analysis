@@ -2,7 +2,7 @@
 
 This document contains the complete configuration guide for the AI Stock Analysis System, intended for users who need advanced features or special deployment methods.
 
-> Quick start guide available in [README_EN.md](README_EN.md). This document covers advanced configuration.
+> Quick start guide available in [README_EN.md](../README_EN.md). This document covers advanced configuration.
 
 ## Project Structure
 

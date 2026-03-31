@@ -11,7 +11,7 @@
 
 [**功能特性**](#-功能特性) · [**快速开始**](#-快速开始) · [**多模型辩论**](#-多模型辩论架构) · [**对话式交易**](#-飞书对话式交易bot) · [**推送效果**](#-推送效果)
 
-简体中文 | [English](docs/README_EN.md) | [繁體中文](docs/README_CHT.md) | [日本語](docs/README_JA.md)
+简体中文 | [English](README_EN.md) | [繁體中文](README_CHT.md) | [日本語](README_JA.md)
 
 </div>
 

@@ -71,7 +71,6 @@ TRADE_FILLER_WORDS = (
     "查看持仓", "持仓查看", "我的持仓", "持仓",
     "查看", "查询", "看看", "显示", "一下",
     "按", "以", "在", "于", "加", "元", "股", "手",
-    "现在", "现在是", "现价", "目前", "仓位", "仓",
 )
 
 LLM_PORTFOLIO_HINT_WORDS = (
@@ -86,9 +85,6 @@ FEEDBACK_CUE_WORDS = (
     "后立刻", "后马上", "后就", "后被", "结果", "反弹", "拉升", "冲到", "回落到",
     "踏空了", "反馈", "复盘",
 )
-
-PLAN_CUE_WORDS = ("明天", "明日", "计划", "打算", "准备", "预备")
-BATCH_SPLIT_RE = re.compile(r"[，,；;\n]+")
 
 
 def _compact_text(text: str) -> str:
@@ -334,133 +330,6 @@ def _parse_clear_target(text: str) -> Tuple[Optional[str], Optional[str]]:
     return code, None
 
 
-def _refresh_portfolio_summary(portfolio: dict) -> dict:
-    holdings = portfolio.get("holdings", []) or []
-    total_mv = 0.0
-    for item in holdings:
-        shares = int(item.get("shares", 0) or 0)
-        current_price = float(item.get("current_price", item.get("cost_price", 0)) or 0)
-        market_value = round(shares * current_price, 2)
-        item["market_value"] = market_value
-        total_mv += market_value
-    total_asset = round(total_mv + float(portfolio.get("cash", 0) or 0), 2)
-    portfolio["total_asset"] = total_asset
-    portfolio["actual_position_ratio"] = round(total_mv / total_asset, 4) if total_asset > 0 else 0.0
-    return portfolio
-
-
-def _split_batch_portfolio_segments(text: str) -> list[str]:
-    segments = []
-    for part in BATCH_SPLIT_RE.split(text or ""):
-        segment = part.strip().strip("。")
-        if segment:
-            segments.append(segment)
-    return segments
-
-
-def _parse_snapshot_segment(text: str) -> Optional[dict]:
-    identifier = _extract_stock_identifier(text)
-    if not identifier:
-        return None
-
-    lot_match = LOT_PATTERN.search(text or "")
-    if not lot_match:
-        return None
-
-    price = _extract_price(text)
-    if price is None or price <= 0:
-        return None
-
-    quantity = int(lot_match.group(1))
-    unit = lot_match.group(2)
-    shares = quantity * 100 if unit == "手" else quantity
-    if shares <= 0:
-        return None
-
-    return {
-        "identifier": identifier,
-        "shares": shares,
-        "price": float(price),
-    }
-
-
-def _build_feedback_command_from_text(text: str) -> Optional[dict]:
-    if not _looks_like_trade_feedback(text):
-        return None
-
-    identifier = _extract_stock_identifier(text) or ""
-    prices = [
-        float(match.group(1))
-        for match in PRICE_PATTERN.finditer(text or "")
-        if match and match.group(1)
-    ]
-    reference_price = prices[0] if prices else None
-    outcome_price = prices[1] if len(prices) > 1 else None
-
-    compact = _compact_text(text)
-    if "清仓" in compact:
-        reference_action = "clear"
-    elif "减仓" in compact or "卖出" in compact:
-        reference_action = "sell"
-    elif "加仓" in compact or "补仓" in compact or "买入" in compact:
-        reference_action = "buy"
-    else:
-        reference_action = "other"
-
-    feedback_tag = "other"
-    if reference_action in {"clear", "sell"} and outcome_price and reference_price and outcome_price > reference_price:
-        feedback_tag = "sold_too_early"
-    elif reference_action in {"buy"} and outcome_price and reference_price and outcome_price > reference_price:
-        feedback_tag = "dip_buy_success"
-    elif reference_action in {"buy"} and outcome_price and reference_price and outcome_price < reference_price:
-        feedback_tag = "bought_too_early"
-
-    return {
-        "is_portfolio_command": True,
-        "action": "feedback",
-        "stock_hint": identifier,
-        "price": reference_price,
-        "outcome_price": outcome_price,
-        "reference_action": reference_action,
-        "feedback_tag": feedback_tag,
-        "summary": text.strip(),
-        "needs_clarification": False,
-        "confidence": 0.72,
-    }
-
-
-def _looks_like_future_trade_plan(text: str) -> bool:
-    compact = _compact_text(text)
-    if not compact:
-        return False
-    if not any(word in compact for word in PLAN_CUE_WORDS):
-        return False
-    if not any(word in compact for word in ("清仓", "卖出", "减仓", "买入", "加仓", "补仓")):
-        return False
-    return _extract_stock_identifier(text) is not None
-
-
-def _looks_like_batch_portfolio_sync(text: str) -> bool:
-    segments = _split_batch_portfolio_segments(text)
-    if len(segments) < 2:
-        return False
-
-    recognized = 0
-    for segment in segments:
-        if _looks_like_trade_feedback(segment):
-            recognized += 1
-            continue
-        if _looks_like_future_trade_plan(segment):
-            recognized += 1
-            continue
-        if _detect_trade_action(segment) is not None:
-            recognized += 1
-            continue
-        if _parse_snapshot_segment(segment):
-            recognized += 1
-    return recognized >= 2
-
-
 def _looks_like_trade_instruction(text: str) -> bool:
     compact = _compact_text(text)
     has_action = any(word in compact for word in ("买入", "加仓", "补仓", "卖出", "减仓"))
@@ -496,10 +365,6 @@ def is_portfolio_command(text: str) -> bool:
         return False
     if _is_show_portfolio_command(text):
         return True
-    if _looks_like_batch_portfolio_sync(text):
-        return True
-    if _looks_like_future_trade_plan(text):
-        return True
     if any(text.startswith(kw) for kw in PORTFOLIO_COMMAND_PREFIXES):
         return True
     if _detect_trade_action(text) is not None:
@@ -529,11 +394,6 @@ def handle_portfolio_command(text: str) -> str:
     text = text.strip()
 
     try:
-        if _looks_like_batch_portfolio_sync(text):
-            return _handle_batch_portfolio_sync(text)
-        if _looks_like_future_trade_plan(text):
-            return _handle_future_trade_plan(text)
-
         llm_command = None
         if _should_try_llm_portfolio_interpretation(text):
             llm_command = _get_llm_portfolio_command(text)
@@ -663,133 +523,6 @@ def _handle_trade_feedback(command: Optional[dict], raw_text: str) -> str:
     )
 
 
-def _handle_future_trade_plan(text: str) -> str:
-    identifier = _extract_stock_identifier(text)
-    if not identifier:
-        return "识别到了明日计划，但没识别出股票名称，请补一句股票名。"
-
-    holdings = _get_holdings_snapshot()
-    code = _resolve_portfolio_holding_code(identifier, holdings) or _resolve_stock_code(identifier)
-    symbol = identifier
-    if code:
-        symbol = f"{_get_stock_name(code)}({code})"
-
-    action = "调仓"
-    compact = _compact_text(text)
-    if "清仓" in compact:
-        action = "清仓"
-    elif "减仓" in compact or "卖出" in compact:
-        action = "减仓"
-    elif "加仓" in compact or "补仓" in compact or "买入" in compact:
-        action = "加仓"
-
-    return (
-        f"📝 已识别为明日计划：{symbol} {action}\n"
-        "  这条消息不会修改当前持仓。\n"
-        "  如果你要立刻落账，请发送不带“明天/计划”的执行指令。"
-    )
-
-
-def _upsert_holding_snapshot(code: str, shares: int, price: float, raw_text: str = "") -> str:
-    if not is_valid_a_share_lot(code, shares):
-        return f"❌ {code} 的同步数量不是整手，已跳过。"
-
-    name = _get_stock_name(code)
-    portfolio = load_portfolio()
-    holdings = portfolio.get("holdings", [])
-    existing = next((h for h in holdings if h.get("code") == code), None)
-
-    if existing:
-        existing["shares"] = shares
-        existing["current_price"] = price
-        existing["market_value"] = round(shares * price, 2)
-        if not float(existing.get("cost_price", 0) or 0):
-            existing["cost_price"] = price
-        action = "同步持仓"
-    else:
-        holdings.append({
-            "code": code,
-            "name": name,
-            "shares": shares,
-            "cost_price": price,
-            "current_price": price,
-            "market_value": round(shares * price, 2),
-            "sector": _guess_sector(raw_text, code),
-            "buy_date": datetime.now().strftime("%Y-%m-%d"),
-            "strategy_tag": "短线",
-            "sellable_shares": shares,
-        })
-        action = "新增持仓"
-
-    portfolio["holdings"] = holdings
-    _refresh_portfolio_summary(portfolio)
-    save_portfolio(portfolio)
-    _clear_portfolio_llm_cache()
-    return f"{action}: {name}({code}) {shares}股 @ {price}元"
-
-
-def _handle_batch_portfolio_sync(text: str) -> str:
-    results = []
-    unhandled = []
-    for segment in _split_batch_portfolio_segments(text):
-        handled = False
-
-        feedback_command = _build_feedback_command_from_text(segment)
-        if feedback_command:
-            results.append(_handle_trade_feedback(feedback_command, segment))
-            handled = True
-        elif _looks_like_future_trade_plan(segment):
-            results.append(_handle_future_trade_plan(segment))
-            handled = True
-        else:
-            action = _detect_trade_action(segment)
-            if action == "buy":
-                results.append(_handle_buy(segment))
-                handled = True
-            elif action == "sell":
-                results.append(_handle_sell(segment))
-                handled = True
-            elif action == "clear":
-                results.append(_handle_clear(segment))
-                handled = True
-            else:
-                snapshot = _parse_snapshot_segment(segment)
-                if snapshot:
-                    holdings = _get_holdings_snapshot()
-                    code = (
-                        _resolve_portfolio_holding_code(snapshot["identifier"], holdings)
-                        or _resolve_stock_code(snapshot["identifier"])
-                    )
-                    if code:
-                        results.append(
-                            _upsert_holding_snapshot(
-                                code=code,
-                                shares=int(snapshot["shares"]),
-                                price=float(snapshot["price"]),
-                                raw_text=segment,
-                            )
-                        )
-                    else:
-                        unhandled.append(f"{segment}（无法识别股票）")
-                    handled = True
-
-        if not handled:
-            unhandled.append(segment)
-
-    if not results and unhandled:
-        return "识别到了持仓同步类消息，但没有解析出可执行项，请拆成更短的几句再发。"
-
-    lines = ["✅ 已处理批量持仓同步"]
-    for item in results:
-        first_line = str(item or "").splitlines()[0]
-        lines.append(f"  - {first_line}")
-    if unhandled:
-        lines.append("⚠️ 未处理片段:")
-        for segment in unhandled[:4]:
-            lines.append(f"  - {segment}")
-    return "\n".join(lines)
-
-
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 买入
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -861,7 +594,6 @@ def _execute_buy_order(code: str, shares: int, price: float, raw_text: str = "")
     # 扣现金
     portfolio["cash"] = round(portfolio.get("cash", 0) - cost, 2)
     portfolio["holdings"] = holdings
-    _refresh_portfolio_summary(portfolio)
     save_portfolio(portfolio)
     _clear_portfolio_llm_cache()
     try:
@@ -948,7 +680,6 @@ def _execute_sell_order(code: str, shares: int, price: float) -> str:
 
     portfolio["cash"] = round(portfolio.get("cash", 0) + income, 2)
     portfolio["holdings"] = holdings
-    _refresh_portfolio_summary(portfolio)
     save_portfolio(portfolio)
     _clear_portfolio_llm_cache()
     try:
@@ -1017,7 +748,6 @@ def _execute_clear_order(code: str) -> str:
     holdings = [h for h in holdings if h["code"] != code]
     portfolio["cash"] = round(portfolio.get("cash", 0) + income, 2)
     portfolio["holdings"] = holdings
-    _refresh_portfolio_summary(portfolio)
     save_portfolio(portfolio)
     _clear_portfolio_llm_cache()
     try:

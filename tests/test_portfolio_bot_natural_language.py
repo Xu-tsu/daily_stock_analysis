@@ -4,7 +4,6 @@
 import os
 import sys
 import unittest
-from copy import deepcopy
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -264,93 +263,7 @@ class TestPortfolioBotNaturalLanguage(unittest.TestCase):
         self.assertIn("卖飞", result)
         mock_record_feedback.assert_called_once()
 
-    @patch("trade_journal.record_buy")
-    @patch("src.services.trade_feedback_service.record_trade_feedback")
-    @patch("portfolio_bot._get_stock_name")
-    @patch("portfolio_bot.resolve_name_to_code")
-    def test_handle_batch_portfolio_sync_updates_holdings_and_feedback(
-        self,
-        mock_resolve_name,
-        mock_get_stock_name,
-        mock_record_feedback,
-        mock_record_buy,
-    ) -> None:
-        state = {
-            "cash": 10000.0,
-            "holdings": [
-                {
-                    "code": "002506",
-                    "name": "协鑫集成",
-                    "shares": 600,
-                    "cost_price": 5.075,
-                    "current_price": 5.075,
-                    "market_value": 3045.0,
-                    "sector": "光伏",
-                    "buy_date": "2026-03-30",
-                    "strategy_tag": "短线",
-                }
-            ],
-        }
-
-        def fake_load():
-            return deepcopy(state)
-
-        def fake_save(portfolio):
-            state.clear()
-            state.update(deepcopy(portfolio))
-
-        name_map = {
-            "002506": "协鑫集成",
-            "600227": "赤天化",
-            "002413": "雷科防务",
-        }
-        code_map = {
-            "赤天化": "600227",
-            "雷科防务": "002413",
-        }
-        mock_get_stock_name.side_effect = lambda code: name_map.get(code, code)
-        mock_resolve_name.side_effect = lambda name: code_map.get(name)
-        mock_record_feedback.return_value = {
-            "saved": True,
-            "name": "华银电力",
-            "code": "600744",
-            "feedback_tag": "sold_too_early",
-            "summary": "7.61清仓后拉升到7.76",
-            "guidance": "下次主线强化时分批止盈。",
-        }
-
-        with patch("portfolio_bot.load_portfolio", side_effect=fake_load), patch(
-            "portfolio_bot.save_portfolio", side_effect=fake_save
-        ):
-            result = handle_portfolio_command(
-                "协鑫集成现在是5.24元13手，华银电力7.61清仓后拉升7.76，赤天化4.3加仓3手，雷科防务13.256 2手"
-            )
-
-        self.assertIn("已处理批量持仓同步", result)
-        holdings_by_code = {item["code"]: item for item in state["holdings"]}
-        self.assertEqual(holdings_by_code["002506"]["shares"], 1300)
-        self.assertEqual(holdings_by_code["002506"]["current_price"], 5.24)
-        self.assertEqual(holdings_by_code["600227"]["shares"], 300)
-        self.assertEqual(holdings_by_code["002413"]["shares"], 200)
-        mock_record_feedback.assert_called_once()
-        mock_record_buy.assert_called_once()
-
-    @patch("portfolio_bot.save_portfolio")
-    def test_future_trade_plan_does_not_change_current_holding(self, mock_save_portfolio) -> None:
-        with patch(
-            "portfolio_bot.load_portfolio",
-            return_value={
-                "cash": 10000.0,
-                "holdings": [
-                    {"code": "600227", "name": "赤天化", "shares": 300, "cost_price": 4.3, "current_price": 4.3}
-                ],
-            },
-        ):
-            result = handle_portfolio_command("明天赤天化清仓")
-
-        self.assertIn("不会修改当前持仓", result)
-        mock_save_portfolio.assert_not_called()
-
 
 if __name__ == "__main__":
     unittest.main()
+

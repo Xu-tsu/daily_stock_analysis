@@ -10,7 +10,7 @@
 
 | Document | Description |
 |----------|-------------|
-| [README (EN)](README_EN.md) | Project overview, quick start, features, sample output |
+| [README (EN)](../README_EN.md) | Project overview, quick start, features, sample output |
 | [Full Guide (EN)](full-guide_EN.md) | Complete setup and usage walkthrough |
 | [Deploy Guide (EN)](DEPLOY_EN.md) | Server deployment (Docker, systemd, Supervisor) |
 | [LLM Config Guide (EN)](LLM_CONFIG_GUIDE_EN.md) | AI model configuration (Gemini, OpenAI-compatible, DeepSeek, Ollama, etc.) |
