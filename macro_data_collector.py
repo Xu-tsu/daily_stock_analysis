@@ -644,7 +644,239 @@ def fetch_stock_news(stock_code: str, stock_name: str = "", limit: int = 5) -> l
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 11. 一键采集
+# 11. 基本面深度数据（研究员用）
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def fetch_fundamental_deep(stock_code: str) -> dict:
+    """获取单只股票的深度基本面数据，供研究员Agent使用。
+    优先链: AkShare基本面 → Tushare估值 → 腾讯行情PE兜底
+    """
+    result = {
+        "pe_current": None, "pb_current": None, "roe_recent": None,
+        "revenue_yoy": None, "net_profit_yoy": None, "gross_margin": None,
+        "industry_pe_avg": None, "earnings_forecast": "",
+        "financial_health": "unknown", "small_cap_caveat": False,
+        "source_chain": [],
+    }
+
+    # 1) AkShare 基本面适配器
+    try:
+        from data_provider.fundamental_adapter import AkshareFundamentalAdapter
+        adapter = AkshareFundamentalAdapter()
+        bundle = adapter.get_fundamental_bundle(stock_code)
+        growth = bundle.get("growth", {})
+        if growth:
+            result["roe_recent"] = growth.get("roe")
+            result["revenue_yoy"] = growth.get("revenue_yoy")
+            result["net_profit_yoy"] = growth.get("net_profit_yoy")
+            result["gross_margin"] = growth.get("gross_margin")
+            result["source_chain"].append("akshare_fundamental")
+
+        earnings = bundle.get("earnings", {})
+        if earnings:
+            result["earnings_forecast"] = earnings.get("summary", "")
+    except Exception as e:
+        logger.warning(f"AkShare基本面 {stock_code} 失败: {e}")
+
+    # 2) Tushare 估值数据
+    api = _get_tushare()
+    if api is not None:
+        try:
+            # 转换为Tushare格式代码
+            ts_code = f"{stock_code}.SH" if stock_code.startswith("6") else f"{stock_code}.SZ"
+            end = datetime.now().strftime("%Y%m%d")
+            start = (datetime.now() - timedelta(days=10)).strftime("%Y%m%d")
+            df = api.daily_basic(ts_code=ts_code, start_date=start, end_date=end,
+                                 fields="ts_code,trade_date,pe_ttm,pb,total_mv,circ_mv")
+            if df is not None and not df.empty:
+                latest = df.iloc[0]
+                result["pe_current"] = float(latest.get("pe_ttm", 0)) if pd.notna(latest.get("pe_ttm")) else None
+                result["pb_current"] = float(latest.get("pb", 0)) if pd.notna(latest.get("pb")) else None
+                total_mv = float(latest.get("total_mv", 0)) if pd.notna(latest.get("total_mv")) else 0
+                result["total_mv_yi"] = round(total_mv / 10000, 2) if total_mv else None  # 万元→亿元
+                result["small_cap_caveat"] = (total_mv > 0 and total_mv / 10000 < 50)
+                result["source_chain"].append("tushare_daily_basic")
+        except Exception as e:
+            logger.warning(f"Tushare估值 {stock_code} 失败: {e}")
+
+    # 3) 财务健康判断
+    roe = result.get("roe_recent")
+    profit_yoy = result.get("net_profit_yoy")
+    pe = result.get("pe_current")
+    if roe is not None and profit_yoy is not None:
+        if roe < 0 or profit_yoy < -30:
+            result["financial_health"] = "danger"
+        elif roe < 5 or profit_yoy < -10:
+            result["financial_health"] = "warning"
+        else:
+            result["financial_health"] = "healthy"
+    elif pe is not None and pe < 0:
+        result["financial_health"] = "danger"
+
+    return result
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 12. 市场情绪指标（分析师用）
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def fetch_sentiment_indicators(margin_data: dict = None,
+                                market_breadth: dict = None) -> dict:
+    """计算市场情绪复合指标。大部分从已采集数据计算，极少新API调用。
+
+    Args:
+        margin_data: 已采集的两融数据 (可选，无则重新采集)
+        market_breadth: 已采集的涨跌家数 (可选，无则重新采集)
+    """
+    result = {
+        "fear_greed_score": 50,
+        "emotional_cycle": "修复",
+        "margin_signal": "中性",
+        "breadth_signal": "中性",
+        "margin_change_5d_pct": 0,
+        "retail_vs_inst_signal": "无明显倾向",
+    }
+
+    # 融资余额趋势
+    if margin_data is None:
+        margin_data = fetch_margin_data()
+    recent_margin = margin_data.get("recent", [])
+    if len(recent_margin) >= 2:
+        latest_rz = recent_margin[0].get("rzye", 0)
+        oldest_rz = recent_margin[-1].get("rzye", 0)
+        if oldest_rz > 0:
+            change_pct = round((latest_rz - oldest_rz) / oldest_rz * 100, 2)
+            result["margin_change_5d_pct"] = change_pct
+            if change_pct > 2:
+                result["margin_signal"] = "杠杆加码（贪婪）"
+            elif change_pct < -2:
+                result["margin_signal"] = "杠杆收缩（恐慌）"
+
+    # 涨跌家数
+    if market_breadth is None:
+        market_breadth = fetch_market_breadth()
+    up = market_breadth.get("up_count", 0)
+    down = market_breadth.get("down_count", 0)
+    total = up + down
+    if total > 0:
+        up_ratio = up / total
+        if up_ratio > 0.7:
+            result["breadth_signal"] = "普涨（乐观/贪婪）"
+        elif up_ratio < 0.3:
+            result["breadth_signal"] = "普跌（恐慌）"
+        elif up_ratio < 0.4:
+            result["breadth_signal"] = "偏弱（犹豫）"
+        else:
+            result["breadth_signal"] = "分化（正常）"
+
+    # 恐贪复合评分 (0=极度恐慌, 100=极度贪婪)
+    score = 50
+    # 融资情绪 (±15)
+    mc = result["margin_change_5d_pct"]
+    score += max(-15, min(15, mc * 5))
+    # 涨跌广度 (±20)
+    if total > 0:
+        score += (up_ratio - 0.5) * 40
+    # 融资趋势方向 (±10)
+    margin_trend = margin_data.get("trend", "未知")
+    if margin_trend == "增加":
+        score += 10
+    elif margin_trend == "减少":
+        score -= 10
+
+    score = max(0, min(100, round(score)))
+    result["fear_greed_score"] = score
+
+    # 情绪周期映射
+    if score <= 20:
+        result["emotional_cycle"] = "恐慌"
+    elif score <= 35:
+        result["emotional_cycle"] = "犹豫"
+    elif score <= 50:
+        result["emotional_cycle"] = "修复"
+    elif score <= 65:
+        result["emotional_cycle"] = "乐观"
+    elif score <= 80:
+        result["emotional_cycle"] = "贪婪"
+    else:
+        result["emotional_cycle"] = "疯狂"
+
+    # 散户 vs 机构信号
+    if score > 70 and result["breadth_signal"].startswith("普涨"):
+        result["retail_vs_inst_signal"] = "散户蜂拥入场，机构可能在派发"
+    elif score < 30 and result["breadth_signal"].startswith("普跌"):
+        result["retail_vs_inst_signal"] = "散户恐慌出逃，可能接近底部"
+
+    return result
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 13. 历史回溯上下文（回溯验证用）
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def fetch_rebalance_backtest_context() -> dict:
+    """从本地DB获取历史准确度数据，零API调用。"""
+    result = {
+        "scan_accuracy": {},
+        "trade_performance": {},
+        "winning_patterns": {},
+        "recent_rebalance_outcomes": [],
+        "note": None,
+    }
+
+    # 扫描胜率
+    try:
+        from data_store import get_backtest_summary
+        result["scan_accuracy"] = get_backtest_summary(days=30)
+    except Exception as e:
+        logger.warning(f"扫描回测数据获取失败: {e}")
+
+    # 交易绩效
+    try:
+        from trade_journal import get_performance_summary, analyze_winning_patterns
+        result["trade_performance"] = get_performance_summary(days=30)
+        result["winning_patterns"] = analyze_winning_patterns(days=90)
+    except Exception as e:
+        logger.warning(f"交易绩效数据获取失败: {e}")
+
+    # 最近蒸馏样本 vs 实际结果
+    try:
+        from pathlib import Path
+        import json as _json
+        distill_dir = Path("data/distillation")
+        outcomes = []
+        if distill_dir.exists():
+            files = sorted(distill_dir.glob("distill_*.jsonl"), reverse=True)
+            for fpath in files[:2]:  # 最近2个月
+                with open(fpath, "r", encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            sample = _json.loads(line)
+                            ts = sample.get("timestamp", "")[:10]
+                            parsed = sample.get("parsed_json", {})
+                            actions = parsed.get("actions", []) if isinstance(parsed, dict) else []
+                            for act in actions[:3]:
+                                outcomes.append({
+                                    "date": ts,
+                                    "code": act.get("code", ""),
+                                    "action": act.get("action", ""),
+                                    "target_sell_price": act.get("target_sell_price"),
+                                })
+                        except:
+                            continue
+                if len(outcomes) >= 10:
+                    break
+        result["recent_rebalance_outcomes"] = outcomes[:10]
+    except Exception as e:
+        logger.warning(f"蒸馏回溯数据获取失败: {e}")
+
+    # 数据充足性
+    perf = result.get("trade_performance", {})
+    if perf.get("total_trades", 0) < 10:
+        result["note"] = "insufficient_data"
+
+    return result
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 14. 一键采集
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def collect_full_macro_data(holding_codes: list) -> dict:
     """一键采集所有数据"""
@@ -729,6 +961,36 @@ def collect_full_macro_data(holding_codes: list) -> dict:
             data["hot_candidates"] = fetch_hot_stocks_for_candidate(max_price=10.0, top_n=20)
         except:
             data["hot_candidates"] = []
+
+    # 12. 个股基本面深度数据（研究员Agent用）
+    logger.info("[额外] 个股基本面深度数据...")
+    data["holdings_fundamental"] = {}
+    for code in holding_codes:
+        try:
+            data["holdings_fundamental"][code] = fetch_fundamental_deep(code)
+        except Exception as e:
+            logger.warning(f"基本面 {code} 跳过: {e}")
+
+    # 13. 市场情绪指标（分析师Agent用）
+    logger.info("[额外] 市场情绪指标...")
+    try:
+        data["sentiment_indicators"] = fetch_sentiment_indicators(
+            margin_data=data.get("margin_data"),
+            market_breadth=data.get("market_breadth"),
+        )
+        logger.info(f"  情绪: {data['sentiment_indicators'].get('emotional_cycle')} "
+                     f"(恐贪={data['sentiment_indicators'].get('fear_greed_score')})")
+    except Exception as e:
+        logger.warning(f"情绪指标跳过: {e}")
+        data["sentiment_indicators"] = {}
+
+    # 14. 历史回溯上下文（回溯验证Agent用）
+    logger.info("[额外] 历史回溯数据...")
+    try:
+        data["backtest_context"] = fetch_rebalance_backtest_context()
+    except Exception as e:
+        logger.warning(f"回溯数据跳过: {e}")
+        data["backtest_context"] = {}
 
     # 兼容字段（给 rebalance_engine 用）
     data["northbound_holdings"] = {}

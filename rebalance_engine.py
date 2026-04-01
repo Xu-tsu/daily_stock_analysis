@@ -23,15 +23,200 @@ logger = logging.getLogger(__name__)
 # ── 导入项目已有模块 ──
 from src.config import Config, get_config
 from src.core.trading_calendar import count_stock_trading_days
-from macro_data_collector import collect_full_macro_data, _fetch_tencent_quote, _stock_code_to_tencent
+from macro_data_collector import (
+    collect_full_macro_data, _fetch_tencent_quote,
+    _stock_code_to_tencent, _fetch_tencent_kline,
+)
 from portfolio_manager import (
     load_portfolio, update_current_prices, format_rebalance_report,
 )
+from src.stock_analyzer import StockTrendAnalyzer
 from src.services.trade_feedback_service import format_feedback_for_prompt
 from src.services.trade_sizing_service import annotate_a_share_trade_suggestions
 
 # 蒸馏数据保存目录
 DISTILL_DIR = Path("data/distillation")
+
+# ── 趋势分析器（复用单例）──
+_trend_analyzer = StockTrendAnalyzer()
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 降级追踪 — 记录每次降级的原因和修复建议
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _classify_error(e: Exception) -> tuple:
+    """根据异常类型返回 (error_type, chinese_reason, fix_suggestion)"""
+    err_str = str(e).lower()
+    err_type = type(e).__name__
+
+    # Timeout
+    if "timeout" in err_str or "timed out" in err_str or "Timeout" in err_type:
+        return (
+            "timeout",
+            f"模型响应超时（{err_type}）",
+            "1) 检查Ollama是否正常运行: ollama ps\n"
+            "2) 检查GPU显存: nvidia-smi\n"
+            "3) 考虑换用更小模型: set REBALANCE_LOCAL_MODEL=ollama/qwen2.5:7b-instruct\n"
+            "4) 增大超时: 当前prompt可能过长，考虑精简输入数据",
+        )
+
+    # Connection refused / not running
+    if "connection" in err_str or "refused" in err_str or "connect" in err_str:
+        return (
+            "connection",
+            f"无法连接模型服务（{err_type}）",
+            "1) 启动Ollama: ollama serve\n"
+            "2) 确认端口: 默认 http://localhost:11434\n"
+            "3) 检查防火墙是否拦截本地端口",
+        )
+
+    # API key / auth
+    if "auth" in err_str or "api_key" in err_str or "401" in err_str or "403" in err_str:
+        return (
+            "auth",
+            f"API认证失败（{err_type}）",
+            "1) 检查 .env 中的 API Key 是否正确\n"
+            "2) REBALANCE_CLOUD_MODEL 对应的 key: GEMINI_API_KEY / OPENAI_API_KEY\n"
+            "3) 确认 key 未过期或超出配额",
+        )
+
+    # Rate limit
+    if "rate" in err_str or "429" in err_str or "quota" in err_str:
+        return (
+            "rate_limit",
+            f"API调用频率/配额超限（{err_type}）",
+            "1) 稍后重试（等待1-2分钟）\n"
+            "2) 检查API配额剩余量\n"
+            "3) 考虑切换到备用模型: set REBALANCE_CLOUD_FALLBACK=...",
+        )
+
+    # JSON parse
+    if "json" in err_str or "decode" in err_str or "parse" in err_str:
+        return (
+            "parse_error",
+            f"模型返回内容解析失败（{err_type}）",
+            "1) 模型可能返回了非JSON文本，检查日志中的原始返回\n"
+            "2) 考虑降低temperature提高输出稳定性\n"
+            "3) 如果频繁出现，可能需要调整prompt模板",
+        )
+
+    # Generic
+    return (
+        "unknown",
+        f"{err_type}: {str(e)[:120]}",
+        "1) 查看完整日志定位具体错误\n"
+        "2) 检查网络连接和模型服务状态\n"
+        "3) 尝试重新运行调仓分析",
+    )
+
+
+def _make_degradation_entry(
+    step: str,
+    agent: str,
+    error: Exception = None,
+    reason: str = "",
+    fix: str = "",
+    severity: str = "warning",
+) -> dict:
+    """构建标准化降级记录条目"""
+    if error and not reason:
+        _, reason, fix = _classify_error(error)
+    return {
+        "step": step,
+        "agent": agent,
+        "severity": severity,        # warning / error / critical
+        "reason": reason,
+        "fix_suggestion": fix,
+        "error_type": type(error).__name__ if error else "",
+        "error_detail": str(error)[:200] if error else "",
+        "timestamp": datetime.now().strftime("%H:%M:%S"),
+    }
+
+
+def _fetch_holding_technical(code: str, cost_price: float = 0) -> dict:
+    """
+    获取单只持仓的K线趋势 + 筹码分布，用于增强持仓扫描。
+    返回紧凑字典给 LLM prompt。
+    """
+    result = {}
+
+    # ---- K线趋势分析 ----
+    try:
+        kdf = _fetch_tencent_kline(code, days=90)
+        if kdf is not None and len(kdf) >= 20:
+            tr = _trend_analyzer.analyze(kdf, code)
+            result["trend"] = {
+                "trend_status": tr.trend_status.value,
+                "ma_alignment": tr.ma_alignment,
+                "trend_strength": round(tr.trend_strength, 1),
+                "ma5": round(tr.ma5, 3),
+                "ma10": round(tr.ma10, 3),
+                "ma20": round(tr.ma20, 3),
+                "bias_ma5": round(tr.bias_ma5, 2),
+                "macd_signal": tr.macd_signal,
+                "rsi_6": round(tr.rsi_6, 1),
+                "rsi_signal": tr.rsi_signal,
+                "volume_status": tr.volume_status.value,
+                "volume_ratio_5d": round(tr.volume_ratio_5d, 2),
+                "support_levels": [round(s, 3) for s in tr.support_levels[:3]],
+                "resistance_levels": [round(r, 3) for r in tr.resistance_levels[:3]],
+                "buy_signal": tr.buy_signal.value,
+                "signal_score": tr.signal_score,
+            }
+            # ---- 盈亏转正预测 ----
+            if cost_price > 0 and tr.current_price < cost_price:
+                gap_pct = round((cost_price - tr.current_price) / tr.current_price * 100, 2)
+                # 用近20日平均日涨幅估算回本天数
+                if len(kdf) >= 20:
+                    recent = kdf.tail(20)
+                    daily_returns = recent["close"].pct_change().dropna()
+                    avg_daily = daily_returns.mean()
+                    if avg_daily > 0:
+                        est_days = int(gap_pct / (avg_daily * 100)) + 1
+                        result["profitability_forecast"] = {
+                            "current_loss_pct": round(-gap_pct, 2),
+                            "avg_daily_return_pct": round(avg_daily * 100, 3),
+                            "estimated_days_to_breakeven": est_days,
+                            "confidence": "低" if est_days > 15 else ("中" if est_days > 5 else "高"),
+                            "note": f"按近20日均涨幅{avg_daily*100:.3f}%估算，约需{est_days}个交易日回本",
+                        }
+                    else:
+                        result["profitability_forecast"] = {
+                            "current_loss_pct": round(-gap_pct, 2),
+                            "avg_daily_return_pct": round(avg_daily * 100, 3),
+                            "estimated_days_to_breakeven": "无法估计（近期均涨幅≤0）",
+                            "note": "近20日平均日收益率为负，短期回本概率低",
+                        }
+    except Exception as e:
+        logger.warning(f"K线趋势分析 {code} 失败: {e}")
+
+    # ---- 筹码分布 ----
+    try:
+        from data_provider.akshare_fetcher import AkshareFetcher
+        fetcher = AkshareFetcher()
+        chip = fetcher.get_chip_distribution(code)
+        if chip:
+            result["chip"] = {
+                "date": chip.date,
+                "profit_ratio": round(chip.profit_ratio * 100, 1),
+                "avg_cost": chip.avg_cost,
+                "cost_90_range": f"{chip.cost_90_low}-{chip.cost_90_high}",
+                "concentration_90": round(chip.concentration_90 * 100, 2),
+                "cost_70_range": f"{chip.cost_70_low}-{chip.cost_70_high}",
+                "concentration_70": round(chip.concentration_70 * 100, 2),
+            }
+            # 筹码峰与当前价的关系
+            if chip.avg_cost > 0:
+                price_vs_avg = round(
+                    (tr.current_price - chip.avg_cost) / chip.avg_cost * 100, 2
+                ) if 'tr' in dir() and hasattr(tr, 'current_price') else None
+                if price_vs_avg is not None:
+                    result["chip"]["price_vs_avg_cost_pct"] = price_vs_avg
+    except Exception as e:
+        logger.warning(f"筹码分布 {code} 获取失败: {e}")
+
+    return result
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -322,6 +507,22 @@ def _load_scan_mode_candidates(scan_mode: str, limit: int = 12) -> List[dict]:
         return []
     finally:
         conn.close()
+
+
+def _summarize_fundamentals(fundamental_ratings: list) -> str:
+    """将研究员评级列表压缩为紧凑文本，供辩论 prompt 使用。"""
+    if not fundamental_ratings:
+        return "无基本面数据"
+    lines = []
+    for fr in fundamental_ratings:
+        lines.append(
+            f"- {fr.get('name','?')}({fr.get('code','?')}): "
+            f"评级{fr.get('fundamental_grade','?')} "
+            f"风险{fr.get('financial_risk','?')} "
+            f"增长{fr.get('growth_trend','?')} "
+            f"| {fr.get('key_finding','')}"
+        )
+    return "\n".join(lines)
 
 
 def _build_relay_candidate_pool(
@@ -933,6 +1134,111 @@ PROMPT_SECTOR_ROTATION = """你是一位专业的A股行业研究分析师。
   "summary": "一句话总结板块轮动态势"
 }}"""
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 分析师 Prompt（市场情绪）
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PROMPT_SENTIMENT_ANALYST = """你是一位专业的A股市场情绪分析师，擅长通过多维度数据判断市场情绪周期。
+
+## 大盘研判（来自上一步分析）
+{market_judge}
+
+## 市场情绪数据
+{sentiment_data}
+
+## 用户交易偏好
+用户是超短线选手，核心理念："买在分歧，卖在高潮"
+- 情绪恐慌但主线板块未坏 → 低吸机会
+- 情绪贪婪+人气拥挤 → 止盈信号
+
+## 你的任务
+分析当前市场情绪所处阶段，给出情绪面的操作参考。
+
+请严格按以下 JSON 格式回复：
+{{
+  "emotional_cycle": "恐慌/犹豫/修复/乐观/贪婪/疯狂",
+  "fear_greed_score": 0-100,
+  "margin_signal": "融资情绪一句话描述",
+  "breadth_signal": "涨跌广度一句话描述",
+  "contrarian_opportunity": "是否存在逆向操作机会（低吸或止盈）",
+  "sentiment_advice": "基于情绪面的操作建议（1-2句话）"
+}}"""
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 研究员 Prompt（基本面）
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PROMPT_FUNDAMENTAL_SCAN = """你是一位A股基本面研究员。
+
+## 重要前提
+用户做低价小盘题材股，基本面是辅助参考而非主导因素。
+你的重点是：财务是否有雷？增长趋势是否在好转？估值是否极端？
+
+## {name}({code}) 基本面数据
+{fundamental_data}
+
+## 该股技术面评级摘要
+{tech_rating_summary}
+
+## 你的任务
+对该股基本面给出研究评级。注意：
+- 小盘股PE>100或为负是常态，不要因此直接否定
+- 关注ROE趋势方向、营收/利润增速变化、是否存在ST/退市风险
+- 如果基本面很差但技术面强，说明可能是炒作题材，提示风险但不否定短线交易
+
+请严格按以下 JSON 格式回复：
+{{
+  "code": "{code}",
+  "name": "{name}",
+  "fundamental_grade": "A(优秀)/B(良好)/C(一般)/D(危险)",
+  "financial_risk": "低/中/高/极高",
+  "growth_trend": "加速增长/稳定增长/放缓/下滑/亏损",
+  "valuation_note": "估值一句话点评（PE/PB vs 行业）",
+  "risk_flag": "无/关注/ST风险/退市风险",
+  "key_finding": "最重要的一个发现（1句话）"
+}}"""
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 回溯验证 Prompt（决策后标注）
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PROMPT_BACKTEST_VALIDATOR = """你是一位量化回溯验证专家，负责对调仓决策进行置信度标注。
+
+## 今日最终调仓决策
+{rebalance_decision}
+
+## 历史交易绩效（近30日）
+{trade_performance}
+
+## 历史胜率模式（近90日）
+{winning_patterns}
+
+## 扫描回测准确率
+{scan_accuracy}
+
+## 你的任务
+对每条操作建议标注置信度，并检查是否匹配历史亏损模式。
+
+注意：
+- 如果某操作与历史亏损模式高度吻合（如：追高买入、持仓超3天亏损股），大幅降低置信度
+- 如果某操作与历史盈利模式吻合（如：缩量回踩MA5买入、1天内止盈），提高置信度
+- 如果历史数据不足（总交易<10笔），所有置信度设为50（中性）
+
+请严格按以下 JSON 格式回复：
+{{
+  "overall_confidence": 0-100,
+  "per_action_confidence": [
+    {{
+      "code": "股票代码",
+      "action": "操作",
+      "confidence": 0-100,
+      "pattern_match": "匹配的历史模式（盈利或亏损）",
+      "warning": "风险提示（如有）"
+    }}
+  ],
+  "calibration_note": "整体校准说明（1-2句话）"
+}}"""
+
+
 PROMPT_HOLDING_SCAN = """你是一位专业的A股短线交易顾问，专注低价小盘题材股。
 
 ## 基于真实交易数据的评级标准
@@ -974,8 +1280,24 @@ PROMPT_HOLDING_SCAN = """你是一位专业的A股短线交易顾问，专注低
 ## 该股最新新闻
 {stock_news}
 
+## K线趋势分析（MA均线、MACD、RSI、量能、支撑压力位）
+{trend_analysis}
+
+## 筹码分布（获利比例、平均成本、集中度）
+{chip_distribution}
+
+## 盈亏回本预测（如果当前亏损）
+{profitability_forecast}
+
 ## 你的任务
-综合以上所有信息，对 {name}({code}) 给出操作评级。
+综合以上所有信息（特别关注大盘趋势、K线形态、筹码峰位置），对 {name}({code}) 给出操作评级。
+
+### 额外要求
+1. **结合大盘判断**：如果大盘处于上涨趋势且板块资金流入，即使个股短期亏损，也应评估继续持有的价值
+2. **K线趋势研判**：关注均线排列（多头/空头）、MACD金叉死叉、RSI超买超卖、量价配合
+3. **筹码峰分析**：如果当前价格接近筹码密集区的平均成本，抛压较大；如果在筹码密集区下方，可能有支撑
+4. **持有回本预测**：如果该股处于亏损但趋势在好转（均线收敛、MACD即将金叉、板块走强），预测继续持有多少个交易日可能回本，给出 estimated_hold_days
+5. **不要机械止损**：如果亏损在5%以内且趋势明确向好（K线沿MA5上攻、板块资金持续流入、筹码集中度在改善），可以建议"持有等待回本"并给出预计天数
 
 请严格按以下 JSON 格式回复：
 {{
@@ -986,10 +1308,14 @@ PROMPT_HOLDING_SCAN = """你是一位专业的A股短线交易顾问，专注低
   "reasons": ["原因1", "原因2", "原因3"],
   "risk_level": "低/中/高",
   "key_price_levels": {{
-    "support": "支撑位",
-    "resistance": "压力位",
+    "support": "支撑位（基于K线和筹码峰）",
+    "resistance": "压力位（基于K线和筹码峰）",
     "stop_loss": "止损位"
-  }}
+  }},
+  "trend_assessment": "趋势判断：上涨/震荡/下跌 + 一句话描述K线形态",
+  "chip_assessment": "筹码分析：当前价vs筹码峰位置 + 抛压/支撑判断",
+  "estimated_hold_days": "如果亏损但趋势向好，预计多少天可回本（无法判断则填null）",
+  "hold_or_cut_reason": "详细说明为什么建议继续持有等回本 或 立即止损的逻辑"
 }}"""
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1020,9 +1346,9 @@ PROMPT_DEBATE_CRITIQUE = """你是一位严谨保守的A股风控专家，你的
 5. **补仓禁忌**：有没有建议对亏损股加仓？
 6. **换股质量**：推荐的新股是否真的符合低价小盘+缩量回踩+板块资金流入？
 7. **卖点合理性**：目标卖出价和止损价是否合理？止盈太贪或止损太松都不行
-8. **低吸机会**：如果大盘下跌但主线板块资金仍在、个股只是回踩支撑，方案是否错过“买在分歧”的低吸机会？
+8. **低吸机会**：如果大盘下跌但主线板块资金仍在、个股只是回踩支撑，方案是否错过"买在分歧"的低吸机会？
 9. **高潮兑现**：如果个股红盘冲高、题材一致加速、人气过热，方案是否应该更主动止盈，而不是继续恋战？
-10. **题材切主线**：如果领涨龙头继续连板、板块内副龙/补涨股开始放量承接，方案有没有及时识别“新主线切换”和副龙低吸机会？
+10. **题材切主线**：如果领涨龙头继续连板、板块内副龙/补涨股开始放量承接，方案有没有及时识别"新主线切换"和副龙低吸机会？
 11. **过期买点**：如果建议买入区间已经被盘中拉升明显脱离，方案是否还在给一个已经失效的低点价位？
 
 请严格按以下 JSON 格式回复：
@@ -1061,11 +1387,13 @@ PROMPT_DEBATE_ARBITRATE = """你是最终仲裁者，需要综合激进派交易
 2. 如果有分歧 → 偏向保守派（风控优先），但如果保守派的理由是纯粹死套规则而忽略趋势，则偏向激进派
 3. 止损5%红线不可商量 → 如果激进派想保留亏损超5%的股票，必须否决
 4. 卖出股数不能超过 sellable_shares（T+1约束）
-5. 每只股必须给出 target_sell_price 和 stop_loss_price
+5. 每只股必须给出 target_sell_price 和 stop_loss_price，**价格必须参考持仓明细中的实时 current_price，不能用过期的价格**
 6. 换股只能从热门股列表中选，不能自己编造
-7. 同等条件下，优先“买在分歧、卖在高潮”：指数回落但主线未坏时允许小仓低吸；红盘冲高且人气拥挤时优先兑现
+7. 同等条件下，优先"买在分歧、卖在高潮"：指数回落但主线未坏时允许小仓低吸；红盘冲高且人气拥挤时优先兑现
 8. 如果龙头已经加速封板，优先考虑同题材里尚未完全加速、但资金开始扩散承接的副龙/补涨股
 9. 如果原始低吸位已经被盘中拉升明显脱离，不要继续给过期买点；应改成等待下一次回踩确认
+10. **回本持有预测**：对于亏损但趋势向好的股票（K线趋势上涨、MACD金叉、板块走强、筹码支撑有效），给出预计继续持有多少交易日可回本，作为是否止损的重要参考
+11. **大盘趋势权重**：如果大盘处于上涨趋势，个股亏损但板块强势，适当放宽持有耐心；如果大盘下跌趋势，即使个股技术面好也要更严格止损
 
 请严格按以下 JSON 格式回复：
 {{
@@ -1083,7 +1411,9 @@ PROMPT_DEBATE_ARBITRATE = """你是最终仲裁者，需要综合激进派交易
       "reason": "综合理由（引用激进派和保守派的观点）",
       "target_sell_price": 10.5,
       "stop_loss_price": 9.0,
-      "sell_timing": "建议在什么条件下卖出"
+      "sell_timing": "建议在什么条件下卖出",
+      "estimated_hold_days": "亏损股预计多少天回本（趋势好给数字，趋势差null）",
+      "hold_rationale": "继续持有等回本的理由 或 立即止损的依据（K线+筹码+大盘综合判断）"
     }}
   ],
   "new_candidates": [
@@ -1112,11 +1442,11 @@ PROMPT_REBALANCE_FINAL = """你是一位经验丰富的A股短线交易员，擅
 - 绝对禁止：不买大盘蓝筹白马股，不做价值投资，不补仓亏损股
 
 ### 逆向执行偏好：买在分歧，卖在高潮
-- 更高胜率的买点通常出现在大盘回落、盘面转冷、个股回踩支撑、市场“无人问津”时；前提是主线板块资金确认仍在，不能把下跌趋势误当低吸机会
-- 如果个股红盘冲高、题材一致加速、讨论度和跟风情绪明显升温，要优先考虑分批止盈/减仓，做到“卖在人声鼎沸”
+- 更高胜率的买点通常出现在大盘回落、盘面转冷、个股回踩支撑、市场"无人问津"时；前提是主线板块资金确认仍在，不能把下跌趋势误当低吸机会
+- 如果个股红盘冲高、题材一致加速、讨论度和跟风情绪明显升温，要优先考虑分批止盈/减仓，做到"卖在人声鼎沸"
 - 同等条件下，优先选择轻微回调或平盘承接的候选，而不是当天最热、最拥挤、最接近涨停的票
 - 如果领涨龙头已经涨停或连续加速，而同板块副龙开始放量承接、但尚未脱离低吸区间，应优先考虑副龙/补涨，而不是继续追龙头
-- 如果盘中最低点已经走过、当前价格明显高于低吸区间，不要继续给一个过期的静态买点，应明确写“等回踩/不追高”
+- 如果盘中最低点已经走过、当前价格明显高于低吸区间，不要继续给一个过期的静态买点，应明确写"等回踩/不追高"
 
 ### A股T+1追高禁令（最重要的规则！）
 - 绝对禁止买入当日涨幅超5%的股票
@@ -1163,12 +1493,14 @@ PROMPT_REBALANCE_FINAL = """你是一位经验丰富的A股短线交易员，擅
 2. 对每只持仓股给出 buy/hold/reduce/sell 建议和具体比例
 3. 如建议换股，**必须且只能**从上面"低价热门股"列表中选择，禁止自己编造股票代码和名称
 4. 给出具体比例（如 "减仓50%" 而非 "适当减仓"）
-5. **每只股票必须给出 target_sell_price（目标卖出价）和 stop_loss_price（止损价）**
+5. **每只股票必须给出 target_sell_price（目标卖出价）和 stop_loss_price（止损价）**，价格必须基于持仓明细中的实时 current_price 来设定
 6. **每只股票必须给出 sell_timing（什么条件下卖出）**，如"盈利5%或跌破MA5卖出"
 7. 标注风险等级
-8. 持仓天数必须严格按照 buy_date 字段计算到今天的交易日数，不要编造
+8. 持仓天数必须严格按照 buy_date 字段准确计算到今天的交易日数，不要编造
 9. 如果某只股票所处题材仍在强化、只是冲高后可能回踩，不要动不动就一刀切清仓；除非触发硬风控，否则优先分批止盈、保留底仓观察二波
-9. 如果大盘极弱，可以建议空仓等待，但一旦有板块异动要给出抄底候选
+10. 如果大盘极弱，可以建议空仓等待，但一旦有板块异动要给出抄底候选
+11. **回本预测（重要）**：对于亏损但趋势向好的持仓（K线沿MA5上攻、MACD金叉、板块资金流入），预测继续持有大约多少个交易日可以回本，并说明判断依据（均线趋势、筹码峰支撑等）
+12. **筹码峰参考**：参考各持仓股的筹码分布评级中的 chip_assessment 和 estimated_hold_days，结合大盘趋势综合判断
 
 请严格按以下 JSON 格式回复：
 {{
@@ -1185,7 +1517,9 @@ PROMPT_REBALANCE_FINAL = """你是一位经验丰富的A股短线交易员，擅
       "reason": "综合理由",
       "target_sell_price": 10.5,
       "stop_loss_price": 9.0,
-      "sell_timing": "建议在什么条件下卖出（如：盈利5%或跌破MA5时卖出）"
+      "sell_timing": "建议在什么条件下卖出（如：盈利5%或跌破MA5时卖出）",
+      "estimated_hold_days": "如果亏损，预计持有多少天可回本（趋势好则给数字，趋势差则null）",
+      "hold_rationale": "继续持有的理由（K线趋势+筹码+大盘），或立即止损的理由"
     }}
   ],
   "new_candidates": [
@@ -1226,6 +1560,9 @@ def run_rebalance_analysis(config: Config = None) -> dict:
     logger.info(f"云端模型: {cloud_model}")
     logger.info("=" * 60)
 
+    # ── 降级日志：记录流水线中每一次降级/跳过的原因和修复建议 ──
+    degradation_log: list = []
+
     # ── Step 0: 加载持仓 + 从trade_log同步校准buy_date ──
     portfolio = load_portfolio()
     try:
@@ -1233,6 +1570,11 @@ def run_rebalance_analysis(config: Config = None) -> dict:
         portfolio = sync_portfolio_from_trades(portfolio)
     except Exception as e:
         logger.warning(f"持仓同步失败（不影响主流程）: {e}")
+        degradation_log.append(_make_degradation_entry(
+            "Step0_持仓同步", "portfolio_sync", error=e,
+            reason="FIFO持仓同步失败，使用上次保存的持仓数据",
+            fix="1) 检查 data/trade_log.db 是否存在且可读\n2) 运行 python scripts/import_trades.py 重新导入",
+        ))
     holding_codes = [h["code"] for h in portfolio.get("holdings", [])]
     holding_sectors = list(set(
         h.get("sector", "未知") for h in portfolio.get("holdings", [])
@@ -1278,6 +1620,11 @@ def run_rebalance_analysis(config: Config = None) -> dict:
     except Exception as e:
         price_ts = None
         logger.warning(f"实时报价获取失败（使用历史价格）: {e}")
+        degradation_log.append(_make_degradation_entry(
+            "Step1_实时报价", "tencent_quote", error=e,
+            reason="腾讯实时行情获取失败，使用昨日收盘价（可能不准确）",
+            fix="1) 检查网络连接是否通畅\n2) 确认 qt.gtimg.cn 可访问\n3) 非交易时间无实时价",
+        ))
 
     portfolio = update_current_prices(portfolio, price_map)
 
@@ -1342,6 +1689,38 @@ def run_rebalance_analysis(config: Config = None) -> dict:
     _save_agent_local_sample("agent2_sector", prompt_sector, sector_judge_raw, sector_judge)
     logger.info(f"  热门板块: {sector_judge.get('hot_sectors', [])}")
 
+    # ── Step 3b: Agent 2b — 分析师：情绪面分析 ──
+    logger.info("\n[Step 3b] Agent 2b: 分析师（情绪面分析）...")
+    sentiment_analysis = {}
+    sentiment_model_used = "skipped"
+    try:
+        sentiment_data = macro_data.get("sentiment_indicators", {})
+        if sentiment_data:
+            prompt_sentiment = PROMPT_SENTIMENT_ANALYST.format(
+                market_judge=json.dumps(market_judge, ensure_ascii=False, indent=2),
+                sentiment_data=json.dumps(sentiment_data, ensure_ascii=False, indent=2),
+            )
+            sentiment_raw, sentiment_model_used = _call_local_llm(
+                prompt_sentiment, "Agent2b_分析师", return_model=True,
+            )
+            sentiment_analysis = _parse_llm_json(sentiment_raw)
+            _save_agent_local_sample("agent2b_sentiment", prompt_sentiment, sentiment_raw, sentiment_analysis)
+            logger.info(f"  情绪周期: {sentiment_analysis.get('emotional_cycle', 'N/A')} "
+                        f"(恐贪={sentiment_analysis.get('fear_greed_score', 'N/A')})")
+        else:
+            logger.info("  情绪数据为空，跳过分析师")
+            degradation_log.append(_make_degradation_entry(
+                "Step3b_情绪分析", "Agent2b_分析师", severity="warning",
+                reason="情绪数据采集为空，跳过情绪面分析",
+                fix="1) 检查 macro_data_collector.fetch_sentiment_indicators() 是否正常\n"
+                    "2) 确认融资余额、涨跌家数等原始数据源可用",
+            ))
+    except Exception as e:
+        logger.warning(f"  分析师(情绪)跳过: {e}")
+        degradation_log.append(_make_degradation_entry(
+            "Step3b_情绪分析", "Agent2b_分析师", error=e,
+        ))
+
     # ── Step 4: Agent 3 — 逐只持仓扫描（本地LLM）──
     logger.info("\n[Step 4/5] Agent 3: 持仓个股扫描（本地模型）...")
     holdings_ratings = []
@@ -1368,6 +1747,9 @@ def run_rebalance_analysis(config: Config = None) -> dict:
         nb_holding = macro_data.get("northbound_holdings", {}).get(code, {})
         s_news = macro_data.get("stock_news", {}).get(code, [])[:3]
 
+        # K线趋势 + 筹码分布 + 盈亏回本预测
+        tech_data = _fetch_holding_technical(code, cost_price=h.get("cost_price", 0))
+
         prompt_holding = PROMPT_HOLDING_SCAN.format(
             market_judge=json.dumps(market_judge, ensure_ascii=False),
             sector_judge=json.dumps(sector_judge, ensure_ascii=False),
@@ -1376,6 +1758,9 @@ def run_rebalance_analysis(config: Config = None) -> dict:
             northbound_holding=json.dumps(nb_holding, ensure_ascii=False),
             comment=json.dumps(comment, ensure_ascii=False),
             stock_news=json.dumps(s_news, ensure_ascii=False, indent=2),
+            trend_analysis=json.dumps(tech_data.get("trend", {}), ensure_ascii=False, indent=2),
+            chip_distribution=json.dumps(tech_data.get("chip", {}), ensure_ascii=False, indent=2),
+            profitability_forecast=json.dumps(tech_data.get("profitability_forecast", {}), ensure_ascii=False, indent=2),
             code=code, name=name,
         )
         rating_raw, _ = _call_local_llm(
@@ -1394,6 +1779,56 @@ def run_rebalance_analysis(config: Config = None) -> dict:
             )
         else:
             logger.warning(f"  → {name}: 分析结果解析失败")
+            degradation_log.append(_make_degradation_entry(
+                "Step4_持仓扫描", f"Agent3_{name}", severity="warning",
+                reason=f"{name}({code}) 持仓扫描结果解析失败，该股缺少技术评级",
+                fix="1) 检查本地模型是否正常: ollama ps\n"
+                    "2) 模型可能返回非JSON，查看日志中 Agent3 原始返回\n"
+                    "3) 考虑简化 PROMPT_HOLDING_SCAN 模板",
+            ))
+
+    # ── Step 4b: Agent 3b — 研究员：基本面扫描 ──
+    logger.info("\n[Step 4b] Agent 3b: 研究员（基本面扫描）...")
+    fundamental_ratings = []
+    fundamental_model_used = "skipped"
+    for h in portfolio.get("holdings", []):
+        code = h["code"]
+        name = h.get("name", code)
+        fund_data = macro_data.get("holdings_fundamental", {}).get(code, {})
+        if not fund_data or not fund_data.get("source_chain"):
+            logger.info(f"  {name}: 无基本面数据，跳过")
+            continue
+        try:
+            # 找到技术面评级摘要
+            tech_summary = "暂无"
+            for tr in holdings_ratings:
+                if tr.get("code") == code:
+                    tech_summary = (
+                        f"评级:{tr.get('rating','N/A')}, "
+                        f"得分:{tr.get('score','N/A')}, "
+                        f"趋势:{tr.get('trend_assessment','N/A')}"
+                    )
+                    break
+
+            prompt_fund = PROMPT_FUNDAMENTAL_SCAN.format(
+                code=code, name=name,
+                fundamental_data=json.dumps(fund_data, ensure_ascii=False, indent=2),
+                tech_rating_summary=tech_summary,
+            )
+            fund_raw, fundamental_model_used = _call_local_llm(
+                prompt_fund, f"Agent3b_研究员_{name}", return_model=True,
+            )
+            fund_rating = _parse_llm_json(fund_raw)
+            _save_agent_local_sample(f"agent3b_{code}", prompt_fund, fund_raw, fund_rating)
+            if fund_rating:
+                fundamental_ratings.append(fund_rating)
+                logger.info(f"  → {name}: {fund_rating.get('fundamental_grade', 'N/A')} "
+                            f"风险={fund_rating.get('financial_risk', 'N/A')}")
+        except Exception as e:
+            logger.warning(f"  研究员 {name} 跳过: {e}")
+            degradation_log.append(_make_degradation_entry(
+                "Step4b_基本面", f"Agent3b_研究员_{name}", error=e,
+            ))
 
     # ── Step 5: 多模型辩论调仓（激进派 vs 保守派 → 仲裁）──
     logger.info("\n[Step 5/7] 多模型辩论调仓决策...")
@@ -1432,6 +1867,11 @@ def run_rebalance_analysis(config: Config = None) -> dict:
             risk_alerts_text = "\n## 风控预警（必须优先处理）\n" + format_risk_alerts(alerts)
     except Exception as e:
         logger.debug(f"风控检查跳过: {e}")
+        degradation_log.append(_make_degradation_entry(
+            "Step5_风控检查", "risk_control", error=e,
+            reason="风控预检跳过，止损/止盈提醒可能缺失",
+            fix="1) 检查 risk_control.py 是否存在且无语法错误\n2) import risk_control 手动测试",
+        ))
 
     # 过滤热门候选：去除当日涨幅>5%的追高股，并优先保留分歧低吸/副龙接力候选
     filtered_hot = []
@@ -1523,6 +1963,11 @@ def run_rebalance_analysis(config: Config = None) -> dict:
         prompt_proposal = prompt_proposal + feedback_prompt_block
     if risk_alerts_text:
         prompt_proposal = prompt_proposal + risk_alerts_text
+    # 注入情绪面 + 基本面摘要
+    if sentiment_analysis:
+        prompt_proposal += f"\n\n## 情绪面参考（分析师评估）\n{json.dumps(sentiment_analysis, ensure_ascii=False)}"
+    if fundamental_ratings:
+        prompt_proposal += f"\n\n## 基本面参考（研究员评估）\n{_summarize_fundamentals(fundamental_ratings)}"
 
     proposal_raw, proposal_model_used = _call_local_llm(
         prompt_proposal,
@@ -1536,6 +1981,14 @@ def run_rebalance_analysis(config: Config = None) -> dict:
             logger.info(f"    {a.get('name','?')}: {a.get('action','?')} - {a.get('reason','')[:50]}")
     else:
         logger.warning("  激进派方案解析失败，将使用云端直接决策")
+        degradation_log.append(_make_degradation_entry(
+            "Step5a_激进派", "Agent4a_激进派", severity="error",
+            reason=f"激进派(Qwen)方案解析失败，辩论流程将降级（模型: {proposal_model_used}）",
+            fix="1) 检查Ollama状态: ollama ps\n"
+                "2) 检查GPU显存: nvidia-smi（14B模型需要≥10GB显存）\n"
+                "3) 尝试更小模型: set REBALANCE_LOCAL_MODEL=ollama/qwen2.5:7b-instruct\n"
+                "4) 查看日志中Agent4a原始返回是否为空或非JSON",
+        ))
 
     _save_agent_local_sample("agent4a_proposal", prompt_proposal, proposal_raw, proposal)
 
@@ -1556,6 +2009,16 @@ def run_rebalance_analysis(config: Config = None) -> dict:
         )
         if feedback_prompt_block:
             prompt_critique = prompt_critique + feedback_prompt_block
+        # 注入历史准确度
+        backtest_ctx = macro_data.get("backtest_context", {})
+        if backtest_ctx and backtest_ctx.get("note") != "insufficient_data":
+            perf = backtest_ctx.get("trade_performance", {})
+            prompt_critique += (
+                f"\n\n## 历史准确度参考\n"
+                f"近30日: {perf.get('total_trades',0)}笔交易, "
+                f"胜率{perf.get('win_rate',0)}%, "
+                f"平均盈亏{perf.get('avg_pnl_pct',0)}%"
+            )
         critique_raw, critique_model_used = _call_debate_llm(
             prompt_critique,
             "Agent4b_保守派",
@@ -1577,6 +2040,14 @@ def run_rebalance_analysis(config: Config = None) -> dict:
                 )
         else:
             logger.warning("  保守派审查解析失败")
+            degradation_log.append(_make_degradation_entry(
+                "Step5b_保守派", "Agent4b_保守派", severity="error",
+                reason=f"保守派(DeepSeek-R1)审查解析失败，辩论将缺少质疑环节（模型: {critique_model_used}）",
+                fix="1) 检查DeepSeek-R1模型状态: ollama ps\n"
+                    "2) DeepSeek-R1推理较慢，确认超时设置≥300s\n"
+                    "3) 尝试: set REBALANCE_DEBATE_MODEL=ollama/deepseek-r1:7b\n"
+                    "4) 查看日志中 <think>...</think> 标签是否完整",
+            ))
 
     _save_agent_local_sample("agent4b_critique", prompt_critique if proposal else "", critique_raw, critique)
 
@@ -1602,6 +2073,26 @@ def run_rebalance_analysis(config: Config = None) -> dict:
             prompt_arbitrate = prompt_arbitrate + feedback_prompt_block
         if risk_alerts_text:
             prompt_arbitrate = prompt_arbitrate + "\n" + risk_alerts_text
+        # 注入情绪面 + 基本面 + 历史准确度
+        if sentiment_analysis:
+            prompt_arbitrate += (
+                f"\n\n## 情绪面分析（分析师）\n"
+                f"情绪周期: {sentiment_analysis.get('emotional_cycle','N/A')}, "
+                f"恐贪指数: {sentiment_analysis.get('fear_greed_score','N/A')}, "
+                f"建议: {sentiment_analysis.get('sentiment_advice','N/A')}"
+            )
+        if fundamental_ratings:
+            prompt_arbitrate += f"\n\n## 基本面研究摘要\n{_summarize_fundamentals(fundamental_ratings)}"
+        backtest_ctx = macro_data.get("backtest_context", {})
+        if backtest_ctx and backtest_ctx.get("note") != "insufficient_data":
+            perf = backtest_ctx.get("trade_performance", {})
+            prompt_arbitrate += (
+                f"\n\n## 历史交易准确度\n"
+                f"近30日: {perf.get('total_trades',0)}笔, "
+                f"胜率{perf.get('win_rate',0)}%, "
+                f"均盈亏{perf.get('avg_pnl_pct',0)}%\n"
+                f"规则: 情绪贪婪时偏保守，情绪恐慌但基本面稳可偏激进"
+            )
         prompt_used = prompt_arbitrate
 
         # 仲裁模型降级链：云端 → DeepSeek → Qwen
@@ -1617,6 +2108,14 @@ def run_rebalance_analysis(config: Config = None) -> dict:
             debate_mode = "local_merge"
             rebalance = _merge_proposal_and_critique(proposal, critique)
             arbiter_model_used = "local_merge"
+            degradation_log.append(_make_degradation_entry(
+                "Step5c_仲裁", "Agent4c_仲裁", severity="error",
+                reason="云端仲裁模型返回为空或解析失败，降级为本地合并（采纳激进派方案+保守派修正）",
+                fix="1) 检查云端API Key: GEMINI_API_KEY 或 OPENAI_API_KEY\n"
+                    "2) 检查 .env 中 REBALANCE_CLOUD_MODEL 配置\n"
+                    "3) 确认网络可达: curl https://generativelanguage.googleapis.com\n"
+                    "4) 查看日志中云端模型原始返回",
+            ))
 
     elif proposal:
         # ⚠️ 只有激进派方案，保守派挂了 → 直接用方案但加风控过滤
@@ -1625,11 +2124,26 @@ def run_rebalance_analysis(config: Config = None) -> dict:
         rebalance = _apply_hard_rules(proposal, portfolio)
         rebalance_raw = json.dumps(rebalance, ensure_ascii=False)
         arbiter_model_used = "hard_rules"
+        degradation_log.append(_make_degradation_entry(
+            "Step5c_仲裁", "辩论降级", severity="error",
+            reason="保守派(DeepSeek-R1)未能完成审查，跳过辩论直接使用激进派方案+硬规则风控",
+            fix="1) 检查DeepSeek-R1状态: ollama ps\n"
+                "2) 注意: 缺少辩论质疑，方案风险可能偏高\n"
+                "3) 建议人工审核后再执行交易",
+        ))
 
     else:
         # ❌ 全挂了 → 单模型直接决策
         debate_mode = "single_fallback"
         logger.warning("  辩论未完成，退回单模型直接决策...")
+        degradation_log.append(_make_degradation_entry(
+            "Step5c_仲裁", "辩论降级", severity="critical",
+            reason="激进派+保守派均失败，辩论流程完全跳过，退回单模型直接决策",
+            fix="1) 本地LLM可能完全不可用，检查: ollama ps && nvidia-smi\n"
+                "2) 如果Ollama未运行: ollama serve\n"
+                "3) 如果显存不足: 关闭其他GPU程序，或换7B模型\n"
+                "4) 结果可靠性大幅降低，强烈建议人工复核",
+        ))
         prompt_fallback = PROMPT_REBALANCE_FINAL.format(
             market_judge=json.dumps(market_judge, ensure_ascii=False, indent=2),
             sector_judge=json.dumps(sector_judge, ensure_ascii=False, indent=2),
@@ -1656,6 +2170,16 @@ def run_rebalance_analysis(config: Config = None) -> dict:
         rebalance = _generate_rules_only_advice(portfolio)
         rebalance_raw = json.dumps(rebalance, ensure_ascii=False)
         arbiter_model_used = "rules_only"
+        degradation_log.append(_make_degradation_entry(
+            "Step5c_最终兜底", "rules_only", severity="critical",
+            reason="所有LLM模型（本地+云端）均失败，启用纯规则引擎生成保守建议",
+            fix="1) 所有模型均不可用，这是最严重的降级\n"
+                "2) 检查Ollama: ollama serve && ollama ps\n"
+                "3) 检查GPU: nvidia-smi\n"
+                "4) 检查云端Key: echo %GEMINI_API_KEY%\n"
+                "5) 检查网络: ping google.com\n"
+                "6) 纯规则建议仅基于止损止盈，不含AI分析，请勿直接执行",
+        ))
 
     logger.info(f"[仲裁] 决策模式: {debate_mode}, 返回长度: {len(rebalance_raw) if isinstance(rebalance_raw, str) else 'N/A'}")
 
@@ -1700,6 +2224,63 @@ def run_rebalance_analysis(config: Config = None) -> dict:
         rebalance["_meta"]["execution_profile_samples"] = execution_profile.sample_size
     except Exception as e:
         logger.warning("[执行数量规划] 生成整手数量失败，保留原始建议: %s", e)
+        degradation_log.append(_make_degradation_entry(
+            "Step5_执行规划", "trade_sizing", error=e,
+            reason="整手数量规划失败，建议中不含具体手数，需手动计算",
+            fix="1) 检查 risk_control.py 中 MAX_SINGLE_POSITION_PCT 配置\n"
+                "2) 确认 trade_sizing_service 模块无错误",
+        ))
+
+    # ── Step 5d: 回溯验证 — 置信度标注 ──
+    logger.info("\n[Step 5d] Agent 5: 回溯验证（置信度标注）...")
+    validator_model_used = "skipped"
+    try:
+        backtest_ctx = macro_data.get("backtest_context", {})
+        if rebalance.get("actions") and backtest_ctx:
+            prompt_validator = PROMPT_BACKTEST_VALIDATOR.format(
+                rebalance_decision=json.dumps(
+                    {"actions": rebalance.get("actions", [])},
+                    ensure_ascii=False, indent=2,
+                ),
+                trade_performance=json.dumps(
+                    backtest_ctx.get("trade_performance", {}),
+                    ensure_ascii=False, indent=2,
+                ),
+                winning_patterns=json.dumps(
+                    backtest_ctx.get("winning_patterns", {}),
+                    ensure_ascii=False, indent=2,
+                ),
+                scan_accuracy=json.dumps(
+                    backtest_ctx.get("scan_accuracy", {}),
+                    ensure_ascii=False, indent=2,
+                ),
+            )
+            validator_raw, validator_model_used = _call_local_llm(
+                prompt_validator, "Agent5_回溯验证", return_model=True,
+            )
+            validation = _parse_llm_json(validator_raw)
+            _save_agent_local_sample("agent5_validator", prompt_validator, validator_raw, validation)
+            if validation:
+                rebalance["backtest_validation"] = validation
+                logger.info(f"  整体置信度: {validation.get('overall_confidence', 'N/A')}")
+                for pac in validation.get("per_action_confidence", []):
+                    logger.info(f"    {pac.get('code','?')}: 置信{pac.get('confidence','?')} "
+                                f"| {pac.get('warning','')}")
+            else:
+                logger.info("  回溯验证解析失败，跳过")
+                degradation_log.append(_make_degradation_entry(
+                    "Step5d_回溯验证", "Agent5_回溯验证", severity="warning",
+                    reason="回溯验证结果解析失败，调仓建议无置信度标注",
+                    fix="1) 模型返回非JSON，查看日志中Agent5原始返回\n"
+                        "2) 不影响调仓建议本身，仅缺少置信度参考",
+                ))
+        else:
+            logger.info("  无决策或无回测数据，跳过验证")
+    except Exception as e:
+        logger.warning(f"  回溯验证跳过: {e}")
+        degradation_log.append(_make_degradation_entry(
+            "Step5d_回溯验证", "Agent5_回溯验证", error=e,
+        ))
 
     discussion = _build_rebalance_discussion(
         market_judge=market_judge,
@@ -1719,6 +2300,31 @@ def run_rebalance_analysis(config: Config = None) -> dict:
     rebalance["agent_discussion"] = discussion
     _log_rebalance_discussion(discussion)
 
+    # ── 降级日志汇总 ──
+    if degradation_log:
+        logger.warning(f"[降级汇总] 本次调仓共 {len(degradation_log)} 处降级:")
+        for i, d in enumerate(degradation_log, 1):
+            logger.warning(f"  [{i}] [{d['severity']}] {d['step']} | {d['agent']}: {d['reason']}")
+        rebalance["degradation_log"] = degradation_log
+        # 生成用户友好的降级摘要
+        critical_count = sum(1 for d in degradation_log if d["severity"] == "critical")
+        error_count = sum(1 for d in degradation_log if d["severity"] == "error")
+        warning_count = sum(1 for d in degradation_log if d["severity"] == "warning")
+        severity_parts = []
+        if critical_count:
+            severity_parts.append(f"{critical_count}个严重")
+        if error_count:
+            severity_parts.append(f"{error_count}个错误")
+        if warning_count:
+            severity_parts.append(f"{warning_count}个警告")
+        rebalance["degradation_summary"] = (
+            f"⚠️ 本次分析有{len(degradation_log)}处降级（{'、'.join(severity_parts)}），"
+            f"结果可靠性{'严重降低' if critical_count else '有所降低' if error_count else '轻微影响'}。"
+        )
+    else:
+        rebalance["degradation_log"] = []
+        rebalance["degradation_summary"] = "✅ 全流程正常，无降级。"
+
     rebalance["_meta"] = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "elapsed_seconds": elapsed,
@@ -1732,6 +2338,10 @@ def run_rebalance_analysis(config: Config = None) -> dict:
         "proposal_model_used": proposal_model_used,
         "critique_model_used": critique_model_used or debate_model,
         "arbiter_model_used": arbiter_model_used,
+        "sentiment_model_used": sentiment_model_used,
+        "fundamental_model_used": fundamental_model_used,
+        "validator_model_used": validator_model_used,
+        "degradation_count": len(degradation_log),
         **rebalance.get("_meta", {}),
     }
 

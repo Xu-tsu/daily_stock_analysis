@@ -501,4 +501,22 @@ def format_rebalance_report(rebalance: dict) -> str:
     if risk:
         lines.append(f"⚠️ **风险提示**: {risk}")
 
+    # ── 降级日志展示 ──
+    degradation_summary = rebalance.get("degradation_summary", "")
+    degradation_log = rebalance.get("degradation_log", [])
+    if degradation_log:
+        lines.append("")
+        lines.append(f"🔧 **流程状态**: {degradation_summary}")
+        severity_emoji = {"critical": "🔴", "error": "🟠", "warning": "🟡"}
+        for d in degradation_log:
+            emoji = severity_emoji.get(d.get("severity", "warning"), "ℹ️")
+            lines.append(f"{emoji} [{d.get('step','')}] {d.get('reason','')}")
+            fix = d.get("fix_suggestion", "")
+            if fix:
+                first_fix = fix.split("\n")[0]
+                lines.append(f"   🔧 {first_fix}")
+    elif degradation_summary:
+        lines.append("")
+        lines.append(f"🔧 **流程状态**: {degradation_summary}")
+
     return "\n".join(lines)

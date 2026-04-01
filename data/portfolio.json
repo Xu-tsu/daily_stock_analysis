@@ -1,7 +1,7 @@
 {
-  "updated_at": "2026-04-01 14:29:49",
+  "updated_at": "2026-04-01 16:11:52",
   "cash": 8533.28,
-  "total_asset": 20582.28,
+  "total_asset": 25636.28,
   "target_position_ratio": 0.7,
   "holdings": [
     {
@@ -9,10 +9,10 @@
       "name": "利欧股份",
       "shares": 300,
       "cost_price": 8.6,
-      "current_price": 7.51,
-      "market_value": 3755.0,
+      "current_price": 7.73,
+      "market_value": 2319.0,
       "pnl": -223.48,
-      "pnl_pct": -5.56,
+      "pnl_pct": -10.12,
       "sector": "数字营销",
       "buy_date": "2026-03-03",
       "strategy_tag": "趋势",
@@ -23,10 +23,10 @@
       "name": "协鑫集成",
       "shares": 2300,
       "cost_price": 5.14,
-      "current_price": 5.075,
-      "market_value": 6597.5,
+      "current_price": 4.82,
+      "market_value": 11086.0,
       "pnl": -17.78,
-      "pnl_pct": -0.74,
+      "pnl_pct": -6.23,
       "sector": "光伏",
       "buy_date": "2026-03-24",
       "strategy_tag": "趋势",
@@ -37,14 +37,15 @@
       "name": "雪龙集团",
       "shares": 200,
       "cost_price": 18.042,
-      "current_price": 17.18,
-      "market_value": 3436.0,
+      "current_price": 18.49,
+      "market_value": 3698.0,
       "pnl": -174.68,
-      "pnl_pct": -4.78,
+      "pnl_pct": 2.48,
       "sector": "消防设备",
       "buy_date": "2026-03-25",
       "strategy_tag": "中线",
       "sellable_shares": 200
     }
-  ]
+  ],
+  "actual_position_ratio": 0.6671
 }
