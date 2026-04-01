@@ -180,6 +180,8 @@ def update_current_prices(portfolio: dict, price_map: dict) -> dict:
         round(total_mv / portfolio["total_asset"], 4)
         if portfolio["total_asset"] > 0 else 0
     )
+    # 持久化到磁盘，避免下次读取时仍是陈旧价格
+    save_portfolio(portfolio)
     return portfolio
 
 

@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # ── 导入项目已有模块 ──
 from src.config import Config, get_config
 from src.core.trading_calendar import count_stock_trading_days
-from macro_data_collector import collect_full_macro_data
+from macro_data_collector import collect_full_macro_data, _fetch_tencent_quote, _stock_code_to_tencent
 from portfolio_manager import (
     load_portfolio, update_current_prices, format_rebalance_report,
 )
@@ -1263,6 +1263,22 @@ def run_rebalance_analysis(config: Config = None) -> dict:
         if code not in price_map or price_map[code] == 0:
             if comment.get("latest_price", 0) > 0:
                 price_map[code] = comment["latest_price"]
+
+    # ── 实时价格覆盖：确保用盘中最新价，而非昨日收盘 ──
+    try:
+        tc_codes = [_stock_code_to_tencent(c) for c in holding_codes]
+        realtime_quotes = _fetch_tencent_quote(tc_codes, timeout=10)
+        price_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for tc_code, quote in realtime_quotes.items():
+            raw_code = tc_code.replace("sh", "").replace("sz", "")
+            if quote.get("price", 0) > 0:
+                price_map[raw_code] = quote["price"]
+                logger.info(f"实时价格覆盖: {raw_code} → {quote['price']}")
+        logger.info(f"实时报价刷新完成，时间: {price_ts}")
+    except Exception as e:
+        price_ts = None
+        logger.warning(f"实时报价获取失败（使用历史价格）: {e}")
+
     portfolio = update_current_prices(portfolio, price_map)
 
     # ── Step 2: Agent 1 — 大盘研判（本地LLM）──
@@ -1479,6 +1495,8 @@ def run_rebalance_analysis(config: Config = None) -> dict:
             "total_asset": portfolio.get("total_asset", 0),
             "actual_position_ratio": portfolio.get("actual_position_ratio", 0),
             "today": now.strftime("%Y-%m-%d"),
+            "price_updated_at": price_ts if price_ts else "未知（使用历史收盘价）",
+            "price_source": "realtime_tencent" if price_ts else "daily_close",
             "holdings": portfolio_holdings,
         },
         ensure_ascii=False,
