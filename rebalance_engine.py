@@ -223,20 +223,33 @@ def _fetch_holding_technical(code: str, cost_price: float = 0) -> dict:
 # LLM 调用封装（区分本地 / 云端）
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def _call_local_llm(prompt: str, agent_name: str = "", return_model: bool = False):
+def _call_local_llm(
+    prompt: str,
+    agent_name: str = "",
+    return_model: bool = False,
+    timeout: int = 0,
+):
     """
     调用本地 Ollama 模型（Agent 1-3 用）
     使用 REBALANCE_LOCAL_MODEL 环境变量，不碰主项目的 LITELLM_MODEL
+    timeout: 覆盖默认超时（秒）。0 表示使用环境变量 REBALANCE_LOCAL_TIMEOUT，默认 180。
     """
     import litellm
     model = os.getenv("REBALANCE_LOCAL_MODEL", "ollama/qwen2.5:14b-instruct-q4_K_M")
+    if timeout <= 0:
+        timeout = int(os.getenv("REBALANCE_LOCAL_TIMEOUT", "180"))
+    # num_ctx: 控制 Ollama KV-cache 大小，直接影响 GPU 显存占用
+    # 默认32768太大（14B模型需18GB），8192够用且能全部装进12GB显存
+    num_ctx = int(os.getenv("REBALANCE_LOCAL_NUM_CTX", "8192"))
+    prompt_len = len(prompt)
     try:
-        logger.debug(f"[{agent_name}] 调用本地模型: {model}")
+        logger.debug(f"[{agent_name}] 调用本地模型: {model} (timeout={timeout}s, num_ctx={num_ctx}, prompt={prompt_len}字符)")
         response = litellm.completion(
             model=model,
             messages=[{"role": "user", "content": prompt}],
-            timeout=180,
+            timeout=timeout,
             temperature=0.3,  # 低温度，结果更稳定
+            num_ctx=num_ctx,
         )
         result = response.choices[0].message.content
         logger.debug(f"[{agent_name}] 本地模型返回 {len(result)} 字符")
@@ -244,7 +257,7 @@ def _call_local_llm(prompt: str, agent_name: str = "", return_model: bool = Fals
             return result, model
         return result
     except Exception as e:
-        logger.error(f"[{agent_name}] 本地 LLM 调用失败: {e}")
+        logger.error(f"[{agent_name}] 本地 LLM 调用失败 (timeout={timeout}s, prompt={prompt_len}字符): {e}")
         if return_model:
             return "{}", model
         return "{}"
@@ -257,13 +270,15 @@ def _call_debate_llm(prompt: str, agent_name: str = "", return_model: bool = Fal
     """
     import litellm
     model = os.getenv("REBALANCE_DEBATE_MODEL", "ollama/deepseek-r1:14b")
+    num_ctx = int(os.getenv("REBALANCE_DEBATE_NUM_CTX", "8192"))
     try:
-        logger.info(f"[{agent_name}] 调用辩论模型: {model}")
+        logger.info(f"[{agent_name}] 调用辩论模型: {model} (num_ctx={num_ctx})")
         response = litellm.completion(
             model=model,
             messages=[{"role": "user", "content": prompt}],
             timeout=300,
             temperature=0.4,
+            num_ctx=num_ctx,
         )
         result = response.choices[0].message.content
         # DeepSeek-R1 会输出 <think>...</think> 思考过程，提取最终回答
@@ -1969,10 +1984,13 @@ def run_rebalance_analysis(config: Config = None) -> dict:
     if fundamental_ratings:
         prompt_proposal += f"\n\n## 基本面参考（研究员评估）\n{_summarize_fundamentals(fundamental_ratings)}"
 
+    # Step 5a prompt 最重（含所有Agent结果+候选+风控），给予更长超时
+    _proposal_timeout = int(os.getenv("REBALANCE_PROPOSAL_TIMEOUT", "360"))
     proposal_raw, proposal_model_used = _call_local_llm(
         prompt_proposal,
         "Agent4a_激进派",
         return_model=True,
+        timeout=_proposal_timeout,
     )
     proposal = _parse_llm_json(proposal_raw)
     if proposal:

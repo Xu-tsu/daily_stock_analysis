@@ -176,9 +176,12 @@ def _fetch_tencent_kline(code: str, days: int = 60) -> pd.DataFrame:
         kline = stock_data.get("qfqday", stock_data.get("day", []))
         if not kline:
             return pd.DataFrame()
-        cols = ["date", "open", "close", "high", "low", "volume"]
-        df = pd.DataFrame(kline, columns=cols[:len(kline[0])])
-        for col in ["open", "close", "high", "low", "volume"]:
+        # 腾讯K线列：date, open, close, high, low, volume[, turnover]
+        _ALL_KCOLS = ["date", "open", "close", "high", "low", "volume", "turnover"]
+        ncols = len(kline[0])
+        cols = _ALL_KCOLS[:ncols] if ncols <= len(_ALL_KCOLS) else [f"c{i}" for i in range(ncols)]
+        df = pd.DataFrame(kline, columns=cols)
+        for col in ["open", "close", "high", "low", "volume", "turnover"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
         return df
@@ -201,9 +204,11 @@ def _fetch_tencent_kline_by_tc(tc_code: str, days: int = 60) -> pd.DataFrame:
         kline = stock_data.get("qfqday", stock_data.get("day", []))
         if not kline:
             return pd.DataFrame()
-        cols = ["date", "open", "close", "high", "low", "volume"]
-        df = pd.DataFrame(kline, columns=cols[:len(kline[0])])
-        for col in ["open", "close", "high", "low", "volume"]:
+        _ALL_KCOLS = ["date", "open", "close", "high", "low", "volume", "turnover"]
+        ncols = len(kline[0])
+        cols = _ALL_KCOLS[:ncols] if ncols <= len(_ALL_KCOLS) else [f"c{i}" for i in range(ncols)]
+        df = pd.DataFrame(kline, columns=cols)
+        for col in ["open", "close", "high", "low", "volume", "turnover"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
         return df

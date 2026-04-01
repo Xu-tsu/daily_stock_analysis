@@ -119,9 +119,11 @@ def _fetch_kline(code: str, days: int = 120) -> pd.DataFrame:
         kline = sd.get("qfqday", sd.get("day", []))
         if not kline:
             return pd.DataFrame()
-        cols = ["date", "open", "close", "high", "low", "volume"]
-        df = pd.DataFrame(kline, columns=cols[:len(kline[0])])
-        for c in ["open", "close", "high", "low", "volume"]:
+        _ALL_KCOLS = ["date", "open", "close", "high", "low", "volume", "turnover"]
+        ncols = len(kline[0])
+        cols = _ALL_KCOLS[:ncols] if ncols <= len(_ALL_KCOLS) else [f"c{i}" for i in range(ncols)]
+        df = pd.DataFrame(kline, columns=cols)
+        for c in ["open", "close", "high", "low", "volume", "turnover"]:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
         return df
