@@ -342,6 +342,180 @@ class THSBrokerAdapter(BrokerAdapter):
         except Exception as e:
             logger.error(f"[THS] 发送验证码警报失败: {e}")
 
+    # ── 智能追单：未成交自动撤单改价 ──
+
+    def smart_buy(self, code: str, price: float, shares: int,
+                  max_chase_pct: float = 0.5, timeout: int = 60) -> OrderResult:
+        """智能买入：委托后监控成交，未成交则撤单按最新价重挂。
+
+        参数由 AI execution_strategy 决定：
+            max_chase_pct: AI 根据紧迫度决定最多追高多少（止损紧急=1-2%，正常=0.3-0.5%）
+            timeout: AI 根据紧迫度决定追单超时（紧急=30-60s，正常=60-120s）
+        """
+        ceiling = round(price * (1 + max_chase_pct / 100), 2)
+        return self._smart_execute("buy", code, price, shares, ceiling, timeout)
+
+    def smart_sell(self, code: str, price: float, shares: int,
+                   max_chase_pct: float = 0.5, timeout: int = 60) -> OrderResult:
+        """智能卖出：委托后监控成交，未成交则撤单按最新价重挂。
+
+        参数由 AI execution_strategy 决定：
+            max_chase_pct: AI 根据紧迫度决定最多降价多少
+            timeout: AI 根据紧迫度决定追单超时
+        """
+        floor = round(price * (1 - max_chase_pct / 100), 2)
+        return self._smart_execute("sell", code, price, shares, floor, timeout)
+
+    def _smart_execute(self, direction: str, code: str, price: float,
+                       shares: int, limit_price: float, timeout: int) -> OrderResult:
+        """核心追单循环：挂单 → 等待 → 未成交则撤单改价 → 重挂。"""
+        poll_interval = int(os.getenv("CHASE_POLL_INTERVAL", "5"))
+        dir_cn = "买入" if direction == "buy" else "卖出"
+        trade_fn = self.buy if direction == "buy" else self.sell
+
+        # 第一次下单
+        current_price = round(price, 2)
+        result = trade_fn(code, current_price, shares)
+        if not result.is_success:
+            return result
+
+        order_id = result.order_id
+        logger.info(
+            f"[追单] {dir_cn} {code} {shares}股 @ {current_price} "
+            f"(限价={limit_price}, 超时={timeout}s)"
+        )
+
+        start = time.time()
+        while time.time() - start < timeout:
+            time.sleep(poll_interval)
+
+            # 刷新持仓/委托
+            self._user.refresh()
+
+            # 查找该委托状态
+            filled, remaining = self._check_order_fill(code, direction, shares)
+
+            if remaining <= 0:
+                logger.info(f"[追单] {dir_cn} {code} 全部成交")
+                result.status = "filled"
+                result.actual_shares = shares
+                result.actual_price = current_price
+                result.message = "智能追单: 全部成交"
+                return result
+
+            if filled > 0:
+                logger.info(f"[追单] {dir_cn} {code} 部分成交 {filled}/{shares}")
+
+            # 获取实时价格
+            new_price = self._get_realtime_price(code)
+            if new_price <= 0:
+                continue
+
+            # 检查是否超出追价范围
+            if direction == "buy" and new_price > limit_price:
+                logger.warning(
+                    f"[追单] {dir_cn} {code} 现价{new_price} > 追价上限{limit_price}，"
+                    f"放弃追单"
+                )
+                break
+            if direction == "sell" and new_price < limit_price:
+                logger.warning(
+                    f"[追单] {dir_cn} {code} 现价{new_price} < 追价下限{limit_price}，"
+                    f"放弃追单"
+                )
+                break
+
+            # 价格没变，继续等
+            new_price = round(new_price, 2)
+            if new_price == current_price:
+                continue
+
+            # 撤单 → 改价重挂
+            logger.info(
+                f"[追单] {dir_cn} {code} 改价: {current_price} → {new_price} "
+                f"(剩余{remaining}股)"
+            )
+
+            # 撤原单
+            if order_id:
+                self.cancel_order(order_id)
+            else:
+                # 没有 order_id（模拟盘），尝试撤该股票最新挂单
+                self._cancel_latest_pending(code, direction)
+            time.sleep(0.5)
+
+            # 重新下单（剩余未成交部分）
+            current_price = new_price
+            retry_result = trade_fn(code, current_price, remaining)
+            if retry_result.is_success:
+                order_id = retry_result.order_id
+                shares = remaining  # 后续只追踪剩余部分
+            else:
+                logger.warning(f"[追单] 改价重挂失败: {retry_result.message}")
+                result.message = f"智能追单: 部分成交{filled}股，改价失败"
+                result.actual_shares = filled
+                return result
+
+        # 超时或放弃：统计最终成交
+        final_filled, final_remaining = self._check_order_fill(code, direction, shares)
+        total_filled = shares - final_remaining if final_remaining >= 0 else 0
+
+        if total_filled > 0:
+            result.status = "partial" if final_remaining > 0 else "filled"
+            result.actual_shares = total_filled
+            result.message = f"智能追单: 成交{total_filled}股，未成交{final_remaining}股"
+        else:
+            result.message = f"智能追单: 超时{timeout}s未成交，保留原挂单"
+
+        logger.info(f"[追单] {dir_cn} {code} 结束: {result.message}")
+        return result
+
+    def _check_order_fill(self, code: str, direction: str, total_shares: int):
+        """检查某只股票某方向的成交情况。返回 (已成交, 未成交)。"""
+        try:
+            orders = self.get_today_orders()
+            filled = 0
+            pending = 0
+            for o in orders:
+                if o.code == code and o.direction == direction:
+                    if o.status == "filled":
+                        filled += o.filled_shares or o.shares
+                    elif o.status == "partial":
+                        filled += o.filled_shares
+                        pending += o.shares - o.filled_shares
+                    elif o.status == "pending":
+                        pending += o.shares
+            remaining = max(0, total_shares - filled)
+            return filled, remaining
+        except Exception as e:
+            logger.debug(f"[追单] 查询成交失败: {e}")
+            return 0, total_shares
+
+    def _cancel_latest_pending(self, code: str, direction: str):
+        """撤销该股票最新的挂单（模拟盘没有 order_id 时使用）。"""
+        try:
+            orders = self.get_today_orders()
+            for o in reversed(orders):
+                if o.code == code and o.direction == direction and o.status == "pending":
+                    if o.order_id:
+                        self.cancel_order(o.order_id)
+                        logger.info(f"[追单] 撤销挂单: {o.order_id}")
+                    return
+        except Exception as e:
+            logger.debug(f"[追单] 撤单失败: {e}")
+
+    def _get_realtime_price(self, code: str) -> float:
+        """获取股票实时价格（用于追单改价）。"""
+        try:
+            from macro_data_collector import _stock_code_to_tencent, _fetch_tencent_quote
+            tc = _stock_code_to_tencent(code)
+            quotes = _fetch_tencent_quote([tc], timeout=5)
+            q = quotes.get(tc, {})
+            return float(q.get("price", 0) or 0)
+        except Exception as e:
+            logger.debug(f"[追单] 获取实时价失败 {code}: {e}")
+            return 0
+
     def _refresh_after_trade(self, direction_cn: str, code: str):
         """交易成功后自动刷新同花顺持仓显示"""
         try:

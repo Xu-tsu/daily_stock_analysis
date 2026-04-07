@@ -561,6 +561,70 @@ def _parse_llm_json(response: str) -> dict:
         return {}
 
 
+def _build_last_analysis_context() -> str:
+    """加载上一次调仓分析结果，供 AI 保持决策连贯性。
+
+    解决问题：每次分析独立运行，AI 不知道上一次建议了什么，
+    导致"昨天说持有今天说清仓"这类前后矛盾。
+    """
+    history_dir = Path("data/rebalance_history")
+    if not history_dir.exists():
+        return ""
+
+    # 找最新的历史文件
+    files = sorted(history_dir.glob("rebalance_*.json"), reverse=True)
+    if not files:
+        return ""
+
+    # 跳过太旧的（超过3天不注入，避免误导）
+    latest = files[0]
+    try:
+        ts_str = latest.stem.replace("rebalance_", "")  # 20260407_150051
+        file_dt = datetime.strptime(ts_str, "%Y%m%d_%H%M%S")
+        if (datetime.now() - file_dt).days > 3:
+            return ""
+    except Exception:
+        pass
+
+    try:
+        data = json.loads(latest.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+
+    # 提取关键信息
+    lines = [
+        f"\n\n## 上次调仓分析结果（{file_dt.strftime('%Y-%m-%d %H:%M')}，必须参考保持连贯）",
+        f"整体仓位建议: {data.get('overall_position_advice', 'N/A')}",
+        f"大盘判断: {data.get('market_assessment', 'N/A')}",
+        f"板块判断: {data.get('sector_assessment', 'N/A')}",
+    ]
+
+    actions = data.get("actions", [])
+    if actions:
+        lines.append("各股票操作建议:")
+        for a in actions:
+            target = a.get("target_sell_price", "无")
+            stop = a.get("stop_loss_price", "无")
+            lines.append(
+                f"  - {a.get('name','')}({a.get('code','')}): "
+                f"{a.get('action','?')} {a.get('ratio','')} | "
+                f"止盈目标={target} 止损={stop} | "
+                f"理由: {str(a.get('reason',''))[:80]}"
+            )
+
+    debate = data.get("debate_summary", "")
+    if debate:
+        lines.append(f"辩论总结: {debate[:150]}")
+
+    lines.append(
+        "\n**重要**: 请对照上次分析结果，如果本次建议与上次不同，"
+        "必须在 reason 中明确说明变化原因（如：市场环境变化、价格已到目标、"
+        "新信号出现等）。不要无理由地翻转上次的结论。"
+    )
+
+    return "\n".join(lines)
+
+
 def _build_recent_feedback_prompt_block(limit: int = 6) -> str:
     """Return a compact manual-feedback block for future rebalance prompts."""
     try:
@@ -1510,7 +1574,15 @@ PROMPT_DEBATE_ARBITRATE = """你是最终仲裁者，需要综合激进派交易
       "stop_loss_price": 9.0,
       "sell_timing": "建议在什么条件下卖出",
       "estimated_hold_days": "亏损股预计多少天回本（趋势好给数字，趋势差null）",
-      "hold_rationale": "继续持有等回本的理由 或 立即止损的依据（K线+筹码+大盘综合判断）"
+      "hold_rationale": "继续持有等回本的理由 或 立即止损的依据（K线+筹码+大盘综合判断）",
+      "execution_strategy": {{
+        "urgency": "high/medium/low（执行紧迫度：high=立刻成交，medium=可等几分钟，low=挂单等回调）",
+        "chase_max_pct": 0.5,
+        "chase_timeout": 60,
+        "order_type": "aggressive/passive/limit（aggressive=对手价快速成交，passive=挂买一/卖一等待，limit=指定价不追）",
+        "split_orders": false,
+        "reason": "为什么选择这个执行策略"
+      }}
     }}
   ],
   "new_candidates": [
@@ -1521,11 +1593,31 @@ PROMPT_DEBATE_ARBITRATE = """你是最终仲裁者，需要综合激进派交易
       "reason": "推荐理由",
       "target_sell_price": "目标卖出价",
       "stop_loss_price": "止损价",
-      "buy_price_range": "建议买入价格区间"
+      "buy_price_range": "建议买入价格区间",
+      "execution_strategy": {{
+        "urgency": "low",
+        "chase_max_pct": 0,
+        "chase_timeout": 0,
+        "order_type": "limit",
+        "split_orders": false,
+        "reason": "新候选等回调到位再买，不追高"
+      }}
     }}
   ],
   "risk_warning": "整体风险提示"
-}}"""
+}}
+
+execution_strategy 字段说明（每只股票必须给出，系统会据此自动执行）：
+- urgency: 执行紧迫度
+  - high: 止损/追跌/板块即将转弱 → 对手价立刻成交，不惜多付0.5-1%滑点
+  - medium: 正常止盈/减仓 → 可等2分钟，小幅追价
+  - low: 换股买入/加仓 → 挂限价单等回调，不主动追
+- chase_max_pct: 最多追价百分比（买入是往上追，卖出是往下追）。
+  止损紧急给1-2%，正常给0.3-0.5%，不急给0
+- chase_timeout: 追单超时秒数。紧急给30-60，正常给60-120，不急给0（挂单不追）
+- order_type: aggressive=按对手价（买用卖一价，卖用买一价），passive=按己方价（买用买一，卖用卖一），limit=只挂指定价不动
+- split_orders: 大单是否拆分（>5000股的单子建议true，避免冲击成本）
+- reason: 为什么选择这个策略（如"止损紧急需要立刻成交"或"等回踩到支撑位再买"）"""
 
 PROMPT_REBALANCE_FINAL = """你是一位经验丰富的A股短线交易员，擅长低价小盘题材股的板块轮动策略。
 
@@ -1616,7 +1708,15 @@ PROMPT_REBALANCE_FINAL = """你是一位经验丰富的A股短线交易员，擅
       "stop_loss_price": 9.0,
       "sell_timing": "建议在什么条件下卖出（如：盈利5%或跌破MA5时卖出）",
       "estimated_hold_days": "如果亏损，预计持有多少天可回本（趋势好则给数字，趋势差则null）",
-      "hold_rationale": "继续持有的理由（K线趋势+筹码+大盘），或立即止损的理由"
+      "hold_rationale": "继续持有的理由（K线趋势+筹码+大盘），或立即止损的理由",
+      "execution_strategy": {{
+        "urgency": "high/medium/low",
+        "chase_max_pct": 0.5,
+        "chase_timeout": 60,
+        "order_type": "aggressive/passive/limit",
+        "split_orders": false,
+        "reason": "执行策略理由"
+      }}
     }}
   ],
   "new_candidates": [
@@ -1627,11 +1727,27 @@ PROMPT_REBALANCE_FINAL = """你是一位经验丰富的A股短线交易员，擅
       "reason": "推荐理由（必须是低价小盘题材股）",
       "target_sell_price": "目标卖出价",
       "stop_loss_price": "止损价",
-      "buy_price_range": "建议买入价格区间"
+      "buy_price_range": "建议买入价格区间",
+      "execution_strategy": {{
+        "urgency": "low",
+        "chase_max_pct": 0,
+        "chase_timeout": 0,
+        "order_type": "limit",
+        "split_orders": false,
+        "reason": "等回调到位再买"
+      }}
     }}
   ],
   "risk_warning": "整体风险提示"
-}}"""
+}}
+
+execution_strategy 字段说明（每只股票必须给出，系统会据此自动执行）：
+- urgency: high=止损紧急立刻成交 / medium=正常操作可等几分钟 / low=挂单等回调
+- chase_max_pct: 最多追价百分比。止损紧急给1-2%，正常给0.3-0.5%，不急给0
+- chase_timeout: 追单超时秒数。紧急30-60，正常60-120，不急0
+- order_type: aggressive=对手价快速成交 / passive=挂己方价等待 / limit=只挂指定价
+- split_orders: 大单(>5000股)建议拆分避免冲击
+- reason: 选择该策略的理由"""
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1660,18 +1776,38 @@ def run_rebalance_analysis(config: Config = None) -> dict:
     # ── 降级日志：记录流水线中每一次降级/跳过的原因和修复建议 ──
     degradation_log: list = []
 
-    # ── Step 0: 加载持仓 + 从trade_log同步校准buy_date ──
+    # ── Step 0: 加载持仓（优先从 broker 真实持仓刷新，trade_log 兜底）──
     portfolio = load_portfolio()
+
+    # 第一优先级：broker 真实持仓（THS 客户端扫描后的数据最准确）
+    broker_synced = False
+    try:
+        from portfolio_manager import sync_portfolio_from_broker
+        old_holdings = [h["code"] for h in portfolio.get("holdings", [])]
+        portfolio = sync_portfolio_from_broker(portfolio)
+        new_holdings = [h["code"] for h in portfolio.get("holdings", [])]
+        if old_holdings != new_holdings or any(
+            h.get("sellable_shares") is not None
+            for h in portfolio.get("holdings", [])
+        ):
+            broker_synced = True
+            logger.info("[Step 0] 持仓数据已从 broker（THS）刷新")
+    except Exception as e:
+        logger.debug(f"broker 持仓同步跳过: {e}")
+
+    # 第二优先级：trade_log FIFO 校准（补充 buy_date 等 broker 不返回的字段）
     try:
         from portfolio_manager import sync_portfolio_from_trades
         portfolio = sync_portfolio_from_trades(portfolio)
     except Exception as e:
-        logger.warning(f"持仓同步失败（不影响主流程）: {e}")
-        degradation_log.append(_make_degradation_entry(
-            "Step0_持仓同步", "portfolio_sync", error=e,
-            reason="FIFO持仓同步失败，使用上次保存的持仓数据",
-            fix="1) 检查 data/trade_log.db 是否存在且可读\n2) 运行 python scripts/import_trades.py 重新导入",
-        ))
+        if not broker_synced:
+            logger.warning(f"持仓同步失败（不影响主流程）: {e}")
+            degradation_log.append(_make_degradation_entry(
+                "Step0_持仓同步", "portfolio_sync", error=e,
+                reason="持仓同步失败，使用上次保存的持仓数据",
+                fix="1) 确认 BROKER_ENABLED=true 且 THS 客户端已登录\n"
+                    "2) 或检查 data/trade_log.db 是否存在且可读",
+            ))
     holding_codes = [h["code"] for h in portfolio.get("holdings", [])]
     holding_sectors = list(set(
         h.get("sector", "未知") for h in portfolio.get("holdings", [])
@@ -2141,6 +2277,7 @@ def run_rebalance_analysis(config: Config = None) -> dict:
         indent=2,
     )
     hot_picks_json = json.dumps(hot_picks[:10], ensure_ascii=False, indent=2)
+    last_analysis_block = _build_last_analysis_context()
     feedback_prompt_block = _build_recent_feedback_prompt_block()
 
     # ── 策略自改进反馈（执行质量 + 信号准确率）──
@@ -2154,6 +2291,16 @@ def run_rebalance_analysis(config: Config = None) -> dict:
             logger.info(f"[反馈环] 已注入策略反馈 ({len(strategy_feedback_block)}字)")
     except Exception as e:
         logger.debug(f"[反馈环] 策略反馈生成跳过: {e}")
+
+    # ── 日内峰值时段分析（数据驱动优化买卖时机）──
+    peak_patterns_block = ""
+    try:
+        from src.broker.intraday_tracker import format_peak_patterns_for_prompt
+        peak_patterns_block = format_peak_patterns_for_prompt(days=30)
+        if peak_patterns_block:
+            logger.info(f"[峰值分析] 已注入日内峰值时段数据 ({len(peak_patterns_block)}字)")
+    except Exception as e:
+        logger.debug(f"[峰值分析] 跳过: {e}")
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # Step 5a: 激进派（Qwen）— 提出调仓方案
@@ -2169,10 +2316,15 @@ def run_rebalance_analysis(config: Config = None) -> dict:
         portfolio=portfolio_json,
         hot_picks=hot_picks_json,
     )
+    # 注入上次分析结果（保持决策连贯性）
+    if last_analysis_block:
+        prompt_proposal = prompt_proposal + last_analysis_block
     if feedback_prompt_block:
         prompt_proposal = prompt_proposal + feedback_prompt_block
     if strategy_feedback_block:
         prompt_proposal = prompt_proposal + "\n\n" + strategy_feedback_block
+    if peak_patterns_block:
+        prompt_proposal = prompt_proposal + "\n\n" + peak_patterns_block
     if risk_alerts_text:
         prompt_proposal = prompt_proposal + risk_alerts_text
     # 注入情绪面 + 基本面摘要
@@ -2283,6 +2435,8 @@ def run_rebalance_analysis(config: Config = None) -> dict:
             portfolio=portfolio_json,
             hot_picks=hot_picks_json,
         )
+        if last_analysis_block:
+            prompt_arbitrate = prompt_arbitrate + last_analysis_block
         if feedback_prompt_block:
             prompt_arbitrate = prompt_arbitrate + feedback_prompt_block
         if risk_alerts_text:
@@ -2365,6 +2519,8 @@ def run_rebalance_analysis(config: Config = None) -> dict:
             portfolio=portfolio_json,
             hot_picks=hot_picks_json,
         )
+        if last_analysis_block:
+            prompt_fallback = prompt_fallback + last_analysis_block
         if feedback_prompt_block:
             prompt_fallback = prompt_fallback + feedback_prompt_block
         if risk_alerts_text:

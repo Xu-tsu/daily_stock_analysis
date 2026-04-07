@@ -55,7 +55,7 @@ SHOW_PORTFOLIO_PHRASES = {
 }
 
 PORTFOLIO_COMMAND_PREFIXES = [
-    "调仓", "扫描", "主线", "回测", "预警", "分析", "全量分析", "战绩", "复盘", "交易记录",
+    "调仓", "扫描", "主线", "回测", "预警", "分析", "全量分析", "战绩", "复盘", "交易记录", "复盘笔记",
 ]
 
 TRADE_ACTION_MAP = {
@@ -426,6 +426,8 @@ def handle_portfolio_command(text: str) -> str:
             return _handle_alert()
         elif text.startswith("战绩"):
             return _handle_performance()
+        elif text.startswith("复盘笔记"):
+            return _handle_trade_review()
         elif text.startswith("复盘") and "分析" not in text:
             return _handle_pattern_review()
         elif text.startswith("交易记录"):
@@ -822,6 +824,61 @@ def _handle_show_portfolio() -> str:
     total_emoji = "🟢" if total_pnl >= 0 else "🔴"
     lines.append(f"\n{total_emoji} 总盈亏: {total_pnl:.2f}元")
     return "\n".join(lines)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 战绩 / 复盘 / 交易记录 / 复盘笔记
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def _handle_performance() -> str:
+    try:
+        from trade_journal import get_performance_summary, format_performance
+        stats = get_performance_summary(days=30)
+        return format_performance(stats)
+    except Exception as e:
+        return f"❌ 战绩查询失败: {str(e)}"
+
+
+def _handle_pattern_review() -> str:
+    try:
+        from trade_journal import analyze_winning_patterns, format_pattern_analysis
+        analysis = analyze_winning_patterns(days=90)
+        return format_pattern_analysis(analysis)
+    except Exception as e:
+        return f"❌ 复盘分析失败: {str(e)}"
+
+
+def _handle_trade_history() -> str:
+    try:
+        from trade_journal import get_recent_trades
+        trades = get_recent_trades(limit=20)
+        if not trades:
+            return "📋 暂无交易记录"
+        lines = ["📋 **最近交易** (近20笔)", ""]
+        for t in trades:
+            emoji = ""
+            if t["trade_type"] == "sell":
+                emoji = "🟢" if (t.get("pnl") or 0) >= 0 else "🔴"
+            direction = "买入" if t["trade_type"] == "buy" else "卖出"
+            pnl_str = ""
+            if t["trade_type"] == "sell" and t.get("pnl") is not None:
+                pnl_str = f" {t['pnl']:+.2f}元({t.get('pnl_pct', 0):+.2f}%)"
+            lines.append(
+                f"{emoji} {t['trade_date']} {direction} "
+                f"{t.get('name', '')}({t['code']}) "
+                f"{t.get('shares', 0)}股@{t.get('price', 0)}{pnl_str}"
+            )
+        return "\n".join(lines)
+    except Exception as e:
+        return f"❌ 交易记录查询失败: {str(e)}"
+
+
+def _handle_trade_review() -> str:
+    """复盘笔记 — AI驱动的盘后复盘"""
+    try:
+        from src.core.trade_review import format_review_brief
+        return format_review_brief()
+    except Exception as e:
+        return f"❌ 复盘笔记生成失败: {str(e)}"
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

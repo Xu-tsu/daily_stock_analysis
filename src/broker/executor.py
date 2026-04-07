@@ -125,14 +125,90 @@ class RebalanceExecutor:
                 message=f"安全限制: {reason}",
             )
 
-        # 下单
-        if direction == "sell":
-            result = self._broker.sell(code, price, shares)
+        # 下单：根据 AI execution_strategy 决定执行方式
+        strategy = action.get("execution_strategy", {})
+        order_type = str(strategy.get("order_type", "")).lower()
+        chase_pct = float(strategy.get("chase_max_pct", 0) or 0)
+        chase_timeout = int(strategy.get("chase_timeout", 0) or 0)
+        split = strategy.get("split_orders", False)
+
+        # 大单拆分（AI 建议 split_orders=true 时，分批下单）
+        if split and shares > 5000 and hasattr(self._broker, "smart_buy"):
+            result = self._execute_split(
+                direction, code, price, shares,
+                chase_pct, chase_timeout, order_type,
+            )
+        # aggressive/passive → 智能追单，AI 给的参数
+        elif chase_pct > 0 and chase_timeout > 0 and hasattr(self._broker, "smart_buy"):
+            # AI 给了追单参数
+            if order_type == "aggressive":
+                # 对手价：买用卖一(+0.01)，卖用买一(-0.01)
+                price = round(price + (0.01 if direction == "buy" else -0.01), 2)
+            if direction == "sell":
+                result = self._broker.smart_sell(
+                    code, price, shares,
+                    max_chase_pct=chase_pct, timeout=chase_timeout,
+                )
+            else:
+                result = self._broker.smart_buy(
+                    code, price, shares,
+                    max_chase_pct=chase_pct, timeout=chase_timeout,
+                )
+        # limit 或无策略 → 普通限价委托
         else:
-            result = self._broker.buy(code, price, shares)
+            if direction == "sell":
+                result = self._broker.sell(code, price, shares)
+            else:
+                result = self._broker.buy(code, price, shares)
+
+        if strategy.get("reason"):
+            result.message = f"{result.message} | AI策略: {strategy['reason'][:50]}"
 
         result.name = name
         return result
+
+    def _execute_split(self, direction, code, price, total_shares,
+                        chase_pct, chase_timeout, order_type) -> OrderResult:
+        """拆单执行：将大单拆成多笔小单，减少市场冲击。"""
+        batch_size = 2000  # 每批最多 2000 股
+        remaining = total_shares
+        filled_total = 0
+
+        while remaining > 0:
+            batch = min(remaining, batch_size)
+            if chase_pct > 0 and chase_timeout > 0:
+                if direction == "sell":
+                    r = self._broker.smart_sell(code, price, batch,
+                                                max_chase_pct=chase_pct,
+                                                timeout=min(chase_timeout, 60))
+                else:
+                    r = self._broker.smart_buy(code, price, batch,
+                                               max_chase_pct=chase_pct,
+                                               timeout=min(chase_timeout, 60))
+            else:
+                if direction == "sell":
+                    r = self._broker.sell(code, price, batch)
+                else:
+                    r = self._broker.buy(code, price, batch)
+
+            if r.is_success:
+                filled_total += r.actual_shares or batch
+            remaining -= batch
+            if remaining > 0:
+                time.sleep(2)  # 批间间隔
+            # 更新实时价
+            if hasattr(self._broker, "_get_realtime_price"):
+                new_p = self._broker._get_realtime_price(code)
+                if new_p > 0:
+                    price = round(new_p, 2)
+
+        return OrderResult(
+            code=code, direction=direction,
+            status="filled" if filled_total >= total_shares else "partial",
+            requested_price=price, requested_shares=total_shares,
+            actual_price=price, actual_shares=filled_total,
+            message=f"拆单执行: {filled_total}/{total_shares}股",
+        )
 
     def _dry_run(self, actions: List[dict], total_asset: float) -> List[OrderResult]:
         """Dry run — 模拟执行，不实际下单"""

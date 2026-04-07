@@ -38,6 +38,117 @@ def load_portfolio() -> dict:
     logger.warning(f"持仓文件 {PORTFOLIO_FILE} 不存在，使用空持仓")
     return DEFAULT_PORTFOLIO.copy()
 
+
+def sync_portfolio_from_broker(portfolio: dict) -> dict:
+    """以券商（THS）真实持仓为准，覆盖 portfolio.json。
+
+    broker.get_positions() 返回的是同花顺客户端刷新后的实时数据：
+    - shares:          真实持仓股数（成交后已更新）
+    - sellable_shares: T+1 可卖余额（THS 客户端自动计算）
+    - cost_price:      成本价（含手续费均摊）
+    - current_price:   最新市价
+    - market_value:    最新市值
+    - pnl / pnl_pct:  盈亏
+
+    合并逻辑：
+    - broker 有的股票 → 覆盖 shares/cost/price/sellable
+    - broker 没有但 portfolio.json 有 → 说明已清仓，移除
+    - buy_date / sector / strategy_tag 保留 portfolio.json 里的（broker 不返回这些）
+    """
+    if os.getenv("BROKER_ENABLED", "false").lower() not in ("true", "1", "yes"):
+        return portfolio
+
+    try:
+        from src.broker import get_broker
+        broker = get_broker()
+        if not broker or not broker.is_connected():
+            logger.debug("[持仓同步] broker 未连接，跳过")
+            return portfolio
+    except Exception as e:
+        logger.debug(f"[持仓同步] broker 初始化失败: {e}")
+        return portfolio
+
+    try:
+        positions = broker.get_positions()
+        balance = broker.get_balance()
+    except Exception as e:
+        logger.warning(f"[持仓同步] 获取持仓/资金失败: {e}")
+        return portfolio
+
+    if not positions and not balance:
+        return portfolio
+
+    # 建立旧持仓索引（保留 buy_date 等元数据）
+    old_map = {h["code"]: h for h in portfolio.get("holdings", [])}
+
+    # 以 broker 数据为准重建 holdings
+    new_holdings = []
+    total_mv = 0
+    for pos in positions:
+        if pos.shares <= 0:
+            continue
+        old = old_map.get(pos.code, {})
+        h = {
+            "code": pos.code,
+            "name": pos.name or old.get("name", pos.code),
+            "shares": pos.shares,
+            "sellable_shares": pos.sellable_shares,
+            "cost_price": pos.cost_price,
+            "current_price": pos.current_price,
+            "market_value": pos.market_value,
+            "pnl_pct": pos.pnl_pct,
+            # 保留 portfolio.json 的元数据（broker 不返回这些）
+            "sector": old.get("sector", ""),
+            "buy_date": old.get("buy_date", ""),
+            "strategy_tag": old.get("strategy_tag", ""),
+        }
+        new_holdings.append(h)
+        total_mv += pos.market_value
+
+    # 记录变化
+    old_codes = set(old_map.keys())
+    new_codes = {p.code for p in positions if p.shares > 0}
+    removed = old_codes - new_codes
+    added = new_codes - old_codes
+    if removed:
+        logger.info(f"[持仓同步] 已清仓（从broker确认）: {removed}")
+    if added:
+        logger.info(f"[持仓同步] 新增持仓（从broker确认）: {added}")
+
+    # 更新 portfolio
+    portfolio["holdings"] = new_holdings
+    if balance:
+        portfolio["cash"] = balance.cash
+        portfolio["total_asset"] = balance.total_asset
+    else:
+        portfolio["total_asset"] = round(total_mv + portfolio.get("cash", 0), 2)
+    portfolio["actual_position_ratio"] = (
+        round(total_mv / portfolio["total_asset"], 4)
+        if portfolio["total_asset"] > 0 else 0
+    )
+
+    # 对比后有变化才记录
+    changed_count = 0
+    for h in new_holdings:
+        old = old_map.get(h["code"], {})
+        if (old.get("shares", 0) != h["shares"]
+                or abs(old.get("current_price", 0) - h["current_price"]) > 0.001):
+            changed_count += 1
+            logger.info(
+                f"  [broker→portfolio] {h['name']}({h['code']}): "
+                f"股数{old.get('shares',0)}→{h['shares']} "
+                f"可卖{h['sellable_shares']} "
+                f"价格{old.get('current_price',0):.2f}→{h['current_price']:.2f}"
+            )
+
+    if changed_count or removed or added:
+        save_portfolio(portfolio)
+        logger.info(f"[持仓同步] 已从broker刷新 {len(new_holdings)} 只持仓，{changed_count} 只有变化")
+    else:
+        logger.debug("[持仓同步] broker数据与本地一致，无需更新")
+
+    return portfolio
+
 def save_portfolio(portfolio: dict):
     """保存持仓到本地"""
     p = Path(PORTFOLIO_FILE)

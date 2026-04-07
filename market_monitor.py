@@ -316,7 +316,41 @@ def check_market_anomaly(
 # 4. 推送
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def _get_current_holdings() -> list:
-    """从持仓数据库获取当前持仓（供风控检查用）。"""
+    """获取当前持仓（供风控检查用）。优先从 broker 真实持仓获取。"""
+    # 第一优先级：broker 真实持仓（最准确）
+    try:
+        if os.getenv("BROKER_ENABLED", "false").lower() in ("true", "1", "yes"):
+            from src.broker import get_broker
+            broker = get_broker()
+            if broker and broker.is_connected():
+                positions = broker.get_positions()
+                if positions:
+                    # 从 portfolio.json 补充 buy_date（broker 不返回）
+                    buy_dates = {}
+                    try:
+                        from portfolio_manager import load_portfolio
+                        for h in load_portfolio().get("holdings", []):
+                            buy_dates[h.get("code", "")] = h.get("buy_date", "")
+                    except Exception:
+                        pass
+                    return [
+                        {
+                            "code": p.code,
+                            "name": p.name,
+                            "cost_price": p.cost_price,
+                            "current_price": p.current_price,
+                            "shares": p.shares,
+                            "sellable_shares": p.sellable_shares,
+                            "buy_date": buy_dates.get(p.code, ""),
+                            "pnl_pct": p.pnl_pct,
+                            "market_value": p.market_value,
+                        }
+                        for p in positions if p.shares > 0
+                    ]
+    except Exception:
+        pass
+
+    # 第二优先级：数据库
     try:
         from src.storage import get_engine
         from sqlalchemy import text
@@ -330,7 +364,8 @@ def _get_current_holdings() -> list:
             return [dict(r._mapping) for r in rows]
     except Exception:
         pass
-    # 备用：从 trade_journal 推算持仓
+
+    # 第三优先级：trade_journal 推算
     try:
         from trade_journal import _conn
         conn = _conn()
@@ -351,6 +386,109 @@ def _get_current_holdings() -> list:
         return [dict(r) for r in rows] if rows else []
     except Exception:
         return []
+
+
+def _collect_intraday_ticks_and_check_targets(today: str, executed_set: set):
+    """盘中分时采集 + AI目标价实时检测。
+
+    每次调用：
+    1. 获取所有持仓股的实时行情
+    2. 写入分时数据库（intraday_ticks 表）
+    3. 检测是否触及 AI 目标价 → 自动止盈/止损
+       （严格 T+1：只卖 sellable_shares > 0 的部分）
+    """
+    from macro_data_collector import _stock_code_to_tencent
+
+    # 获取持仓股代码 + 当日交易股代码
+    watch_codes = set()
+    name_map = {}
+
+    # 优先从 broker 获取真实持仓
+    try:
+        if os.getenv("BROKER_ENABLED", "false").lower() in ("true", "1", "yes"):
+            from src.broker import get_broker
+            broker = get_broker()
+            if broker and broker.is_connected():
+                for pos in broker.get_positions():
+                    if pos.code and pos.shares > 0:
+                        watch_codes.add(pos.code)
+                        name_map[pos.code] = pos.name
+    except Exception:
+        pass
+
+    # 兜底：从 portfolio.json 补充
+    if not watch_codes:
+        try:
+            from portfolio_manager import load_portfolio
+            portfolio = load_portfolio()
+            for h in portfolio.get("holdings", []):
+                code = h.get("code", "")
+                if code:
+                    watch_codes.add(code)
+                    name_map[code] = h.get("name", "")
+        except Exception:
+            pass
+
+    # AI 目标价中的股票
+    try:
+        from src.broker.price_target_store import load_price_targets
+        targets = load_price_targets()
+        for code, info in targets.items():
+            watch_codes.add(code)
+            if code not in name_map:
+                name_map[code] = info.get("name", "")
+    except Exception:
+        pass
+
+    if not watch_codes:
+        return
+
+    # 批量获取行情
+    tc_codes = [_stock_code_to_tencent(c) for c in watch_codes]
+    quotes = _fetch_quotes_cached(tc_codes, timeout=8, ttl_seconds=3.0)
+    if not quotes:
+        return
+
+    # 写入分时数据库
+    try:
+        from src.broker.intraday_tracker import record_ticks_batch
+        count = record_ticks_batch(today, quotes, name_map)
+        if count:
+            logger.debug(f"[分时] 采集 {count} 条")
+    except Exception as e:
+        logger.debug(f"[分时] 写入失败: {e}")
+
+    # AI 目标价检测 + 自动执行
+    if os.getenv("AUTO_TAKE_PROFIT", "false").lower() not in ("true", "1", "yes"):
+        return
+    if os.getenv("BROKER_ENABLED", "false").lower() not in ("true", "1", "yes"):
+        return
+
+    try:
+        from src.broker import get_broker
+        broker = get_broker()
+        if not broker or not broker.is_connected():
+            return
+        positions = broker.get_positions()
+        if not positions:
+            return
+    except Exception:
+        return
+
+    try:
+        from src.broker.intraday_tracker import check_targets_and_execute
+        results = check_targets_and_execute(positions, today, executed_set)
+        for r in results:
+            label = "AI止盈" if r["trigger"] == "take_profit" else "AI止损"
+            status = "成功" if r["success"] else "失败"
+            msg = (
+                f"{'✅' if r['success'] else '⚠️'} {label}{status}\n"
+                f"{r['name']}({r['code']}) {r['shares']}股 @ {r['price']:.2f}\n"
+                f"{r['detail']}"
+            )
+            send_alert(msg)
+    except Exception as e:
+        logger.debug(f"[目标价检测] 异常: {e}")
 
 
 def _auto_execute_risk_alerts(alerts, holdings, today, executed_set):
@@ -2094,6 +2232,12 @@ def run_monitor_loop(interval_minutes: int = 10, auto_rebalance: bool = True):
             except Exception as e:
                 logger.error(f"盘中检查失败: {e}")
 
+            # ── 分时价格采集 + AI 目标价监控 ──
+            try:
+                _collect_intraday_ticks_and_check_targets(today, after_close_done)
+            except Exception as e:
+                logger.debug(f"分时采集跳过: {e}")
+
             # ── 风控检查：止损/止盈/持仓天数（去重，每只股票每级别只报一次）──
             try:
                 from risk_control import check_stop_loss, format_risk_alerts
@@ -2140,6 +2284,35 @@ def run_monitor_loop(interval_minutes: int = 10, auto_rebalance: bool = True):
                 save_sector_flow_batch(hy, "hy", today)
             except Exception as e:
                 logger.warning(f"收盘数据积累失败: {e}")
+
+            # 1b. 分时峰值统计（对比执行价 vs 日内最优价）
+            try:
+                from src.broker.intraday_tracker import generate_daily_peak_stats
+                peak_stats = generate_daily_peak_stats(today)
+                if peak_stats:
+                    logger.info(f"[峰值统计] 已生成 {len(peak_stats)} 条日内统计")
+                    for ps in peak_stats:
+                        if ps.get("executed_price", 0) > 0:
+                            d = ps["executed_direction"]
+                            label = "买" if d == "buy" else "卖"
+                            gap = ps["price_vs_low_pct"] if d == "buy" else ps["price_vs_high_pct"]
+                            logger.info(
+                                f"  {ps['name']}({ps['code']}) {label}@{ps['executed_price']:.2f} | "
+                                f"日高{ps['day_high']:.2f}({ps['high_time']}) "
+                                f"日低{ps['day_low']:.2f}({ps['low_time']}) "
+                                f"偏差{gap:+.1f}%"
+                            )
+            except Exception as e:
+                logger.debug(f"峰值统计跳过: {e}")
+
+            # 1c. 盘后复盘笔记（AI分析当日盈亏原因）
+            try:
+                from src.core.trade_review import run_trade_review
+                review = run_trade_review(trade_date=today, send_notification=True)
+                if review:
+                    logger.info(f"[复盘] 复盘笔记已生成")
+            except Exception as e:
+                logger.warning(f"复盘笔记生成失败: {e}")
 
             # 2. 回测历史扫描结果
             try:
