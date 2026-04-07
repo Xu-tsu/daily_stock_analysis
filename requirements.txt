@@ -67,3 +67,6 @@ jinja2>=3.1.0               # Jinja2 template engine for report rendering
 fastapi>=0.109.0            # 现代 Python Web 框架
 uvicorn[standard]>=0.27.0   # ASGI 服务器
 python-multipart>=0.0.6     # FastAPI File/Form upload support
+
+# 券商自动交易（模拟盘/实盘）
+easytrader>=0.24.0          # 同花顺/东方财富 Win32 自动化下单

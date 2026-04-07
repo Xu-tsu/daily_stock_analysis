@@ -26,13 +26,14 @@ logger = logging.getLogger(__name__)
 # 核心参数
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# 止损 / 止盈
-HARD_STOP_LOSS_PCT = -5.0          # 高优先级风险复核线，不再代表无条件清仓
-FORCE_EXIT_LOSS_PCT = -8.0         # 强制退出线，原则上不再保留底仓
-TRAILING_STOP_TRIGGER = 3.0        # 盈利 3% 后进入保本保护
-TRAILING_STOP_PCT = 0.0            # 移动止损线 = 成本价（保本出）
-TAKE_PROFIT_HALF_PCT = 8.0         # 盈利 8% 减仓一半
-TAKE_PROFIT_FULL_PCT = 15.0        # 盈利 15% 全部止盈
+# 止损 / 止盈（可通过 .env 同名变量覆盖）
+import os as _os
+HARD_STOP_LOSS_PCT = float(_os.getenv("HARD_STOP_LOSS_PCT", "-5"))
+FORCE_EXIT_LOSS_PCT = float(_os.getenv("FORCE_EXIT_LOSS_PCT", "-8"))
+TRAILING_STOP_TRIGGER = float(_os.getenv("TRAILING_STOP_TRIGGER", "3"))
+TRAILING_STOP_PCT = float(_os.getenv("TRAILING_STOP_PCT", "0"))
+TAKE_PROFIT_HALF_PCT = float(_os.getenv("TAKE_PROFIT_HALF_PCT", "8"))
+TAKE_PROFIT_FULL_PCT = float(_os.getenv("TAKE_PROFIT_FULL_PCT", "15"))
 
 # 持仓天数
 HOLD_DAYS_WARNING = 3              # 超过 3 天开始降级看待

@@ -26,6 +26,10 @@ from src.langgraph.nodes.rebalance import (
 )
 from src.langgraph.nodes.chat import chat_node, strategy_node
 from src.langgraph.nodes.portfolio_update import update_portfolio_node
+from src.langgraph.nodes.broker_commands import (
+    broker_sync_node, broker_quality_node,
+    broker_halt_node, broker_resume_node,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +56,10 @@ def route_intent(state: dict) -> str:
         "trade_history": "trade_history",
         "strategy": "strategy",
         "update_portfolio": "update_portfolio",
+        "broker_sync": "broker_sync",
+        "broker_quality": "broker_quality",
+        "broker_halt": "broker_halt",
+        "broker_resume": "broker_resume",
         "alert": "chat",      # 暂时用chat处理
         "mainline": "chat",   # 暂时用chat处理
         "chat": "chat",
@@ -129,6 +137,10 @@ def build_portfolio_graph() -> StateGraph:
     graph.add_node("analyze", analyze_stock_node)
     graph.add_node("strategy", strategy_node)
     graph.add_node("update_portfolio", update_portfolio_node)
+    graph.add_node("broker_sync", broker_sync_node)
+    graph.add_node("broker_quality", broker_quality_node)
+    graph.add_node("broker_halt", broker_halt_node)
+    graph.add_node("broker_resume", broker_resume_node)
     graph.add_node("chat", chat_node)
 
     # 入口
@@ -157,6 +169,10 @@ def build_portfolio_graph() -> StateGraph:
         "trade_history": "trade_history",
         "strategy": "strategy",
         "update_portfolio": "update_portfolio",
+        "broker_sync": "broker_sync",
+        "broker_quality": "broker_quality",
+        "broker_halt": "broker_halt",
+        "broker_resume": "broker_resume",
         "chat": "chat",
         "end": END,
     })
@@ -169,6 +185,10 @@ def build_portfolio_graph() -> StateGraph:
     graph.add_edge("analyze", END)
     graph.add_edge("strategy", END)
     graph.add_edge("update_portfolio", END)
+    graph.add_edge("broker_sync", END)
+    graph.add_edge("broker_quality", END)
+    graph.add_edge("broker_halt", END)
+    graph.add_edge("broker_resume", END)
     graph.add_edge("chat", END)
 
     # 交易流程: risk_check → confirm → (等待) → execute_trade → END

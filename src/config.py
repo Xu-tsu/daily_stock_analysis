@@ -1299,32 +1299,38 @@ class Config:
         """
         model_list: List[Dict[str, Any]] = []
 
+        # 从环境变量获取实际模型名（避免 litellm Router 拒绝占位名）
+        _primary_model = os.getenv("LITELLM_MODEL", "gemini/gemini-2.5-flash")
+        _gemini_model = _primary_model if "gemini" in _primary_model else "gemini/gemini-2.5-flash"
+        _anthropic_model = _primary_model if "claude" in _primary_model else "anthropic/claude-sonnet-4-20250514"
+        _openai_model = _primary_model if ("gpt" in _primary_model or "openai" in _primary_model) else "openai/gpt-4o-mini"
+
         # Gemini keys
         for k in gemini_keys:
             if k and len(k) >= 8:
                 model_list.append({
-                    'model_name': '__legacy_gemini__',
-                    'litellm_params': {'model': '__legacy_gemini__', 'api_key': k},
+                    'model_name': _gemini_model,
+                    'litellm_params': {'model': _gemini_model, 'api_key': k},
                 })
 
         # Anthropic keys
         for k in anthropic_keys:
             if k and len(k) >= 8:
                 model_list.append({
-                    'model_name': '__legacy_anthropic__',
-                    'litellm_params': {'model': '__legacy_anthropic__', 'api_key': k},
+                    'model_name': _anthropic_model,
+                    'litellm_params': {'model': _anthropic_model, 'api_key': k},
                 })
 
         # OpenAI-compatible keys
         for k in openai_keys:
             if k and len(k) >= 8:
-                params: Dict[str, Any] = {'model': '__legacy_openai__', 'api_key': k}
+                params: Dict[str, Any] = {'model': _openai_model, 'api_key': k}
                 if openai_base_url:
                     params['api_base'] = openai_base_url
                 if openai_base_url and 'aihubmix.com' in openai_base_url:
                     params['extra_headers'] = {'APP-Code': 'GPIJ3886'}
                 model_list.append({
-                    'model_name': '__legacy_openai__',
+                    'model_name': _openai_model,
                     'litellm_params': params,
                 })
 

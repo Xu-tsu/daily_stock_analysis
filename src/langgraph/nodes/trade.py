@@ -1,10 +1,17 @@
 """
 交易节点 — 买入/卖出/清仓 + 风控检查 + 确认工作流
+
+券商集成:
+  BROKER_ENABLED=true 时，确认后先在 THS 模拟盘下单，
+  成交后才更新本地 portfolio.json，保证本地/远程一致。
 """
 import logging
+import os
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+BROKER_ENABLED = os.getenv("BROKER_ENABLED", "false").lower() == "true"
 
 
 def _get_stock_name(code: str) -> str:
@@ -144,8 +151,57 @@ def request_confirmation_node(state: dict) -> dict:
     }
 
 
+def _execute_via_broker(code: str, name: str, action: str, shares: int, price: float) -> dict:
+    """通过券商执行交易，返回 {"success": bool, "result": OrderResult, "message": str}"""
+    try:
+        from src.broker import get_broker
+        from src.broker.safety import check_order_allowed
+
+        broker = get_broker()
+        if not broker or not broker.is_connected():
+            return {"success": False, "result": None,
+                    "message": "券商未连接，仅更新本地持仓"}
+
+        # 安全检查
+        safety = check_order_allowed(code, price, shares, total_asset=0)
+        if not safety.get("allowed", True):
+            return {"success": False, "result": None,
+                    "message": f"安全限制: {safety.get('reason', '未知')}"}
+
+        if action == "buy":
+            result = broker.buy(code, price, shares)
+        else:
+            result = broker.sell(code, price, shares)
+
+        # 记录执行质量
+        try:
+            from src.broker.execution_tracker import record_execution
+            record_execution(result, session_id="langgraph", mode="broker+local")
+        except Exception as e:
+            logger.warning(f"记录执行质量失败: {e}")
+
+        if result.is_success:
+            return {"success": True, "result": result,
+                    "message": f"券商成交: {result.actual_shares}股@{result.actual_price:.2f}"}
+        else:
+            return {"success": False, "result": result,
+                    "message": f"券商拒绝: {result.message}"}
+
+    except ImportError:
+        return {"success": False, "result": None, "message": "券商模块未安装"}
+    except Exception as e:
+        logger.error(f"券商执行异常: {e}")
+        return {"success": False, "result": None, "message": f"券商异常: {e}"}
+
+
 def execute_trade_node(state: dict) -> dict:
-    """执行交易 — 仅在确认后触发"""
+    """执行交易 — 仅在确认后触发
+
+    BROKER_ENABLED=true 时:
+      1. 先在 THS 模拟盘下单
+      2. 成交后用实际成交价更新本地 portfolio
+      3. 券商拒绝则不更新本地，返回错误
+    """
     confirmed = state.get("confirmed")
     if not confirmed:
         return {"response": "已取消操作。"}
@@ -160,6 +216,33 @@ def execute_trade_node(state: dict) -> dict:
     action = trade.get("action", "")
     shares = trade.get("shares", 0)
     price = trade.get("price", 0)
+
+    # ── 券商执行（如果启用）──
+    broker_msg = ""
+    broker_order_result = None
+    if BROKER_ENABLED:
+        broker_ret = _execute_via_broker(code, name, action, shares, price)
+        broker_msg = broker_ret["message"]
+        if broker_ret.get("result"):
+            broker_order_result = broker_ret["result"].to_dict()
+        if broker_ret["success"]:
+            # 用实际成交价替换请求价
+            actual = broker_ret["result"]
+            if actual.actual_price > 0:
+                price = actual.actual_price
+            if actual.actual_shares > 0:
+                shares = actual.actual_shares
+            logger.info(f"[券商] 成交: {name} {action} {shares}股@{price}")
+        else:
+            # 券商拒绝 → 不更新本地
+            if broker_ret.get("result") and broker_ret["result"].status == "rejected":
+                return {
+                    "response": f"⛔ 券商拒绝下单: {broker_msg}",
+                    "pending_confirmation": False,
+                    "broker_order_result": broker_order_result,
+                }
+            # 其他失败（断连等）→ 仅本地记账 + 提示
+            broker_msg = f"\n⚠️ {broker_msg}，仅本地记账"
 
     try:
         from portfolio_manager import load_portfolio, save_portfolio
@@ -202,9 +285,10 @@ def execute_trade_node(state: dict) -> dict:
             _log_trade(code, name, "buy", shares, price)
 
             return {
-                "response": f"✅ 已买入 {name}({code}) {shares}股 × {price:.2f}元 = {shares*price:,.0f}元",
+                "response": f"✅ 已买入 {name}({code}) {shares}股 × {price:.2f}元 = {shares*price:,.0f}元{broker_msg}",
                 "portfolio": portfolio,
                 "pending_confirmation": False,
+                "broker_order_result": broker_order_result,
             }
 
         elif action in ("sell", "clear"):
@@ -223,10 +307,11 @@ def execute_trade_node(state: dict) -> dict:
                         return {
                             "response": (
                                 f"✅ 已清仓 {name}({code}) {h['shares']}股 × {price:.2f}元\n"
-                                f"{emoji} 盈亏: {pnl:+,.0f}元"
+                                f"{emoji} 盈亏: {pnl:+,.0f}元{broker_msg}"
                             ),
                             "portfolio": portfolio,
                             "pending_confirmation": False,
+                            "broker_order_result": broker_order_result,
                         }
                     else:
                         # 部分卖
@@ -241,10 +326,11 @@ def execute_trade_node(state: dict) -> dict:
                         return {
                             "response": (
                                 f"✅ 已卖出 {name}({code}) {sell_shares}股 × {price:.2f}元\n"
-                                f"{emoji} 盈亏: {pnl:+,.0f}元 | 剩余{h['shares']}股"
+                                f"{emoji} 盈亏: {pnl:+,.0f}元 | 剩余{h['shares']}股{broker_msg}"
                             ),
                             "portfolio": portfolio,
                             "pending_confirmation": False,
+                            "broker_order_result": broker_order_result,
                         }
             return {"response": f"未找到 {code} 的持仓。", "pending_confirmation": False}
 

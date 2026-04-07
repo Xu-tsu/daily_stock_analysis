@@ -14,6 +14,7 @@ LLM 调用方式:
   根据 .env 中的 LITELLM_MODEL / LITELLM_FALLBACK_MODELS 路由。
 """
 import json, logging, os, time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -359,6 +360,87 @@ def _call_cloud_llm(prompt: str, agent_name: str = "", return_model: bool = Fals
         f"{agent_name}_本地回退",
         return_model=return_model,
     )
+
+
+def _call_scan_llm(prompt: str, agent_name: str = "", return_model: bool = False):
+    """
+    持仓扫描用 LLM — 根据 REBALANCE_SCAN_USE_CLOUD 决定走云端还是本地。
+    云端（Gemini）: 5-15s/股，支持并发，适合多只持仓并行分析。
+    本地（Ollama）: 100-260s/股，单GPU串行，适合省钱但慢。
+    """
+    use_cloud = os.getenv("REBALANCE_SCAN_USE_CLOUD", "true").lower() in ("true", "1", "yes")
+    if use_cloud:
+        return _call_cloud_llm(prompt, agent_name, return_model=return_model)
+    return _call_local_llm(prompt, agent_name, return_model=return_model)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 即时卖出 — 分析一只、执行一只
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _should_immediate_sell(rating: dict, holding: dict) -> bool:
+    """判断是否应该立即卖出（不等辩论）
+
+    触发条件（满足任一，阈值可通过 .env 配置）：
+    - rating.action 明确为 "sell" 且 score <= IMMEDIATE_SELL_SCORE（默认30）
+    - rating.risk_level 为 "high" 且 pnl_pct < IMMEDIATE_SELL_LOSS_PCT（默认-5%）
+    - rating 包含止损建议
+    """
+    # 可配置阈值
+    sell_score = float(os.getenv("IMMEDIATE_SELL_SCORE", "30"))
+    sell_loss_pct = float(os.getenv("IMMEDIATE_SELL_LOSS_PCT", "-5"))
+
+    action = str(rating.get("action", "")).lower()
+    score = rating.get("score", 50)
+    try:
+        score = float(score)
+    except (ValueError, TypeError):
+        score = 50
+    risk = str(rating.get("risk_level", "")).lower()
+
+    if action == "sell" and score <= sell_score:
+        return True
+    if risk == "high" and float(holding.get("pnl_pct", 0) or 0) < sell_loss_pct:
+        return True
+    reason = str(rating.get("reason", ""))
+    if "止损" in reason:
+        return True
+    return False
+
+
+def _immediate_sell(holding, rating, broker, total_asset, results_list):
+    """立即执行卖出操作（不等辩论完成）"""
+    code = holding["code"]
+    name = holding.get("name", code)
+    shares = int(holding.get("sellable_shares", holding.get("shares", 0)) or 0)
+    price = float(holding.get("current_price", 0) or 0)
+
+    if not broker or shares <= 0 or price <= 0:
+        logger.warning(f"[即时卖出] {name}({code}) 跳过: broker={bool(broker)} shares={shares} price={price}")
+        return
+
+    from src.broker.safety import check_order_allowed, increment_order_count
+    allowed, reason = check_order_allowed(code, price, shares, total_asset)
+    if not allowed:
+        logger.warning(f"[即时卖出] {name} 安全限制: {reason}")
+        return
+
+    score = rating.get("score", "?")
+    sell_reason = str(rating.get("reason", ""))[:50]
+    logger.info(
+        f"[即时卖出] {name}({code}) {shares}股 @ {price:.2f} "
+        f"(评分:{score}, 原因:{sell_reason})"
+    )
+
+    result = broker.sell(code, round(price, 2), shares)
+    result.name = name
+    results_list.append(result)
+
+    if result.is_success:
+        increment_order_count()
+        logger.info(f"[即时卖出] {name} 成功: {result.message}")
+    else:
+        logger.warning(f"[即时卖出] {name} 失败: {result.message}")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1668,7 +1750,7 @@ def run_rebalance_analysis(config: Config = None) -> dict:
         sensitive_news=json.dumps(sensitive_news, ensure_ascii=False, indent=2),
         trump_news=json.dumps(trump_news, ensure_ascii=False, indent=2),
     )
-    market_judge_raw, market_model_used = _call_local_llm(
+    market_judge_raw, market_model_used = _call_scan_llm(
         prompt_market,
         "Agent1_大盘",
         return_model=True,
@@ -1695,7 +1777,7 @@ def run_rebalance_analysis(config: Config = None) -> dict:
         ),
         holding_sectors=json.dumps(holding_sectors, ensure_ascii=False),
     )
-    sector_judge_raw, sector_model_used = _call_local_llm(
+    sector_judge_raw, sector_model_used = _call_scan_llm(
         prompt_sector,
         "Agent2_板块",
         return_model=True,
@@ -1715,7 +1797,7 @@ def run_rebalance_analysis(config: Config = None) -> dict:
                 market_judge=json.dumps(market_judge, ensure_ascii=False, indent=2),
                 sentiment_data=json.dumps(sentiment_data, ensure_ascii=False, indent=2),
             )
-            sentiment_raw, sentiment_model_used = _call_local_llm(
+            sentiment_raw, sentiment_model_used = _call_scan_llm(
                 prompt_sentiment, "Agent2b_分析师", return_model=True,
             )
             sentiment_analysis = _parse_llm_json(sentiment_raw)
@@ -1736,16 +1818,33 @@ def run_rebalance_analysis(config: Config = None) -> dict:
             "Step3b_情绪分析", "Agent2b_分析师", error=e,
         ))
 
-    # ── Step 4: Agent 3 — 逐只持仓扫描（本地LLM）──
-    logger.info("\n[Step 4/5] Agent 3: 持仓个股扫描（本地模型）...")
+    # ── 即时卖出: 初始化broker（分析一只、执行一只）──
+    immediate_results = []
+    _immediate_broker = None
+    if os.getenv("BROKER_ENABLED", "false").lower() == "true":
+        try:
+            from src.broker import get_broker as _get_broker_fn
+            _immediate_broker = _get_broker_fn()
+            if _immediate_broker and not _immediate_broker.is_connected():
+                _immediate_broker = None
+            if _immediate_broker:
+                logger.info("[即时卖出] broker已连接，高风险持仓将立即卖出")
+        except Exception:
+            pass
+    total_asset = portfolio.get("total_asset", 0)
+
+    # ── Step 4: Agent 3 — 逐只持仓扫描（并行）──
+    scan_cloud = os.getenv("REBALANCE_SCAN_USE_CLOUD", "true").lower() in ("true", "1", "yes")
+    scan_mode = "云端并行" if scan_cloud else "本地串行"
+    logger.info(f"\n[Step 4/5] Agent 3: 持仓个股扫描（{scan_mode}）...")
     holdings_ratings = []
 
-    for h in portfolio.get("holdings", []):
+    def _scan_one_holding(h):
+        """扫描单只持仓（线程安全，可并行）"""
         code = h["code"]
         name = h.get("name", code)
         logger.info(f"  分析 {name}({code})...")
 
-        # 用腾讯行情+同花顺数据替代原项目的 analyze_stock（避免额外LLM调用）
         stock_analysis_text = "暂无已有分析数据"
         comment = macro_data.get("stock_comments", {}).get(code, {})
         if comment:
@@ -1762,7 +1861,6 @@ def run_rebalance_analysis(config: Config = None) -> dict:
         nb_holding = macro_data.get("northbound_holdings", {}).get(code, {})
         s_news = macro_data.get("stock_news", {}).get(code, [])[:3]
 
-        # K线趋势 + 筹码分布 + 盈亏回本预测
         tech_data = _fetch_holding_technical(code, cost_price=h.get("cost_price", 0))
 
         prompt_holding = PROMPT_HOLDING_SCAN.format(
@@ -1778,72 +1876,157 @@ def run_rebalance_analysis(config: Config = None) -> dict:
             profitability_forecast=json.dumps(tech_data.get("profitability_forecast", {}), ensure_ascii=False, indent=2),
             code=code, name=name,
         )
-        rating_raw, _ = _call_local_llm(
+        rating_raw, _ = _call_scan_llm(
             prompt_holding,
             f"Agent3_{name}",
             return_model=True,
         )
         rating = _parse_llm_json(rating_raw)
         _save_agent_local_sample(f"agent3_{code}", prompt_holding, rating_raw, rating)
+        return code, name, rating
 
-        if rating:
-            holdings_ratings.append(rating)
-            logger.info(
-                f"  → {name}: {rating.get('rating', 'N/A')} "
-                f"(得分: {rating.get('score', 'N/A')})"
-            )
-        else:
-            logger.warning(f"  → {name}: 分析结果解析失败")
-            degradation_log.append(_make_degradation_entry(
-                "Step4_持仓扫描", f"Agent3_{name}", severity="warning",
-                reason=f"{name}({code}) 持仓扫描结果解析失败，该股缺少技术评级",
-                fix="1) 检查本地模型是否正常: ollama ps\n"
-                    "2) 模型可能返回非JSON，查看日志中 Agent3 原始返回\n"
-                    "3) 考虑简化 PROMPT_HOLDING_SCAN 模板",
-            ))
+    # 云端用并行（最多6线程），本地用串行（单GPU无法并发）
+    max_workers = int(os.getenv("REBALANCE_SCAN_WORKERS", "6")) if scan_cloud else 1
+    holdings_list = portfolio.get("holdings", [])
 
-    # ── Step 4b: Agent 3b — 研究员：基本面扫描 ──
-    logger.info("\n[Step 4b] Agent 3b: 研究员（基本面扫描）...")
+    # 构建 code→holding 映射（即时卖出需要持仓信息）
+    _holdings_by_code = {h["code"]: h for h in holdings_list}
+
+    if max_workers > 1 and len(holdings_list) > 1:
+        t0 = time.time()
+        # 并行分析，收集结果后串行检查即时卖出（broker不是线程安全的）
+        _immediate_sell_candidates = []
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(_scan_one_holding, h): h for h in holdings_list}
+            for future in as_completed(futures):
+                try:
+                    code, name, rating = future.result()
+                    if rating:
+                        holdings_ratings.append(rating)
+                        logger.info(f"  → {name}: {rating.get('rating', 'N/A')} (得分: {rating.get('score', 'N/A')})")
+                        # 标记即时卖出候选
+                        h = _holdings_by_code.get(code, {})
+                        if _immediate_broker and h and _should_immediate_sell(rating, h):
+                            _immediate_sell_candidates.append((h, rating))
+                    else:
+                        logger.warning(f"  → {name}: 分析结果解析失败")
+                        degradation_log.append(_make_degradation_entry(
+                            "Step4_持仓扫描", f"Agent3_{name}", severity="warning",
+                            reason=f"{name}({code}) 持仓扫描结果解析失败",
+                            fix="1) 检查云端API配额\n2) 查看日志中 Agent3 原始返回",
+                        ))
+                except Exception as e:
+                    h = futures[future]
+                    logger.error(f"  → {h.get('name', h['code'])}: 并行扫描异常: {e}")
+                    degradation_log.append(_make_degradation_entry(
+                        "Step4_持仓扫描", f"Agent3_{h.get('name', h['code'])}", error=e,
+                    ))
+        logger.info(f"  并行扫描完成: {len(holdings_ratings)}/{len(holdings_list)}只 耗时{time.time()-t0:.1f}s")
+
+        # 串行执行即时卖出
+        for h, rating in _immediate_sell_candidates:
+            _immediate_sell(h, rating, _immediate_broker, total_asset, immediate_results)
+    else:
+        for h in holdings_list:
+            try:
+                code, name, rating = _scan_one_holding(h)
+                if rating:
+                    holdings_ratings.append(rating)
+                    logger.info(f"  → {name}: {rating.get('rating', 'N/A')} (得分: {rating.get('score', 'N/A')})")
+                    # 即时卖出：分析完一只，立即执行
+                    if _immediate_broker and _should_immediate_sell(rating, h):
+                        _immediate_sell(h, rating, _immediate_broker, total_asset, immediate_results)
+                else:
+                    logger.warning(f"  → {name}: 分析结果解析失败")
+                    degradation_log.append(_make_degradation_entry(
+                        "Step4_持仓扫描", f"Agent3_{name}", severity="warning",
+                        reason=f"{name}({code}) 持仓扫描结果解析失败",
+                        fix="1) 检查本地模型是否正常: ollama ps\n"
+                            "2) 模型可能返回非JSON，查看日志中 Agent3 原始返回\n"
+                            "3) 考虑简化 PROMPT_HOLDING_SCAN 模板",
+                    ))
+            except Exception as e:
+                logger.error(f"  → {h.get('name', h['code'])}: 扫描异常: {e}")
+                degradation_log.append(_make_degradation_entry(
+                    "Step4_持仓扫描", f"Agent3_{h.get('name', h['code'])}", error=e,
+                ))
+
+    # ── Step 4b: Agent 3b — 研究员：基本面扫描（并行）──
+    logger.info(f"\n[Step 4b] Agent 3b: 研究员（基本面扫描, {scan_mode}）...")
     fundamental_ratings = []
     fundamental_model_used = "skipped"
-    for h in portfolio.get("holdings", []):
+
+    # 构建 holdings_ratings 快速查找表
+    _ratings_by_code = {r.get("code"): r for r in holdings_ratings if r.get("code")}
+
+    def _scan_one_fundamental(h):
+        """扫描单只持仓基本面（线程安全）"""
         code = h["code"]
         name = h.get("name", code)
         fund_data = macro_data.get("holdings_fundamental", {}).get(code, {})
         if not fund_data or not fund_data.get("source_chain"):
-            logger.info(f"  {name}: 无基本面数据，跳过")
-            continue
-        try:
-            # 找到技术面评级摘要
-            tech_summary = "暂无"
-            for tr in holdings_ratings:
-                if tr.get("code") == code:
-                    tech_summary = (
-                        f"评级:{tr.get('rating','N/A')}, "
-                        f"得分:{tr.get('score','N/A')}, "
-                        f"趋势:{tr.get('trend_assessment','N/A')}"
-                    )
-                    break
+            return code, name, None, "no_data"
 
-            prompt_fund = PROMPT_FUNDAMENTAL_SCAN.format(
-                code=code, name=name,
-                fundamental_data=json.dumps(fund_data, ensure_ascii=False, indent=2),
-                tech_rating_summary=tech_summary,
+        tr = _ratings_by_code.get(code)
+        tech_summary = "暂无"
+        if tr:
+            tech_summary = (
+                f"评级:{tr.get('rating','N/A')}, "
+                f"得分:{tr.get('score','N/A')}, "
+                f"趋势:{tr.get('trend_assessment','N/A')}"
             )
-            fund_raw, fundamental_model_used = _call_local_llm(
-                prompt_fund, f"Agent3b_研究员_{name}", return_model=True,
-            )
-            fund_rating = _parse_llm_json(fund_raw)
-            _save_agent_local_sample(f"agent3b_{code}", prompt_fund, fund_raw, fund_rating)
-            if fund_rating:
-                fundamental_ratings.append(fund_rating)
-                logger.info(f"  → {name}: {fund_rating.get('fundamental_grade', 'N/A')} "
-                            f"风险={fund_rating.get('financial_risk', 'N/A')}")
-        except Exception as e:
-            logger.warning(f"  研究员 {name} 跳过: {e}")
-            degradation_log.append(_make_degradation_entry(
-                "Step4b_基本面", f"Agent3b_研究员_{name}", error=e,
-            ))
+
+        prompt_fund = PROMPT_FUNDAMENTAL_SCAN.format(
+            code=code, name=name,
+            fundamental_data=json.dumps(fund_data, ensure_ascii=False, indent=2),
+            tech_rating_summary=tech_summary,
+        )
+        fund_raw, model_used = _call_scan_llm(
+            prompt_fund, f"Agent3b_研究员_{name}", return_model=True,
+        )
+        fund_rating = _parse_llm_json(fund_raw)
+        _save_agent_local_sample(f"agent3b_{code}", prompt_fund, fund_raw, fund_rating)
+        return code, name, fund_rating, model_used
+
+    if max_workers > 1 and len(holdings_list) > 1:
+        t0 = time.time()
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(_scan_one_fundamental, h): h for h in holdings_list}
+            for future in as_completed(futures):
+                try:
+                    code, name, fund_rating, model_used = future.result()
+                    if model_used == "no_data":
+                        logger.info(f"  {name}: 无基本面数据，跳过")
+                        continue
+                    fundamental_model_used = model_used
+                    if fund_rating:
+                        fundamental_ratings.append(fund_rating)
+                        logger.info(f"  → {name}: {fund_rating.get('fundamental_grade', 'N/A')} "
+                                    f"风险={fund_rating.get('financial_risk', 'N/A')}")
+                except Exception as e:
+                    h = futures[future]
+                    logger.warning(f"  研究员 {h.get('name', h['code'])} 跳过: {e}")
+                    degradation_log.append(_make_degradation_entry(
+                        "Step4b_基本面", f"Agent3b_研究员_{h.get('name', h['code'])}", error=e,
+                    ))
+        logger.info(f"  并行基本面完成: {len(fundamental_ratings)}只 耗时{time.time()-t0:.1f}s")
+    else:
+        for h in holdings_list:
+            try:
+                code, name, fund_rating, model_used = _scan_one_fundamental(h)
+                if model_used == "no_data":
+                    logger.info(f"  {name}: 无基本面数据，跳过")
+                    continue
+                fundamental_model_used = model_used
+                if fund_rating:
+                    fundamental_ratings.append(fund_rating)
+                    logger.info(f"  → {name}: {fund_rating.get('fundamental_grade', 'N/A')} "
+                                f"风险={fund_rating.get('financial_risk', 'N/A')}")
+            except Exception as e:
+                logger.warning(f"  研究员 {h.get('name', h['code'])} 跳过: {e}")
+                degradation_log.append(_make_degradation_entry(
+                    "Step4b_基本面", f"Agent3b_研究员_{h.get('name', h['code'])}", error=e,
+                ))
 
     # ── Step 5: 多模型辩论调仓（激进派 vs 保守派 → 仲裁）──
     logger.info("\n[Step 5/7] 多模型辩论调仓决策...")
@@ -1960,6 +2143,18 @@ def run_rebalance_analysis(config: Config = None) -> dict:
     hot_picks_json = json.dumps(hot_picks[:10], ensure_ascii=False, indent=2)
     feedback_prompt_block = _build_recent_feedback_prompt_block()
 
+    # ── 策略自改进反馈（执行质量 + 信号准确率）──
+    strategy_feedback_block = ""
+    try:
+        from src.strategy.feedback_loop import StrategyFeedbackLoop
+        fb = StrategyFeedbackLoop()
+        fb_report = fb.generate_feedback_report(days=30)
+        strategy_feedback_block = fb.format_for_llm_prompt(fb_report)
+        if strategy_feedback_block:
+            logger.info(f"[反馈环] 已注入策略反馈 ({len(strategy_feedback_block)}字)")
+    except Exception as e:
+        logger.debug(f"[反馈环] 策略反馈生成跳过: {e}")
+
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # Step 5a: 激进派（Qwen）— 提出调仓方案
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1976,6 +2171,8 @@ def run_rebalance_analysis(config: Config = None) -> dict:
     )
     if feedback_prompt_block:
         prompt_proposal = prompt_proposal + feedback_prompt_block
+    if strategy_feedback_block:
+        prompt_proposal = prompt_proposal + "\n\n" + strategy_feedback_block
     if risk_alerts_text:
         prompt_proposal = prompt_proposal + risk_alerts_text
     # 注入情绪面 + 基本面摘要
@@ -1986,11 +2183,10 @@ def run_rebalance_analysis(config: Config = None) -> dict:
 
     # Step 5a prompt 最重（含所有Agent结果+候选+风控），给予更长超时
     _proposal_timeout = int(os.getenv("REBALANCE_PROPOSAL_TIMEOUT", "360"))
-    proposal_raw, proposal_model_used = _call_local_llm(
+    proposal_raw, proposal_model_used = _call_scan_llm(
         prompt_proposal,
         "Agent4a_激进派",
         return_model=True,
-        timeout=_proposal_timeout,
     )
     proposal = _parse_llm_json(proposal_raw)
     if proposal:
@@ -2273,7 +2469,7 @@ def run_rebalance_analysis(config: Config = None) -> dict:
                     ensure_ascii=False, indent=2,
                 ),
             )
-            validator_raw, validator_model_used = _call_local_llm(
+            validator_raw, validator_model_used = _call_scan_llm(
                 prompt_validator, "Agent5_回溯验证", return_model=True,
             )
             validation = _parse_llm_json(validator_raw)
@@ -2362,5 +2558,66 @@ def run_rebalance_analysis(config: Config = None) -> dict:
         "degradation_count": len(degradation_log),
         **rebalance.get("_meta", {}),
     }
+
+    # ── 保存 AI 目标价（供盘中监控自动止盈止损）──
+    try:
+        from src.broker.price_target_store import save_price_targets
+        all_ai_actions = rebalance.get("actions", []) + rebalance.get("new_candidates", [])
+        saved_count = save_price_targets(all_ai_actions, source="rebalance")
+        if saved_count:
+            rebalance.setdefault("_meta", {})["price_targets_saved"] = saved_count
+    except Exception as e:
+        logger.debug(f"[目标价] 保存跳过: {e}")
+
+    # ── 即时卖出结果记录 ──
+    if immediate_results:
+        rebalance["_immediate_execution"] = [r.to_dict() for r in immediate_results]
+        sold_count = sum(1 for r in immediate_results if r.is_success)
+        logger.info(f"[即时卖出] 共{len(immediate_results)}笔，成功{sold_count}笔")
+
+    # ── 券商自动执行钩子 ──
+    if os.getenv("BROKER_ENABLED", "false").lower() == "true":
+        try:
+            from src.broker import get_broker
+            from src.broker.executor import RebalanceExecutor
+            broker = get_broker()
+            if broker and broker.is_connected():
+                confirm_mode = os.getenv("BROKER_CONFIRM_MODE", "confirm")
+                executor = RebalanceExecutor(broker)
+                actions = rebalance.get("actions", [])
+
+                # 跳过已通过即时卖出执行的股票
+                if immediate_results:
+                    executed_codes = {r.code for r in immediate_results if r.is_success}
+                    before_len = len(actions)
+                    actions = [a for a in actions if a.get("code") not in executed_codes]
+                    if before_len != len(actions):
+                        logger.info(f"[券商] 跳过{before_len - len(actions)}只已即时卖出的股票")
+
+                total_asset = portfolio.get("total_asset", 0)
+
+                if confirm_mode == "auto":
+                    exec_report = executor.execute(actions, mode="auto", total_asset=total_asset)
+                    rebalance["_execution"] = exec_report.to_dict()
+                    logger.info(f"[券商] 自动执行完成: {exec_report.format_summary()}")
+                elif confirm_mode == "dry_run":
+                    dry = executor._dry_run(actions, total_asset)
+                    rebalance["_execution"] = {"mode": "dry_run", "actions": dry}
+                    logger.info(f"[券商] dry_run: {len(dry)}笔模拟订单")
+                else:
+                    # confirm 模式: 只生成确认消息，不执行
+                    rebalance["_execution"] = {
+                        "mode": "confirm",
+                        "pending": True,
+                        "confirmation_message": executor.format_confirmation_message(actions),
+                    }
+                    logger.info("[券商] confirm模式: 等待飞书确认后执行")
+            else:
+                logger.info("[券商] 未连接，跳过自动执行")
+        except ImportError as e:
+            logger.warning(f"[券商] 模块导入失败: {e}")
+        except Exception as e:
+            logger.error(f"[券商] 执行钩子异常: {e}")
+            rebalance["_execution"] = {"error": str(e)}
 
     return rebalance

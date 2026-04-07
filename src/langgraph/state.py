@@ -50,5 +50,10 @@ class PortfolioGraphState(TypedDict):
     # ── 数据快照 ──
     portfolio: Optional[dict]     # 当前持仓（每次图调用开头加载）
 
+    # ── 券商执行 ──
+    broker_enabled: bool              # 券商模块是否启用
+    broker_order_result: Optional[dict]  # 最近一笔券商委托结果
+    execution_mode: Optional[str]     # "local_only" / "broker" / "broker+local"
+
     # ── 输出 ──
     response: str                 # 最终发送给用户的回复文本

@@ -41,6 +41,8 @@ try:
         ReplyMessageRequestBody,
         CreateMessageRequest,
         CreateMessageRequestBody,
+        CreateImageRequest,
+        CreateImageRequestBody,
     )
 
     FEISHU_SDK_AVAILABLE = True
@@ -158,6 +160,66 @@ class FeishuReplyClient:
 
         except Exception as e:
             logger.error(f"[Feishu Stream] 发送交互卡片异常: {e}")
+            return False
+
+    def upload_image(self, image_bytes: bytes) -> Optional[str]:
+        """上传图片到飞书，返回 image_key"""
+        import io
+        try:
+            request = CreateImageRequest.builder().request_body(
+                CreateImageRequestBody.builder()
+                .image_type("message")
+                .image(io.BytesIO(image_bytes))
+                .build()
+            ).build()
+            response = self._client.im.v1.image.create(request)
+            if response.success():
+                return response.data.image_key
+            logger.error(
+                f"[Feishu Stream] 图片上传失败: code={response.code}, msg={response.msg}"
+            )
+            return None
+        except Exception as e:
+            logger.error(f"[Feishu Stream] 图片上传异常: {e}")
+            return None
+
+    def send_image_to_chat(
+        self, chat_id: str, image_bytes: bytes, caption: str = "",
+        receive_id_type: str = "chat_id",
+    ) -> bool:
+        """发送图片（+可选文字说明）到指定会话"""
+        # 先发文字说明
+        if caption:
+            self.send_to_chat(chat_id, caption, receive_id_type=receive_id_type)
+
+        # 上传图片
+        image_key = self.upload_image(image_bytes)
+        if not image_key:
+            logger.error("[Feishu Stream] 图片上传失败，无法发送")
+            return False
+
+        # 发送图片消息
+        try:
+            content = json.dumps({"image_key": image_key})
+            request = CreateMessageRequest.builder() \
+                .receive_id_type(receive_id_type) \
+                .request_body(
+                    CreateMessageRequestBody.builder()
+                    .receive_id(chat_id)
+                    .content(content)
+                    .msg_type("image")
+                    .build()
+                ).build()
+            response = self._client.im.v1.message.create(request)
+            if response.success():
+                logger.info("[Feishu Stream] 图片发送成功")
+                return True
+            logger.error(
+                f"[Feishu Stream] 图片发送失败: code={response.code}, msg={response.msg}"
+            )
+            return False
+        except Exception as e:
+            logger.error(f"[Feishu Stream] 图片发送异常: {e}")
             return False
 
     def reply_text(self, message_id: str, text: str, at_user: bool = False,
@@ -502,6 +564,34 @@ class FeishuStreamClient:
     # ── 长耗时意图集合 —— 这些走「立即回复 + 后台执行 + 异步推送」模式 ──
     _SLOW_INTENTS = {"rebalance", "scan"}
 
+    def _register_captcha_alert_callback(self):
+        """注册验证码警报回调，让broker模块可以发送截图到飞书"""
+        reply_client = self._reply_client
+        alert_chat_id = os.getenv("FEISHU_ALERT_CHAT_ID", "")
+
+        if not alert_chat_id:
+            logger.info("[Feishu Stream] FEISHU_ALERT_CHAT_ID 未配置，验证码截图将无法发送")
+            return
+
+        def _on_captcha(image_bytes: bytes, message: str) -> bool:
+            try:
+                if image_bytes and reply_client:
+                    return reply_client.send_image_to_chat(
+                        alert_chat_id, image_bytes, caption=message
+                    )
+                elif reply_client:
+                    return reply_client.send_to_chat(alert_chat_id, message)
+            except Exception as e:
+                logger.error(f"[Feishu Stream] 验证码回调失败: {e}")
+            return False
+
+        try:
+            from src.broker.captcha_alert import set_captcha_alert_callback
+            set_captcha_alert_callback(_on_captcha)
+            logger.info(f"[Feishu Stream] 验证码回调已注册 → chat_id={alert_chat_id[:8]}...")
+        except ImportError:
+            logger.debug("[Feishu Stream] broker模块不可用，跳过验证码回调注册")
+
     def _create_message_handler(self) -> Callable[[BotMessage], BotResponse]:
         """
         创建消息处理函数（LangGraph 对话引擎 / 传统指令拦截）
@@ -621,6 +711,9 @@ class FeishuStreamClient:
         """创建事件分发处理器"""
         # 创建回复客户端
         self._reply_client = FeishuReplyClient(self._app_id, self._app_secret)
+
+        # 注册验证码警报回调（broker模块通过此回调发送截图到飞书）
+        self._register_captcha_alert_callback()
 
         # 创建消息处理器
         handler = FeishuStreamHandler(

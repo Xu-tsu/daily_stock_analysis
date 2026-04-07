@@ -24,7 +24,7 @@ from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 TZ_CN = timezone(timedelta(hours=8))
-AUCTION_POLL_SECONDS = 30
+AUCTION_POLL_SECONDS = 15
 AUCTION_WATCHLIST_LIMIT = 15
 AUCTION_ALERT_TOP_N = 3
 CN_INDEX_CODES = [
@@ -351,6 +351,172 @@ def _get_current_holdings() -> list:
         return [dict(r) for r in rows] if rows else []
     except Exception:
         return []
+
+
+def _auto_execute_risk_alerts(alerts, holdings, today, executed_set):
+    """根据 AI 目标价 + 风控警报自动执行止盈/止损交易。
+
+    优先使用 AI 分析生成的 target_sell_price / stop_loss_price（data/price_targets.json），
+    其次使用 risk_control 的固定阈值警报作为兜底。
+
+    需要 .env 配置:
+      AUTO_TAKE_PROFIT=true       — 启用自动止盈止损执行
+      BROKER_ENABLED=true         — 券商已连接
+    """
+    if os.getenv("AUTO_TAKE_PROFIT", "false").lower() not in ("true", "1", "yes"):
+        return
+    if os.getenv("BROKER_ENABLED", "false").lower() not in ("true", "1", "yes"):
+        return
+
+    try:
+        from src.broker import get_broker
+        broker = get_broker()
+        if not broker or not broker.is_connected():
+            logger.debug("[自动止盈] broker 未连接，跳过")
+            return
+    except Exception as e:
+        logger.debug(f"[自动止盈] broker 初始化失败: {e}")
+        return
+
+    # 从 broker 获取实时持仓（含可卖数量和实时价格）
+    try:
+        positions = broker.get_positions()
+        if not positions:
+            return
+        pos_map = {p.code: p for p in positions}
+    except Exception as e:
+        logger.warning(f"[自动止盈] 获取持仓失败: {e}")
+        return
+
+    from src.broker.safety import check_order_allowed, increment_order_count
+
+    # ── 第一层：AI 目标价触发 ──
+    try:
+        from src.broker.price_target_store import check_price_targets, remove_target
+        triggered = check_price_targets(positions)
+        for hit in triggered:
+            code = hit["code"]
+            name = hit["name"]
+            exec_key = f"auto_exec_{today}_{code}"
+            if exec_key in executed_set:
+                continue
+
+            pos = pos_map.get(code)
+            if not pos or pos.sellable_shares <= 0:
+                continue
+
+            price = pos.current_price
+            trigger = hit["trigger"]
+            target_info = hit["target_info"]
+
+            if trigger == "take_profit":
+                action_label = "AI止盈"
+                trigger_detail = (
+                    f"当前价{price:.2f} >= AI目标价{hit['target_price']:.2f}"
+                )
+            else:
+                action_label = "AI止损"
+                trigger_detail = (
+                    f"当前价{price:.2f} <= AI止损价{hit['stop_price']:.2f}"
+                )
+
+            sell_shares = pos.sellable_shares
+            sell_timing = target_info.get("sell_timing", "")
+
+            # 安全检查
+            try:
+                balance = broker.get_balance()
+                total_asset = balance.total_asset if balance else 0
+            except Exception:
+                total_asset = 0
+            allowed, reason = check_order_allowed(code, price, sell_shares, total_asset)
+            if not allowed:
+                logger.warning(f"[{action_label}] {name} 安全限制: {reason}")
+                continue
+
+            logger.info(
+                f"[{action_label}] {name}({code}) {sell_shares}股 @ {price:.2f} | "
+                f"{trigger_detail} | AI建议: {sell_timing[:50]}"
+            )
+
+            try:
+                result = broker.sell(code, round(price, 2), sell_shares)
+                if result.is_success:
+                    increment_order_count()
+                    executed_set.add(exec_key)
+                    remove_target(code)  # 已执行，清除目标价
+                    ai_reason = target_info.get("reason", "")[:80]
+                    msg = (
+                        f"✅ {action_label}已执行\n"
+                        f"{name}({code}) {sell_shares}股 @ {price:.2f}\n"
+                        f"{trigger_detail}\n"
+                        f"AI分析: {ai_reason}"
+                    )
+                    logger.info(f"[{action_label}] {name} 成功")
+                    send_alert(msg)
+                else:
+                    logger.warning(f"[{action_label}] {name} 失败: {result.message}")
+            except Exception as e:
+                logger.error(f"[{action_label}] {name} 异常: {e}")
+    except Exception as e:
+        logger.debug(f"[自动止盈] AI目标价检查跳过: {e}")
+
+    # ── 第二层：风控固定阈值兜底（AI目标价未覆盖的股票）──
+    actionable = [a for a in alerts if a.action in ("force_sell", "reduce_half")]
+    actionable = [a for a in actionable if f"auto_exec_{today}_{a.code}" not in executed_set]
+
+    for alert in actionable:
+        code = alert.code
+        name = alert.name
+        pos = pos_map.get(code)
+        if not pos or pos.sellable_shares <= 0:
+            continue
+
+        price = pos.current_price
+        if price <= 0:
+            continue
+
+        if alert.action == "force_sell":
+            sell_shares = pos.sellable_shares
+            action_label = "风控止盈" if pos.pnl_pct >= 0 else "风控止损"
+        else:
+            sell_shares = (pos.sellable_shares // 200) * 100
+            if sell_shares <= 0:
+                sell_shares = pos.sellable_shares
+            action_label = "风控减仓"
+
+        try:
+            balance = broker.get_balance()
+            total_asset = balance.total_asset if balance else 0
+        except Exception:
+            total_asset = 0
+        allowed, reason = check_order_allowed(code, price, sell_shares, total_asset)
+        if not allowed:
+            logger.warning(f"[{action_label}] {name} 安全限制: {reason}")
+            continue
+
+        logger.info(
+            f"[{action_label}] {name}({code}) {sell_shares}股 @ {price:.2f} "
+            f"(盈亏:{pos.pnl_pct:+.1f}%, 触发:{alert.message[:40]})"
+        )
+
+        try:
+            result = broker.sell(code, round(price, 2), sell_shares)
+            if result.is_success:
+                increment_order_count()
+                executed_set.add(f"auto_exec_{today}_{code}")
+                msg = (
+                    f"✅ {action_label}已执行\n"
+                    f"{name}({code}) {sell_shares}股 @ {price:.2f}\n"
+                    f"盈亏: {pos.pnl_pct:+.1f}%\n"
+                    f"触发: {alert.message[:60]}"
+                )
+                logger.info(f"[{action_label}] {name} 成功")
+                send_alert(msg)
+            else:
+                logger.warning(f"[{action_label}] {name} 失败: {result.message}")
+        except Exception as e:
+            logger.error(f"[{action_label}] {name} 异常: {e}")
 
 
 def send_alert(message: str):
@@ -1928,19 +2094,34 @@ def run_monitor_loop(interval_minutes: int = 10, auto_rebalance: bool = True):
             except Exception as e:
                 logger.error(f"盘中检查失败: {e}")
 
-            # ── 风控检查：止损/止盈/持仓天数 ──
+            # ── 风控检查：止损/止盈/持仓天数（去重，每只股票每级别只报一次）──
             try:
                 from risk_control import check_stop_loss, format_risk_alerts
                 holdings = _get_current_holdings()
                 if holdings:
                     alerts = check_stop_loss(holdings)
+                    # 去重：同一股票+同一级别只保留第一条
+                    seen = set()
+                    deduped = []
+                    for a in alerts:
+                        key = (getattr(a, 'code', ''), getattr(a, 'level', ''))
+                        if key not in seen:
+                            seen.add(key)
+                            deduped.append(a)
+                    alerts = deduped
                     critical_alerts = [a for a in alerts if a.level == "critical"]
-                    if critical_alerts:
+                    # 同一天只推送一次风控（避免每分钟重复发）
+                    risk_key = f"risk_{today}"
+                    if critical_alerts and risk_key not in after_close_done:
                         alert_text = "** 风控紧急预警 **\n" + format_risk_alerts(alerts)
                         logger.warning(f"风控！\n{alert_text}")
                         send_alert(alert_text)
+                        after_close_done.add(risk_key)  # 今天不再重复推送
                     elif alerts:
-                        logger.info(f"  风控: {len(alerts)} 条提示")
+                        logger.info(f"  风控: {len(alerts)} 条提示（已去重）")
+
+                    # ── 自动止盈/止损执行 ──
+                    _auto_execute_risk_alerts(alerts, holdings, today, after_close_done)
             except Exception as e:
                 logger.debug(f"风控检查跳过: {e}")
 
@@ -2011,7 +2192,7 @@ def run_monitor_loop(interval_minutes: int = 10, auto_rebalance: bool = True):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="A股盘中全功能监控")
-    parser.add_argument("--interval", type=int, default=10)
+    parser.add_argument("--interval", type=int, default=1)
     parser.add_argument("--no-rebalance", action="store_true")
     parser.add_argument("--test", action="store_true", help="测试所有模块")
     parser.add_argument("--backtest", action="store_true", help="手动回测")

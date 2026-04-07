@@ -223,8 +223,8 @@ def parse_arguments() -> argparse.Namespace:
                         help="启动全部功能：Web + 定时分析 + 盘中监控")
     parser.add_argument("--monitor", action="store_true",
                         help="启动盘中实时监控（含集合竞价资金、异动与收盘调仓）")
-    parser.add_argument("--interval", type=int, default=10,
-                        help="监控检查间隔（分钟，默认10）")
+    parser.add_argument("--interval", type=int, default=1,
+                        help="监控检查间隔（分钟，默认1）")
     parser.add_argument("--rebalance", action="store_true",
                        help="执行持仓调仓分析（大盘→板块→个股→调仓建议）")
     parser.add_argument("--portfolio", type=str, default=None,
@@ -465,23 +465,171 @@ def run_full_analysis(
         logger.exception(f"分析流程执行失败: {e}")
 
 
+def _auto_build_positions(portfolio: dict, config, args):
+    """空仓时自动选股+直接在THS买入。
+
+    流程: scan_market → 选3只 → 均分资金 → broker.buy → 更新 portfolio
+    """
+    import os
+    try:
+        from market_scanner import scan_market
+        candidates = scan_market(max_price=10.0, min_turnover=2.0, top_n=5, mode="trend")
+        if not candidates:
+            logger.info("[自动建仓] 扫描无合适候选，跳过")
+            return
+
+        picks = candidates[:3]
+        logger.info(f"[自动建仓] 候选: {[(c['code'], c.get('name','')) for c in picks]}")
+
+        broker_enabled = os.getenv("BROKER_ENABLED", "false").lower() == "true"
+        total_cash = portfolio.get("cash", 0) or 200000
+        per_stock_cash = total_cash * 0.25  # 每只分配25%资金，保留25%现金
+
+        bought = []
+        for c in picks:
+            code = c["code"]
+            name = c.get("name", code)
+            price = c.get("price", 0)
+            if price <= 0:
+                # 尝试获取实时价
+                try:
+                    from macro_data_collector import _fetch_tencent_quote, _stock_code_to_tencent
+                    tc = _stock_code_to_tencent(code)
+                    qt = _fetch_tencent_quote([tc], timeout=5)
+                    for _, q in qt.items():
+                        if q.get("price", 0) > 0:
+                            price = q["price"]
+                except Exception:
+                    pass
+            if price <= 0:
+                logger.warning(f"[自动建仓] {name}({code}) 无法获取价格，跳过")
+                continue
+
+            # 计算买入股数（向下取整到100的倍数）
+            shares = int(per_stock_cash / price / 100) * 100
+            if shares < 100:
+                logger.warning(f"[自动建仓] {name}({code}) 资金不足买1手 ({price:.2f}元)，跳过")
+                continue
+
+            amount = shares * price
+            logger.info(f"[自动建仓] 买入 {name}({code}) {shares}股 × {price:.2f}元 = {amount:,.0f}元")
+
+            # 券商下单
+            if broker_enabled:
+                try:
+                    from src.broker import get_broker
+                    broker = get_broker()
+                    if broker and broker.is_connected():
+                        result = broker.buy(code, price, shares)
+                        logger.info(f"[自动建仓] THS下单: {result.status} {result.message}")
+                        if result.actual_price and result.actual_price > 0:
+                            price = result.actual_price
+                        if result.actual_shares and result.actual_shares > 0:
+                            shares = result.actual_shares
+                except Exception as e:
+                    logger.error(f"[自动建仓] THS下单失败: {e}")
+
+            # 更新本地持仓
+            # 先移除同code的0股占位
+            portfolio["holdings"] = [
+                h for h in portfolio.get("holdings", [])
+                if h.get("code") != code or h.get("shares", 0) > 0
+            ]
+            portfolio.setdefault("holdings", []).append({
+                "code": code,
+                "name": name,
+                "shares": shares,
+                "cost_price": price,
+                "current_price": price,
+                "market_value": round(price * shares, 2),
+                "sector": c.get("sector", ""),
+                "buy_date": datetime.now().strftime("%Y-%m-%d"),
+                "strategy_tag": "auto_scan",
+            })
+            portfolio["cash"] = portfolio.get("cash", 0) - round(price * shares, 2)
+            bought.append(f"{name}({code}) {shares}股@{price:.2f}")
+
+        # 清理剩余0股占位
+        portfolio["holdings"] = [h for h in portfolio.get("holdings", []) if h.get("shares", 0) > 0]
+
+        from portfolio_manager import save_portfolio
+        save_portfolio(portfolio)
+
+        if bought:
+            summary = f"🛒 自动建仓完成:\n" + "\n".join(f"  • {b}" for b in bought)
+            logger.info(f"[自动建仓] {summary}")
+            if not getattr(args, 'no_notify', False):
+                try:
+                    from src.notification import NotificationService
+                    notifier = NotificationService()
+                    if notifier.is_available():
+                        notifier.send(summary)
+                except Exception:
+                    pass
+        else:
+            logger.info("[自动建仓] 未能成功买入任何股票")
+
+    except Exception as e:
+        logger.error(f"[自动建仓] 失败: {e}", exc_info=True)
+
+
+def _run_checkpoint_with_rebalance(checkpoint: str, send_notification: bool):
+    """盘中节点：先做市场快照，再跑调仓+自动执行。空仓时自动选股建仓。"""
+    from market_monitor import run_intraday_checkpoint
+    # 1) 盘中快照（指数/板块/异动）
+    run_intraday_checkpoint(checkpoint=checkpoint, send_notification=send_notification)
+
+    # 2) 检查持仓 → 空仓自动建仓 / 有仓正常调仓
+    try:
+        from portfolio_manager import load_portfolio, format_rebalance_report
+        portfolio = load_portfolio()
+        real_holdings = [h for h in portfolio.get("holdings", []) if h.get("shares", 0) > 0]
+
+        if not real_holdings:
+            logger.info(f"[{checkpoint}] 空仓，启动自动建仓...")
+            import argparse as _ap
+            _dummy_args = _ap.Namespace(no_notify=not send_notification)
+            _auto_build_positions(portfolio, None, _dummy_args)
+        else:
+            from rebalance_engine import run_rebalance_analysis
+            from src.config import get_config
+            logger.info(f"[{checkpoint}] 开始调仓分析...")
+            result = run_rebalance_analysis(config=get_config())
+            if "error" not in result:
+                report = format_rebalance_report(result)
+                logger.info(f"\n{report}")
+                if send_notification:
+                    try:
+                        from src.notification import NotificationService
+                        notifier = NotificationService()
+                        if notifier.is_available():
+                            notifier.send(report)
+                    except Exception:
+                        pass
+                execution = result.get("_execution", {})
+                if execution:
+                    logger.info(f"[{checkpoint}] 券商执行: {execution.get('mode', 'N/A')}")
+            else:
+                logger.warning(f"[{checkpoint}] 调仓失败: {result.get('error')}")
+    except Exception as e:
+        logger.error(f"[{checkpoint}] 调仓异常: {e}")
+
+
 def build_intraday_schedule_tasks(args: argparse.Namespace):
     """Build fixed intraday checkpoint tasks for scheduler mode."""
-    from market_monitor import run_intraday_checkpoint
-
     send_notification = not getattr(args, "no_notify", False)
     return [
         (
-            "10:15",
-            lambda: run_intraday_checkpoint(
+            "9:45",
+            lambda: _run_checkpoint_with_rebalance(
                 checkpoint="morning_review",
                 send_notification=send_notification,
             ),
             "morning_review",
         ),
         (
-            "12:30",
-            lambda: run_intraday_checkpoint(
+            "13:15",
+            lambda: _run_checkpoint_with_rebalance(
                 checkpoint="afternoon_review",
                 send_notification=send_notification,
             ),
@@ -638,7 +786,7 @@ def main() -> int:
         # ━━━ 模式A: 全功能模式（Web + 定时 + 监控 + 调仓）━━━
         if getattr(args, 'all', False):
             logger.info("模式: 全功能（Web + 定时分析 + 盘中监控 + 调仓）")
-            logger.info("附加盘中节点: 10:15 早盘复判, 12:30 午后方向判断")
+            logger.info("附加盘中节点: 9:45 早盘调仓, 13:15 午后调仓")
 
             # 强制跳过交易日检查（监控模块自己判断交易时间）
             args.force_run = True
@@ -649,25 +797,33 @@ def main() -> int:
             def _monitor():
                 from market_monitor import run_monitor_loop
                 run_monitor_loop(
-                    interval_minutes=getattr(args, 'interval', 10),
+                    interval_minutes=getattr(args, 'interval', 1),
                     auto_rebalance=True,
                 )
 
             threading.Thread(target=_monitor, daemon=True).start()
             logger.info("盘中监控已在后台启动")
 
-            # 启动时立即执行一次：扫描 + 分析 + 调仓
-            logger.info("立即执行首次全量分析...")
-            run_full_analysis(config, args, stock_codes)
+            # 流程：先调仓交易（优先级高），再跑全量分析报告（后台）
+            # 原因：两者共用本地Ollama单GPU，不能真正并行，调仓时效性更高
+            skip_startup_analysis = os.getenv("SKIP_STARTUP_ANALYSIS", "false").lower() in ("true", "1", "yes")
 
-            # 如果有持仓，也跑一次调仓
+            # 调仓（空仓时自动选股+直接建仓，有仓时正常调仓）
             try:
-                from portfolio_manager import load_portfolio
+                from portfolio_manager import load_portfolio, save_portfolio, format_rebalance_report
                 portfolio = load_portfolio()
-                if portfolio.get("holdings"):
-                    logger.info("立即执行首次调仓分析...")
+
+                # 判断是否有实际持仓（排除0股占位）
+                real_holdings = [h for h in portfolio.get("holdings", []) if h.get("shares", 0) > 0]
+
+                if not real_holdings:
+                    # ── 空仓：扫描 → 直接在THS买入 ──
+                    logger.info("空仓状态，启动自动选股+建仓...")
+                    _auto_build_positions(portfolio, config, args)
+                else:
+                    # ── 有仓：正常调仓 ──
+                    logger.info("立即执行调仓分析...")
                     from rebalance_engine import run_rebalance_analysis
-                    from portfolio_manager import format_rebalance_report
                     result = run_rebalance_analysis(config=config)
                     if "error" not in result:
                         report = format_rebalance_report(result)
@@ -680,15 +836,30 @@ def main() -> int:
                                     notifier.send(report)
                             except:
                                 pass
+                        execution = result.get("_execution", {})
+                        if execution:
+                            logger.info(f"券商执行: {execution.get('mode', 'N/A')}")
+                    else:
+                        logger.warning(f"调仓失败: {result.get('error')}")
             except Exception as e:
                 logger.warning(f"首次调仓失败: {e}")
+
+            # 调仓完成后，再跑全量分析（生成详细报告推送）
+            if not skip_startup_analysis:
+                logger.info("调仓完成，开始全量分析报告...")
+                try:
+                    run_full_analysis(config, args, stock_codes)
+                except Exception as e:
+                    logger.warning(f"全量分析失败: {e}")
+            else:
+                logger.info("跳过全量分析（SKIP_STARTUP_ANALYSIS=true）")
 
             # 定时循环（每天 SCHEDULE_TIME 再跑一次）
             from src.scheduler import run_with_schedule
             run_with_schedule(
                 task=lambda: run_full_analysis(config, args, stock_codes),
                 schedule_time=config.schedule_time,
-                run_immediately=False,  # 上面已经手动跑过了
+                run_immediately=False,
                 extra_daily_tasks=build_intraday_schedule_tasks(args),
             )
             return 0
@@ -697,7 +868,7 @@ def main() -> int:
             logger.info("模式: 盘中实时监控")
             from market_monitor import run_monitor_loop
             run_monitor_loop(
-                interval_minutes=getattr(args, 'interval', 10),
+                interval_minutes=getattr(args, 'interval', 1),
                 auto_rebalance=True,
             )
             return 0
@@ -865,7 +1036,7 @@ def main() -> int:
         if args.schedule or config.schedule_enabled:
             logger.info("模式: 定时任务")
             logger.info(f"每日执行时间: {config.schedule_time}")
-            logger.info("附加盘中节点: 10:15 早盘复判, 12:30 午后方向判断")
+            logger.info("附加盘中节点: 9:45 早盘调仓, 13:15 午后调仓")
 
             # Determine whether to run immediately:
             # Command line arg --no-run-immediately overrides config if present.
