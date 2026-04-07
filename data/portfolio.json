@@ -1,45 +1,48 @@
 {
-  "updated_at": "2026-04-07 16:06:30",
-  "cash": 50820.0,
-  "total_asset": 200256.0,
+  "updated_at": "2026-04-07 17:16:48",
+  "cash": 99801.96,
+  "total_asset": 200099.96,
   "target_position_ratio": 0.7,
   "holdings": [
-    {
-      "code": "002795",
-      "name": "永和智控",
-      "shares": 6400,
-      "cost_price": 7.74,
-      "current_price": 7.76,
-      "market_value": 49664.0,
-      "sector": "",
-      "buy_date": "2026-04-07",
-      "strategy_tag": "auto_scan",
-      "pnl_pct": 0.26
-    },
     {
       "code": "002219",
       "name": "新里程",
       "shares": 20600,
-      "cost_price": 2.42,
+      "sellable_shares": 20600,
+      "cost_price": 2.421,
       "current_price": 2.42,
       "market_value": 49852.0,
+      "pnl_pct": -0.04,
       "sector": "",
       "buy_date": "2026-04-07",
-      "strategy_tag": "auto_scan",
-      "pnl_pct": 0.0
+      "strategy_tag": "auto_scan"
     },
     {
-      "code": "002550",
-      "name": "千红制药",
+      "code": "002370",
+      "name": "亚太药业",
+      "shares": 100,
+      "sellable_shares": 100,
+      "cost_price": 7.783,
+      "current_price": 7.82,
+      "market_value": 782.0,
+      "pnl_pct": 0.48,
+      "sector": "",
+      "buy_date": "",
+      "strategy_tag": ""
+    },
+    {
+      "code": "002795",
+      "name": "永和智控",
       "shares": 6400,
-      "cost_price": 7.78,
-      "current_price": 7.8,
-      "market_value": 49920.0,
+      "sellable_shares": 6400,
+      "cost_price": 7.742,
+      "current_price": 7.76,
+      "market_value": 49664.0,
+      "pnl_pct": 0.23,
       "sector": "",
       "buy_date": "2026-04-07",
-      "strategy_tag": "auto_scan",
-      "pnl_pct": 0.26
+      "strategy_tag": "auto_scan"
     }
   ],
-  "actual_position_ratio": 0.7462
+  "actual_position_ratio": 0.5012
 }

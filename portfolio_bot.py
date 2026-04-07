@@ -55,7 +55,7 @@ SHOW_PORTFOLIO_PHRASES = {
 }
 
 PORTFOLIO_COMMAND_PREFIXES = [
-    "调仓", "扫描", "主线", "回测", "预警", "分析", "全量分析", "战绩", "复盘", "交易记录", "复盘笔记",
+    "调仓", "扫描", "主线", "回测", "预警", "分析", "全量分析", "战绩", "复盘", "交易记录", "复盘笔记", "涨停分析",
 ]
 
 TRADE_ACTION_MAP = {
@@ -426,6 +426,8 @@ def handle_portfolio_command(text: str) -> str:
             return _handle_alert()
         elif text.startswith("战绩"):
             return _handle_performance()
+        elif text.startswith("涨停分析"):
+            return _handle_limit_up_analysis()
         elif text.startswith("复盘笔记"):
             return _handle_trade_review()
         elif text.startswith("复盘") and "分析" not in text:
@@ -879,6 +881,15 @@ def _handle_trade_review() -> str:
         return format_review_brief()
     except Exception as e:
         return f"❌ 复盘笔记生成失败: {str(e)}"
+
+
+def _handle_limit_up_analysis() -> str:
+    """涨停分析 — 涨停原因+龙虎榜+关联股"""
+    try:
+        from src.core.limit_up_analyzer import get_limit_up_report
+        return get_limit_up_report()
+    except Exception as e:
+        return f"❌ 涨停分析失败: {str(e)}"
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

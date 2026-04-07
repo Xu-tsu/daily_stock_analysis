@@ -23,7 +23,8 @@ class StrategyFeedbackLoop:
     def generate_feedback_report(self, days: int = 30) -> dict:
         """生成策略反馈报告"""
         try:
-            conn = sqlite3.connect(DB_PATH)
+            from src.broker.execution_tracker import _get_conn
+            conn = _get_conn()  # 自动建表
             conn.row_factory = sqlite3.Row
 
             # 执行记录

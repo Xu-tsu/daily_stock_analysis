@@ -2314,6 +2314,15 @@ def run_monitor_loop(interval_minutes: int = 10, auto_rebalance: bool = True):
             except Exception as e:
                 logger.warning(f"复盘笔记生成失败: {e}")
 
+            # 1d. 涨停深度分析（涨停原因+龙虎榜+关联股挖掘）
+            try:
+                from src.core.limit_up_analyzer import run_limit_up_analysis
+                zt_report = run_limit_up_analysis(trade_date=today, send_notification=True)
+                if zt_report:
+                    logger.info(f"[涨停分析] 报告已生成并推送")
+            except Exception as e:
+                logger.warning(f"涨停分析失败: {e}")
+
             # 2. 回测历史扫描结果
             try:
                 from data_store import run_scan_backtest, get_backtest_summary
