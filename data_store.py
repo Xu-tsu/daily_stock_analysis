@@ -224,6 +224,59 @@ def get_consecutive_inflow_stocks(min_days: int = 3, min_total: float = 500) -> 
     return [dict(r) for r in rows]
 
 
+def get_fund_flow_latest(trade_date: str = None, top_n: int = 10) -> dict:
+    """获取当日资金流入/流出排行"""
+    if not trade_date:
+        trade_date = datetime.now().strftime("%Y-%m-%d")
+    conn = _get_conn()
+    # 最近有数据的日期（可能非交易日）
+    actual_date = conn.execute(
+        "SELECT MAX(trade_date) FROM fund_flow_daily WHERE trade_date <= ?", (trade_date,)
+    ).fetchone()[0]
+    if not actual_date:
+        conn.close()
+        return {"inflow": [], "outflow": []}
+
+    inflow = conn.execute("""
+        SELECT code, name, main_net as net, main_net_pct, price, change_pct
+        FROM fund_flow_daily WHERE trade_date = ? AND main_net > 0
+        ORDER BY main_net DESC LIMIT ?
+    """, (actual_date, top_n)).fetchall()
+    outflow = conn.execute("""
+        SELECT code, name, main_net as net, main_net_pct, price, change_pct
+        FROM fund_flow_daily WHERE trade_date = ? AND main_net < 0
+        ORDER BY main_net ASC LIMIT ?
+    """, (actual_date, top_n)).fetchall()
+    conn.close()
+    return {"inflow": [dict(r) for r in inflow], "outflow": [dict(r) for r in outflow]}
+
+
+def get_sector_flow_latest(trade_date: str = None, top_n: int = 10) -> dict:
+    """获取当日板块资金流入/流出排行"""
+    if not trade_date:
+        trade_date = datetime.now().strftime("%Y-%m-%d")
+    conn = _get_conn()
+    actual_date = conn.execute(
+        "SELECT MAX(trade_date) FROM sector_flow_daily WHERE trade_date <= ?", (trade_date,)
+    ).fetchone()[0]
+    if not actual_date:
+        conn.close()
+        return {"inflow": [], "outflow": []}
+
+    inflow = conn.execute("""
+        SELECT sector_name as name, main_net as net, main_net_pct, change_pct
+        FROM sector_flow_daily WHERE trade_date = ? AND main_net > 0 AND sector_type = 'hy'
+        ORDER BY main_net DESC LIMIT ?
+    """, (actual_date, top_n)).fetchall()
+    outflow = conn.execute("""
+        SELECT sector_name as name, main_net as net, main_net_pct, change_pct
+        FROM sector_flow_daily WHERE trade_date = ? AND main_net < 0 AND sector_type = 'hy'
+        ORDER BY main_net ASC LIMIT ?
+    """, (actual_date, top_n)).fetchall()
+    conn.close()
+    return {"inflow": [dict(r) for r in inflow], "outflow": [dict(r) for r in outflow]}
+
+
 def get_sector_mainline(min_days: int = 3) -> list:
     """找连续N日资金净流入的板块（主线确认）"""
     conn = _get_conn()

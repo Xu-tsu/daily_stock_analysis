@@ -2222,7 +2222,7 @@ def run_monitor_loop(interval_minutes: int = 10, auto_rebalance: bool = True):
                     alert = format_anomaly_alert(result)
                     if alert:
                         logger.warning(f"异动！\n{alert}")
-                        send_alert(alert)
+                        # send_alert(alert)  # 已禁用：盘中异动预警推送（避免频繁发消息）
                 else:
                     logger.info(f"  正常 ({result['anomaly_count']} 项检查)")
 
@@ -2314,7 +2314,20 @@ def run_monitor_loop(interval_minutes: int = 10, auto_rebalance: bool = True):
             except Exception as e:
                 logger.warning(f"复盘笔记生成失败: {e}")
 
-            # 1d. 涨停深度分析（涨停原因+龙虎榜+关联股挖掘）
+            # 1d. Agent技能进化（基于今日交易结果更新技能库）
+            try:
+                from agent_skill_engine import evolve_skills
+                evo_report = evolve_skills()
+                logger.info(
+                    f"[技能进化] 更新{evo_report['skills_updated']}个, "
+                    f"发现{evo_report['new_skills_discovered']}个新模式, "
+                    f"升级{len(evo_report['skills_promoted'])}, "
+                    f"降级{len(evo_report['skills_demoted'])}"
+                )
+            except Exception as e:
+                logger.warning(f"技能进化失败: {e}")
+
+            # 1e. 涨停深度分析（涨停原因+龙虎榜+关联股挖掘）
             try:
                 from src.core.limit_up_analyzer import run_limit_up_analysis
                 zt_report = run_limit_up_analysis(trade_date=today, send_notification=True)

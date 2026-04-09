@@ -93,7 +93,157 @@ class RebalanceExecutor:
             f"[执行器] 完成: {report.filled_count}笔成交 "
             f"{report.rejected_count}笔拒绝 滑点={report.total_slippage_pct:+.3f}%"
         )
+
+        # 记录到交易日志（复盘用）
+        self._record_to_journal(report, actions)
+
+        # 持仓核对：用委托明细和真实持仓验证交易是否生效
+        if report.filled_count > 0:
+            self._verify_execution(report, actions)
+
         return report
+
+    def _record_to_journal(self, report: ExecutionReport, actions: List[dict]):
+        """将成交记录写入trade_journal（供复盘分析用）"""
+        try:
+            from trade_journal import record_buy, record_sell
+        except ImportError:
+            return
+
+        # 建立 code→action 映射获取AI分析数据
+        action_map = {a.get("code", ""): a for a in actions}
+
+        for order in report.orders:
+            if not order.is_success:
+                continue
+
+            code = order.code
+            name = getattr(order, "name", code)
+            action_info = action_map.get(code, {})
+            price = order.actual_price or action_info.get("price", 0)
+            shares = order.actual_shares or action_info.get("shares", 0)
+
+            try:
+                if order.direction == "buy":
+                    record_buy(
+                        code=code, name=name, shares=shares, price=price,
+                        ma_trend=str(action_info.get("trend_assessment", ""))[:20],
+                        macd_signal="",
+                        rsi=0,
+                        vol_pattern="",
+                        tech_score=action_info.get("score", 0),
+                        sector=action_info.get("sector", ""),
+                        source="rebalance",
+                        note=f"调仓买入 {str(action_info.get('reason', ''))[:50]}",
+                    )
+                elif order.direction == "sell":
+                    buy_price = float(action_info.get("cost_price", 0) or 0)
+                    record_sell(
+                        code=code, name=name, shares=shares, price=price,
+                        buy_price=buy_price,
+                        ma_trend=str(action_info.get("trend_assessment", ""))[:20],
+                        macd_signal="",
+                        rsi=0,
+                        vol_pattern="",
+                        tech_score=action_info.get("score", 0),
+                        sector=action_info.get("sector", ""),
+                        source="rebalance",
+                        note=f"调仓卖出 {str(action_info.get('reason', ''))[:50]}",
+                    )
+            except Exception as e:
+                logger.warning(f"[执行器] 交易日志记录失败 {code}: {e}")
+
+    def _verify_execution(self, report: ExecutionReport, actions: List[dict]):
+        """核对委托明细和真实持仓，确认交易结果。
+
+        数据来源:
+        1. broker.get_today_orders() — 委托列表（含成交状态/成交数量）
+        2. broker.get_positions() — 当前真实持仓
+        3. report.orders — 本次下单结果
+        """
+        try:
+            # 等待 THS 刷新
+            time.sleep(2)
+
+            # ── 1. 读取委托明细 ──
+            orders = self._broker.get_today_orders()
+            if not orders:
+                logger.warning("[核对] 无法获取今日委托")
+                return
+
+            # 按股票代码汇总已成交数量
+            filled_by_code = {}  # {code: {"buy": shares, "sell": shares}}
+            for o in orders:
+                if o.status in ("filled", "partial"):
+                    code = o.code
+                    if code not in filled_by_code:
+                        filled_by_code[code] = {"buy": 0, "sell": 0}
+                    filled_by_code[code][o.direction] += o.filled_shares
+
+            # ── 2. 读取真实持仓 ──
+            positions = self._broker.get_positions()
+            pos_by_code = {p.code: p for p in positions}
+
+            # ── 3. 核对每笔操作 ──
+            mismatches = []
+            for order_result in report.orders:
+                if not order_result.is_success:
+                    continue
+
+                code = order_result.code
+                name = order_result.name or code
+                direction = order_result.direction
+                expected_shares = order_result.actual_shares or order_result.requested_shares
+
+                # 从委托明细确认
+                entrust_filled = filled_by_code.get(code, {}).get(direction, 0)
+                pos = pos_by_code.get(code)
+
+                if entrust_filled >= expected_shares:
+                    logger.info(
+                        f"[核对] ✅ {name}({code}) {direction} "
+                        f"{expected_shares}股 → 委托已成交 {entrust_filled}股"
+                    )
+                elif entrust_filled > 0:
+                    logger.warning(
+                        f"[核对] ⚠️ {name}({code}) {direction} "
+                        f"期望{expected_shares}股 → 实际成交 {entrust_filled}股 (部分成交)"
+                    )
+                    mismatches.append({
+                        "code": code, "name": name, "direction": direction,
+                        "expected": expected_shares, "actual": entrust_filled,
+                        "status": "partial",
+                    })
+                else:
+                    logger.error(
+                        f"[核对] ❌ {name}({code}) {direction} "
+                        f"{expected_shares}股 → 委托未成交！"
+                    )
+                    mismatches.append({
+                        "code": code, "name": name, "direction": direction,
+                        "expected": expected_shares, "actual": 0,
+                        "status": "not_filled",
+                    })
+
+                # 持仓验证
+                if pos:
+                    logger.info(
+                        f"[核对]    持仓: {pos.shares}股 可卖:{pos.sellable_shares}股 "
+                        f"成本:{pos.cost_price:.2f} 现价:{pos.current_price:.2f}"
+                    )
+                elif direction == "sell":
+                    logger.info(f"[核对]    {name} 已不在持仓中（清仓确认）")
+
+            if mismatches:
+                report.verification_mismatches = mismatches
+                logger.warning(
+                    f"[核对] 共 {len(mismatches)} 笔不一致，需关注"
+                )
+            else:
+                logger.info("[核对] 全部核对通过 ✅")
+
+        except Exception as e:
+            logger.warning(f"[核对] 持仓核对异常（不影响交易）: {e}")
 
     def _execute_single(self, action: dict, total_asset: float) -> OrderResult:
         """执行单笔动作"""

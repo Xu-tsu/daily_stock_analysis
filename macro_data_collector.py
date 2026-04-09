@@ -462,6 +462,8 @@ def fetch_stock_comments(stock_codes: list) -> dict:
 # 7. 两融余额（Tushare）
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def fetch_margin_data() -> dict:
+    # 两融接口需要高积分权限，直接跳过
+    return {"note": "两融数据已跳过（需Tushare高级权限）"}
     api = _get_tushare()
     if api is None:
         return {"note": "无 Tushare Token，两融数据不可用"}

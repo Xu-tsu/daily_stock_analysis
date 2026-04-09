@@ -1,48 +1,31 @@
 {
-  "updated_at": "2026-04-07 17:16:48",
-  "cash": 99801.96,
-  "total_asset": 200099.96,
+  "updated_at": "2026-04-09 10:46:32",
+  "cash": 7122.34,
+  "total_asset": 202421.34,
   "target_position_ratio": 0.7,
   "holdings": [
     {
-      "code": "002219",
-      "name": "新里程",
-      "shares": 20600,
-      "sellable_shares": 20600,
-      "cost_price": 2.421,
-      "current_price": 2.42,
-      "market_value": 49852.0,
-      "pnl_pct": -0.04,
+      "code": "002348",
+      "name": "高乐股份",
+      "shares": 300,
+      "cost_price": 9.25,
+      "current_price": 9.25,
+      "market_value": 2775.0,
       "sector": "",
-      "buy_date": "2026-04-07",
+      "buy_date": "2026-04-09",
       "strategy_tag": "auto_scan"
     },
     {
-      "code": "002370",
-      "name": "亚太药业",
-      "shares": 100,
-      "sellable_shares": 100,
-      "cost_price": 7.783,
-      "current_price": 7.82,
-      "market_value": 782.0,
-      "pnl_pct": 0.48,
+      "code": "002685",
+      "name": "华东重机",
+      "shares": 400,
+      "cost_price": 7.97,
+      "current_price": 7.97,
+      "market_value": 3188.0,
       "sector": "",
-      "buy_date": "",
-      "strategy_tag": ""
-    },
-    {
-      "code": "002795",
-      "name": "永和智控",
-      "shares": 6400,
-      "sellable_shares": 6400,
-      "cost_price": 7.742,
-      "current_price": 7.76,
-      "market_value": 49664.0,
-      "pnl_pct": 0.23,
-      "sector": "",
-      "buy_date": "2026-04-07",
+      "buy_date": "2026-04-09",
       "strategy_tag": "auto_scan"
     }
   ],
-  "actual_position_ratio": 0.5012
+  "actual_position_ratio": 0.0
 }

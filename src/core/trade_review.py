@@ -45,9 +45,12 @@ def run_trade_review(
     data = _collect_review_data(trade_date)
 
     if not data.get("has_activity"):
-        msg = f"📝 {trade_date} 无交易活动，跳过复盘"
-        logger.info(msg)
-        return msg
+        # 即使没有买卖操作，有持仓也要复盘（分析浮盈浮亏+资金流向）
+        if not data.get("holdings_snapshot") and not data.get("fund_flow", {}).get("holding_stocks_flow"):
+            msg = f"📝 {trade_date} 无交易活动且无持仓，跳过复盘"
+            logger.info(msg)
+            return msg
+        logger.info(f"[复盘] {trade_date} 无买卖操作，但有持仓，生成持仓复盘")
 
     # ── 2. AI 分析 ──
     ai_review = _ai_analyze(data, trade_date)
@@ -201,6 +204,40 @@ def _collect_review_data(trade_date: str) -> dict:
             }
             break
 
+    # 8. 资金流向（板块 + 个股）
+    data["fund_flow"] = {}
+    try:
+        from data_store import get_fund_flow_latest, get_sector_flow_latest
+        stock_flow = get_fund_flow_latest(trade_date=trade_date, top_n=10)
+        sector_flow = get_sector_flow_latest(trade_date=trade_date, top_n=10)
+        data["fund_flow"]["top_inflow_stocks"] = stock_flow.get("inflow", [])
+        data["fund_flow"]["top_outflow_stocks"] = stock_flow.get("outflow", [])
+        data["fund_flow"]["top_inflow_sectors"] = sector_flow.get("inflow", [])
+        data["fund_flow"]["top_outflow_sectors"] = sector_flow.get("outflow", [])
+    except Exception as e:
+        logger.debug(f"[复盘] 资金流向读取失败: {e}")
+
+    # 8b. 持仓个股的资金流向
+    try:
+        from ths_scraper import fetch_stock_fund_flow_rank
+        all_flow = fetch_stock_fund_flow_rank(top_n=200)
+        holding_codes = {h["code"] for h in data["holdings_snapshot"] if h.get("code")}
+        holding_flow = [f for f in all_flow if f.get("code") in holding_codes]
+        data["fund_flow"]["holding_stocks_flow"] = holding_flow
+    except Exception as e:
+        logger.debug(f"[复盘] 持仓资金流向失败: {e}")
+
+    # 9. 市场环境（如果交易记录中没有，从扫描器获取）
+    if not data.get("market_context", {}).get("sh_index"):
+        try:
+            from market_scanner import detect_market_regime
+            regime = detect_market_regime()
+            data["market_context"]["regime"] = regime.get("regime", "unknown")
+            data["market_context"]["regime_score"] = regime.get("score", 0)
+            data["market_context"]["regime_detail"] = regime.get("detail", "")
+        except Exception:
+            pass
+
     return data
 
 
@@ -208,22 +245,34 @@ def _ai_analyze(data: dict, trade_date: str) -> str:
     """调用 AI 生成复盘分析"""
     prompt = _build_review_prompt(data, trade_date)
 
-    # 优先云端，兜底本地
+    # 按优先级: Azure(快+稳) → Gemini(免费) → Gemini-lite → 本地Ollama
     try:
         import litellm
 
-        cloud_model = os.getenv("REBALANCE_CLOUD_MODEL") or os.getenv("LITELLM_MODEL", "")
-        fallback = os.getenv("REBALANCE_CLOUD_FALLBACK") or os.getenv("LITELLM_FALLBACK_MODELS", "")
-        models_to_try = [m.strip() for m in [cloud_model, fallback] if m.strip()]
+        models_to_try = []
+        for env_key in ["REBALANCE_CLOUD_MODEL", "LITELLM_MODEL", "REBALANCE_CLOUD_FALLBACK", "LITELLM_FALLBACK_MODELS"]:
+            val = os.getenv(env_key, "")
+            for m in val.split(","):
+                m = m.strip()
+                if m and m not in models_to_try:
+                    models_to_try.append(m)
 
+        # 云端模型
         for model in models_to_try:
             try:
+                logger.info(f"[复盘] 尝试 {model}...")
+                extra = {}
+                if "ollama" in model:
+                    extra["api_base"] = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+                    extra["timeout"] = 300
+                else:
+                    extra["timeout"] = 120
                 resp = litellm.completion(
                     model=model,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.3,
                     max_tokens=3000,
-                    timeout=120,
+                    **extra,
                 )
                 text = resp.choices[0].message.content.strip()
                 if text:
@@ -235,18 +284,22 @@ def _ai_analyze(data: dict, trade_date: str) -> str:
 
         # 兜底本地
         local_model = os.getenv("REBALANCE_LOCAL_MODEL", "")
-        if local_model:
-            resp = litellm.completion(
-                model=local_model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-                max_tokens=3000,
-                timeout=180,
-                api_base=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
-            )
-            text = resp.choices[0].message.content.strip()
-            if text:
-                return text
+        if local_model and local_model not in models_to_try:
+            try:
+                logger.info(f"[复盘] 兜底本地 {local_model}...")
+                resp = litellm.completion(
+                    model=local_model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.3,
+                    max_tokens=3000,
+                    timeout=300,
+                    api_base=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
+                )
+                text = resp.choices[0].message.content.strip()
+                if text:
+                    return text
+            except Exception as e:
+                logger.warning(f"[复盘] 本地模型也失败: {e}")
 
     except Exception as e:
         logger.warning(f"[复盘] AI分析失败，使用纯数据复盘: {e}")
@@ -333,45 +386,106 @@ def _build_review_prompt(data: dict, trade_date: str) -> str:
             f"总盈亏:{perf.get('total_pnl', 0)}元 平均收益:{perf.get('avg_pnl_pct', 0)}%"
         )
 
+    # 资金流向
+    fund_flow = data.get("fund_flow", {})
+    if fund_flow:
+        flow_lines = []
+        # 板块资金
+        top_in_sectors = fund_flow.get("top_inflow_sectors", [])
+        top_out_sectors = fund_flow.get("top_outflow_sectors", [])
+        if top_in_sectors:
+            flow_lines.append("  主力流入板块: " + ", ".join(
+                f"{s.get('name', '')}({s.get('net', 0):.0f}万)" for s in top_in_sectors[:5]
+            ))
+        if top_out_sectors:
+            flow_lines.append("  主力流出板块: " + ", ".join(
+                f"{s.get('name', '')}({s.get('net', 0):.0f}万)" for s in top_out_sectors[:5]
+            ))
+        # 个股资金
+        top_in_stocks = fund_flow.get("top_inflow_stocks", [])
+        top_out_stocks = fund_flow.get("top_outflow_stocks", [])
+        if top_in_stocks:
+            flow_lines.append("  主力流入个股: " + ", ".join(
+                f"{s.get('name', '')}({s.get('net', 0):.0f}万)" for s in top_in_stocks[:5]
+            ))
+        if top_out_stocks:
+            flow_lines.append("  主力流出个股: " + ", ".join(
+                f"{s.get('name', '')}({s.get('net', 0):.0f}万)" for s in top_out_stocks[:5]
+            ))
+        # 持仓个股资金流
+        holding_flow = fund_flow.get("holding_stocks_flow", [])
+        if holding_flow:
+            flow_lines.append("  持仓股资金流:")
+            for hf in holding_flow:
+                net = hf.get("main_net", 0)
+                emoji = "流入" if net > 0 else "流出"
+                flow_lines.append(f"    {hf.get('name', '')}({hf.get('code', '')}) 主力{emoji} {abs(net):.0f}万")
+        if flow_lines:
+            sections.append("【资金流向】\n" + "\n".join(flow_lines))
+
+    # 市场环境
+    mc = data.get("market_context", {})
+    mc_lines = []
+    if mc.get("sh_index"):
+        mc_lines.append(f"  上证指数: {mc['sh_index']} 涨跌: {mc.get('sh_change_pct', '')}%")
+    if mc.get("regime"):
+        regime_map = {"bull": "牛市", "sideways": "震荡市", "bear": "熊市"}
+        mc_lines.append(f"  市场环境: {regime_map.get(mc['regime'], mc['regime'])} (score={mc.get('regime_score', 0)})")
+        if mc.get("regime_detail"):
+            mc_lines.append(f"  环境细节: {mc['regime_detail']}")
+    if mc_lines:
+        sections.append("【市场环境】\n" + "\n".join(mc_lines))
+
     data_block = "\n\n".join(sections)
 
     return f"""你是一位经验丰富的A股短线交易复盘专家。请根据以下 {trade_date} 的交易数据，生成一份详细的复盘笔记。
 
 {data_block}
 
-请按以下结构输出复盘笔记：
+请按以下结构输出复盘笔记（每部分都要结合具体数据分析，不要空泛）：
 
-## 一、今日交易总结
+## 一、今日操作总结
 - 列出当日所有买卖操作及结果
+- 总盈亏金额和百分比
 
-## 二、盈利交易分析
-- 哪些交易盈利了？为什么？
+## 二、资金流向分析
+- 今日主力资金流入了哪些板块/个股？
+- 持仓股的主力资金是流入还是流出？
+- 资金流向与操作方向是否一致？（顺势还是逆势？）
+- 明日资金流向预判
+
+## 三、盈利交易分析
+- 哪些交易盈利了？为什么盈利？
 - 买入时机是否合理（结合MA/MACD/RSI）？
-- 执行价与日内最优价的偏差分析（如有峰值数据）
+- 卖出时机是否最优（对比日内峰值）？
 - 值得保持的操作习惯
 
-## 三、亏损交易分析
-- 哪些交易亏损了？为什么？
-- 是买入时机问题、还是卖出时机问题？
-- 是追高了还是没有止损？
-- 市场环境对亏损的影响
+## 四、亏损交易分析
+- 哪些交易亏损了？根本原因是什么？
+- 是追高被套？是大盘拖累？还是个股利空？
+- 是买入时机问题、还是没有及时止损？
+- 市场环境（牛市/震荡/熊市）对操作的影响
 
-## 四、持仓诊断
+## 五、持仓诊断
 - 当前持仓中哪些需要关注？
-- 浮亏持仓的风险评估
-- 浮盈持仓是否应止盈？
+- 浮亏持仓：继续持有的理由是否还成立？止损位在哪？
+- 浮盈持仓：是否应止盈？目标位在哪？
+- 持仓与当前市场环境是否匹配？
 
-## 五、执行力评分
+## 六、执行力评分（满分10分）
 - 对比AI建议和实际执行的差异
-- 执行价格与最优价格的偏差
+- 执行价格与日内最优价格的偏差
 - 是否存在犹豫/拖延/冲动操作
+- 给出具体分数和理由
 
-## 六、改进建议
-- 明天需要注意什么？
-- 操作纪律上有哪些需要改进？
-- 具体可执行的优化建议（1-3条）
+## 七、改进方案（重点！）
+- 今天最大的教训是什么？
+- 明天具体应该怎么操作？（持仓处理+新机会）
+- 仓位管理需要调整吗？（结合市场环境）
+- 给出3条具体可执行的改进建议
+- 下次遇到类似情况应该如何应对？
 
-请用简洁专业的语言，每条分析都要基于数据，不要空泛。如果数据不足某个板块可以跳过。"""
+请用简洁专业的语言，每条分析必须引用具体数据（价格、涨跌幅、资金流向数值等），不要泛泛而谈。"""
 
 
 def _format_review_report(data: dict, ai_review: str, trade_date: str) -> str:

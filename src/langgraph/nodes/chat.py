@@ -46,19 +46,26 @@ def chat_node(state: dict) -> dict:
 
 请简洁回答（200字以内），如果涉及操作建议，提醒用户使用具体命令（如"买入 002506 500 5.4"）。"""
 
-    # 优先用云端模型（Gemini Flash 响应快），本地 Ollama 备用
-    for model_env, default_model, label in [
-        ("LITELLM_MODEL", "gemini/gemini-2.5-flash", "云端"),
-        ("REBALANCE_LOCAL_MODEL", "ollama/qwen2.5:14b-instruct-q4_K_M", "本地"),
+    # 按优先级尝试: Azure(快+稳) → Gemini(免费) → 本地Ollama(兜底)
+    for model_env, default_model, label, timeout_s in [
+        ("REBALANCE_CLOUD_MODEL", "azure/gpt-5.4-nano", "云端Azure", 30),
+        ("LITELLM_MODEL", "gemini/gemini-2.5-flash", "云端Gemini", 20),
+        ("REBALANCE_LOCAL_MODEL", "ollama/qwen2.5:14b-instruct-q4_K_M", "本地Ollama", 300),
     ]:
         try:
             import litellm
             model = os.getenv(model_env, default_model)
+            if not model:
+                continue
+            extra_kwargs = {}
+            if "ollama" in model:
+                extra_kwargs["api_base"] = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
             response = litellm.completion(
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
-                timeout=30,
+                timeout=timeout_s,
                 temperature=0.5,
+                **extra_kwargs,
             )
             answer = response.choices[0].message.content.strip()
             return {"response": answer}

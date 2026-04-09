@@ -156,12 +156,123 @@ def get_all_stock_codes() -> list:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 市场环境检测
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def detect_market_regime() -> dict:
+    """
+    检测当前市场环境：bull / sideways / bear
+
+    依据:
+      1. 上证指数 MA5/MA20/MA60 排列
+      2. 近5日/20日涨跌幅
+      3. 市场宽度（涨跌家数比，通过批量行情估算）
+
+    返回: {"regime": "bull"|"sideways"|"bear", "score": int, "detail": str}
+    """
+    regime_score = 0   # >30 牛市, -30~30 震荡, <-30 熊市
+    details = []
+
+    try:
+        # 获取上证指数K线
+        df = _fetch_kline("000001", days=80)  # 上证指数在腾讯用sh000001
+        if df is None or len(df) < 60:
+            # fallback: 用沪深300
+            df = _fetch_kline("399300", days=80)
+
+        if df is not None and len(df) >= 60:
+            close = df["close"].values
+
+            # MA排列
+            ma5 = np.mean(close[-5:])
+            ma20 = np.mean(close[-20:])
+            ma60 = np.mean(close[-60:])
+
+            if ma5 > ma20 > ma60:
+                regime_score += 30
+                details.append("MA多头排列(+30)")
+            elif ma5 > ma20:
+                regime_score += 15
+                details.append("短期多头(+15)")
+            elif ma5 < ma20 < ma60:
+                regime_score -= 30
+                details.append("MA空头排列(-30)")
+            elif ma5 < ma20:
+                regime_score -= 15
+                details.append("短期空头(-15)")
+            else:
+                details.append("MA震荡(0)")
+
+            # 近5日涨跌幅
+            chg_5d = (close[-1] / close[-6] - 1) * 100 if len(close) >= 6 else 0
+            if chg_5d > 3:
+                regime_score += 20
+                details.append(f"5日涨{chg_5d:.1f}%(+20)")
+            elif chg_5d > 1:
+                regime_score += 10
+                details.append(f"5日涨{chg_5d:.1f}%(+10)")
+            elif chg_5d < -3:
+                regime_score -= 20
+                details.append(f"5日跌{chg_5d:.1f}%(-20)")
+            elif chg_5d < -1:
+                regime_score -= 10
+                details.append(f"5日跌{chg_5d:.1f}%(-10)")
+
+            # 近20日涨跌幅
+            chg_20d = (close[-1] / close[-21] - 1) * 100 if len(close) >= 21 else 0
+            if chg_20d > 8:
+                regime_score += 15
+                details.append(f"20日涨{chg_20d:.1f}%(+15)")
+            elif chg_20d > 3:
+                regime_score += 5
+                details.append(f"20日涨{chg_20d:.1f}%(+5)")
+            elif chg_20d < -8:
+                regime_score -= 15
+                details.append(f"20日跌{chg_20d:.1f}%(-15)")
+            elif chg_20d < -3:
+                regime_score -= 5
+                details.append(f"20日跌{chg_20d:.1f}%(-5)")
+
+            # 指数是否在60日线上方
+            if close[-1] > ma60:
+                regime_score += 10
+                details.append("站上60日线(+10)")
+            else:
+                regime_score -= 10
+                details.append("跌破60日线(-10)")
+
+    except Exception as e:
+        logger.warning(f"[市场环境] 指数分析失败: {e}")
+        details.append("指数分析失败")
+
+    # 判定
+    if regime_score >= 30:
+        regime = "bull"
+    elif regime_score <= -30:
+        regime = "bear"
+    else:
+        regime = "sideways"
+
+    detail_str = ", ".join(details)
+    logger.info(f"[市场环境] {regime.upper()} (score={regime_score}) | {detail_str}")
+
+    return {
+        "regime": regime,
+        "score": regime_score,
+        "detail": detail_str,
+    }
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # K线技术分析
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def analyze_kline(df: pd.DataFrame) -> dict:
-    """
-    对K线做完整技术分析
-    返回：MA排列、MACD、RSI、量价关系、得分
+def analyze_kline(df: pd.DataFrame, mode: str = "dragon") -> dict:
+    """技术评分（支持多模式）
+
+    mode:
+      dragon   — 龙头打板（涨停/连板/接力）
+      trend    — 趋势选股（MA/RSI/MACD/量价综合评分）
+      oversold — 超跌反弹
+      breakout — 放量突破
     """
     if df is None or len(df) < 20:
         return {"score": 0, "error": "数据不足"}
@@ -171,48 +282,304 @@ def analyze_kline(df: pd.DataFrame) -> dict:
     high = df["high"]
     low = df["low"]
     latest = close.iloc[-1]
+    close_arr = close.values
+    high_arr = high.values
+    vol_arr = volume.values
 
     result = {}
 
-    # === MA 均线 ===
+    # ── 基础指标 ──
     ma5 = close.rolling(5).mean().iloc[-1]
     ma10 = close.rolling(10).mean().iloc[-1]
     ma20 = close.rolling(20).mean().iloc[-1]
-    ma60 = close.rolling(60).mean().iloc[-1] if len(close) >= 60 else ma20
 
-    if ma5 > ma10 > ma20:
-        result["ma_trend"] = "多头排列"
-        ma_score = 30
-    elif ma5 > ma10:
-        result["ma_trend"] = "短期多头"
-        ma_score = 20
-    elif ma5 < ma10 < ma20:
-        result["ma_trend"] = "空头排列"
-        ma_score = -10  # 负分！用户数据：空头排列胜率仅17.5%
-    else:
-        result["ma_trend"] = "震荡"
-        ma_score = 10
+    today_chg = (latest / close_arr[-2] - 1) * 100 if len(close_arr) >= 2 else 0
+    result["today_chg"] = round(today_chg, 2)
 
-    # === 乖离率 BIAS ===
-    bias5 = (latest - ma5) / ma5 * 100 if ma5 else 0
-    bias20 = (latest - ma20) / ma20 * 100 if ma20 else 0
+    prev_chg = (close_arr[-2] / close_arr[-3] - 1) * 100 if len(close_arr) >= 3 else 0
+    is_prev_limit = prev_chg > 9.5
+
+    # 连板天数
+    consec_limit = 0
+    for j in range(-1, max(-8, -len(close_arr)), -1):
+        day_chg = (close_arr[j] / close_arr[j-1] - 1) * 100 if j-1 >= -len(close_arr) else 0
+        if day_chg > 9.5:
+            consec_limit += 1
+        else:
+            break
+
+    # 连阳天数
+    consec_up = 0
+    for j in range(-1, max(-8, -len(close_arr)), -1):
+        if close_arr[j] > close_arr[j-1]:
+            consec_up += 1
+        else:
+            break
+
+    # 量比
+    vol_ma20 = np.mean(vol_arr[-20:]) if len(vol_arr) >= 20 else np.mean(vol_arr[-5:])
+    vol_today_ratio = vol_arr[-1] / vol_ma20 if vol_ma20 > 0 else 1
+    result["vol_ratio"] = round(vol_today_ratio, 2)
+
+    # 3日/5日涨幅
+    chg_3d = (latest / close_arr[-4] - 1) * 100 if len(close_arr) >= 4 else 0
+    chg_5d = (latest / close_arr[-6] - 1) * 100 if len(close_arr) >= 6 else 0
+    result["chg_3d"] = round(chg_3d, 2)
+
+    # 20日新高
+    h20 = np.max(high_arr[-20:]) if len(high_arr) >= 20 else np.max(high_arr[-10:])
+    is_20d_high = latest >= h20 * 0.98
+
+    # 换手率（如果有）
+    turnover = 0
+    if "turnover_rate" in df.columns:
+        turnover = float(df["turnover_rate"].iloc[-1])
+        if pd.isna(turnover):
+            turnover = 0
+
+    score = 0
+    signal_type = "none"
+
+    # 昨日跌幅（用于地天板判断）
+    prev_chg_down = prev_chg  # 已经算过了
+    # 前天涨幅
+    prev2_chg = (close_arr[-3] / close_arr[-4] - 1) * 100 if len(close_arr) >= 4 else 0
+
+    # ═══ 策略S: 地天板 / 天地天板 ═══
+    # 昨日跌停（或大跌≥8%）+ 今日涨停 → 地天板，超强反转信号
+    if today_chg > 9.5 and prev_chg_down < -8:
+        score = 50
+        if prev2_chg > 9.5:
+            # 天地天板：前天涨停→昨天跌停→今天涨停，30%振幅
+            score += 40
+            signal_type = "sky_floor_sky"
+        else:
+            signal_type = "floor_to_sky"
+        if vol_today_ratio > 1.5:
+            score += 10    # 放量反包更强
+        if turnover > 8:
+            score += 5     # 换手充分，筹码交换
+
+    # 昨日涨停 + 今日大跌（量化砸盘）→ 标记为潜在地天板机会
+    elif prev_chg > 9.5 and today_chg < -5:
+        # 不评分（当前在坑里），但标记供持仓判断用
+        result["floor_trap"] = True   # 可能的量化砸盘坑
+        result["potential_reversal"] = True
+
+    # ═══ 策略A: 涨停打板 ═══
+    elif today_chg > 9.5:
+        score = 30
+        if consec_limit >= 2:
+            score += 40     # 二连板最强
+        elif consec_limit == 1:
+            score += 25     # 首板
+        if 5 <= turnover <= 15:
+            score += 15
+        elif turnover > 15:
+            score -= 10
+        if vol_today_ratio < 2:
+            score += 10     # 缩量涨停
+        signal_type = "board_hit"
+
+    # ═══ 策略B: 涨停接力 ═══
+    elif is_prev_limit and today_chg > 3:
+        score = 25
+        if today_chg >= 5:
+            score += 35
+        elif today_chg >= 3:
+            score += 20
+        if turnover > 8:
+            score += 10
+        signal_type = "relay"
+
+    # ═══ 策略C: 爆量突破 ═══
+    elif today_chg >= 5 and vol_today_ratio > 2 and is_20d_high:
+        score = 20
+        if chg_3d > 10:
+            score += 25
+        elif chg_3d > 5:
+            score += 15
+        if consec_up >= 3:
+            score += 15
+        if ma5 > ma10 > ma20:
+            score += 10
+        signal_type = "breakout"
+
+    # ═══ 策略D: 强势动量 ═══
+    elif chg_3d >= 15 and today_chg > 2:
+        score = 20
+        if chg_5d > 20:
+            score += 25
+        elif chg_5d > 10:
+            score += 15
+        if consec_up >= 4:
+            score += 15
+        if is_20d_high:
+            score += 10
+        signal_type = "momentum"
+
+    # ═══ 非龙头模式：趋势/超跌/突破 综合评分 ═══
+    if mode != "dragon" and score == 0:
+        signal_type = "trend"
+
+        # RSI
+        rsi_tmp = 50
+        if len(close_arr) >= 15:
+            _deltas = np.diff(close_arr[-15:])
+            _gain = np.mean(_deltas[_deltas > 0]) if np.any(_deltas > 0) else 0
+            _loss = -np.mean(_deltas[_deltas < 0]) if np.any(_deltas < 0) else 0.001
+            rsi_tmp = 100 - 100 / (1 + _gain / _loss)
+
+        # Bias5
+        _bias5 = (latest - ma5) / ma5 * 100 if ma5 > 0 else 0
+
+        # MA趋势评分
+        if ma5 > ma10 > ma20:
+            score += 15      # 多头排列
+        elif ma5 > ma10:
+            score += 10      # 短期多头
+        elif ma5 < ma10 < ma20:
+            score += 5       # 空头（均值回归机会）
+        else:
+            score += 8       # 震荡
+
+        # RSI评分
+        if rsi_tmp < 30:
+            score += 20      # 超卖
+        elif rsi_tmp < 40:
+            score += 15
+        elif rsi_tmp < 50:
+            score += 10
+        elif rsi_tmp < 60:
+            score += 5
+        elif rsi_tmp > 70:
+            score -= 10      # 超买
+
+        # Bias5评分（偏离均线）
+        if _bias5 < -5:
+            score += 15      # 深度偏离
+        elif _bias5 < -3:
+            score += 12
+        elif _bias5 < -1:
+            score += 8
+        elif _bias5 < 2:
+            score += 5
+        elif _bias5 > 5:
+            score -= 10      # 过度偏离
+
+        # 量比评分
+        if 0.8 <= vol_today_ratio <= 1.5:
+            score += 10      # 温和放量
+        elif vol_today_ratio > 1.5:
+            score += 5       # 放量
+        elif vol_today_ratio > 2.5:
+            score -= 5       # 过度放量
+
+        # MACD
+        _ema12 = close.ewm(span=12).mean()
+        _ema26 = close.ewm(span=26).mean()
+        _dif = _ema12 - _ema26
+        _dea = _dif.ewm(span=9).mean()
+        if _dif.iloc[-1] > _dea.iloc[-1] and _dif.iloc[-2] <= _dea.iloc[-2]:
+            score += 10      # 金叉
+        elif _dif.iloc[-1] > _dea.iloc[-1]:
+            score += 5       # 多头
+
+        # 20日价格位置
+        _h20 = np.max(high_arr[-20:]) if len(high_arr) >= 20 else np.max(high_arr)
+        _l20 = np.min(low.values[-20:]) if len(low) >= 20 else np.min(low.values)
+        _range20 = _h20 - _l20
+        _pos = (latest - _l20) / _range20 if _range20 > 0 else 0.5
+        if _pos < 0.3:
+            score += 10      # 低位
+        elif _pos < 0.5:
+            score += 5
+        elif _pos > 0.9:
+            score -= 10      # 高位
+
+        # ── 龙头预埋加分（提前埋伏有连板预期的票）──
+        # 条件：近期有涨停历史 + 当前回调到位 + 量能未散
+        has_recent_limit = False
+        for j in range(-2, max(-8, -len(close_arr)), -1):
+            _d_chg = (close_arr[j] / close_arr[j-1] - 1) * 100 if j-1 >= -len(close_arr) else 0
+            if _d_chg > 9.5:
+                has_recent_limit = True
+                break
+
+        if has_recent_limit:
+            # 近7日内有过涨停，现在回调 → 龙头预埋
+            if today_chg < 3 and _pos < 0.7:
+                score += 15
+                signal_type = "pre_dragon"  # 龙头预埋
+            elif today_chg < 5:
+                score += 8
+                signal_type = "pre_dragon"
+
+        # 连阳蓄势（3天以上连阳但每天涨幅不大 → 可能要爆发）
+        if consec_up >= 3 and today_chg < 5 and chg_3d < 10:
+            score += 8
+
+        # 涨幅限制（追高惩罚）
+        if today_chg >= 7:
+            score -= 15
+        elif today_chg >= 5:
+            score -= 5
+        elif today_chg < -5:
+            score += 5       # 深跌反弹机会
+
+    # 价格过滤
+    if latest > 50:
+        score -= 20
+
+    # ── 辅助信息 ──
+    result["score"] = max(0, score)
+    result["max_score"] = 100
+    result["signal_type"] = signal_type
+    result["consec_limit"] = consec_limit
+    result["consec_up"] = consec_up
+    result["t1_safety"] = 0
+
+    result["ma_trend"] = (
+        "多头排列" if ma5 > ma10 > ma20
+        else "短期多头" if ma5 > ma10
+        else "空头排列" if ma5 < ma10 < ma20
+        else "震荡"
+    )
+    result["vol_pattern"] = (
+        "放量上攻" if vol_today_ratio > 1.5 and today_chg > 0
+        else "温和放量" if vol_today_ratio > 1.2
+        else "平稳" if vol_today_ratio > 0.8
+        else "缩量"
+    )
+
+    bias5 = (latest - ma5) / ma5 * 100 if ma5 > 0 else 0
     result["bias5"] = round(bias5, 2)
-    result["bias20"] = round(bias20, 2)
-    # 低乖离率（回踩到位）加分
-    bias_score = 10 if -3 < bias5 < 2 else 5 if bias5 < 5 else 0
+    result["bias20"] = round((latest - ma20) / ma20 * 100 if ma20 else 0, 2)
 
-    # === RSI ===
-    delta = close.diff()
-    gain = delta.where(delta > 0, 0).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    rs = gain / loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    rsi_val = rsi.iloc[-1] if not rsi.empty and not pd.isna(rsi.iloc[-1]) else 50
+    recent_20_high = high.tail(20).max()
+    recent_20_low = low.tail(20).min()
+    result["support"] = round(recent_20_low, 2)
+    result["resistance"] = round(recent_20_high, 2)
+    price_range = recent_20_high - recent_20_low
+    result["price_position"] = round(
+        (latest - recent_20_low) / price_range if price_range > 0 else 0.5, 2
+    )
+
+    if len(close) >= 6:
+        result["chg_5d"] = round(chg_5d, 2)
+    if len(close) >= 11:
+        result["chg_10d"] = round((latest / close_arr[-11] - 1) * 100, 2)
+
+    # RSI
+    rsi_val = 50
+    if len(close_arr) >= 15:
+        deltas = np.diff(close_arr[-15:])
+        gain = np.mean(deltas[deltas > 0]) if np.any(deltas > 0) else 0
+        loss_val = -np.mean(deltas[deltas < 0]) if np.any(deltas < 0) else 0.001
+        rsi_val = 100 - 100 / (1 + gain / loss_val)
     result["rsi"] = round(rsi_val, 1)
-    # RSI 30-60 加分（非超买）
-    rsi_score = 15 if 30 < rsi_val < 60 else 10 if rsi_val < 30 else 0
 
-    # === MACD ===
+    # MACD
     ema12 = close.ewm(span=12).mean()
     ema26 = close.ewm(span=26).mean()
     dif = ema12 - ema26
@@ -221,64 +588,7 @@ def analyze_kline(df: pd.DataFrame) -> dict:
     result["macd_dif"] = round(dif.iloc[-1], 3)
     result["macd_dea"] = round(dea.iloc[-1], 3)
     result["macd_bar"] = round(macd_bar.iloc[-1], 3)
-    # 金叉或即将金叉加分
-    if dif.iloc[-1] > dea.iloc[-1] and dif.iloc[-2] <= dea.iloc[-2]:
-        result["macd_signal"] = "金叉"
-        macd_score = 20
-    elif dif.iloc[-1] > dea.iloc[-1]:
-        result["macd_signal"] = "多头"
-        macd_score = 15
-    elif macd_bar.iloc[-1] > macd_bar.iloc[-2]:
-        result["macd_signal"] = "底部收敛"
-        macd_score = 10
-    else:
-        result["macd_signal"] = "空头"
-        macd_score = 0
-
-    # === 量价关系 ===
-    vol_ma5 = volume.rolling(5).mean().iloc[-1]
-    vol_ma20 = volume.rolling(20).mean().iloc[-1] if len(volume) >= 20 else vol_ma5
-    vol_ratio = round(vol_ma5 / vol_ma20, 2) if vol_ma20 > 0 else 1
-    result["vol_ratio"] = vol_ratio
-    # 缩量回踩（量比0.6-0.9）或温和放量（1.0-1.5）加分
-    if 0.6 <= vol_ratio <= 0.9:
-        result["vol_pattern"] = "缩量回踩"
-        vol_score = 15
-    elif 1.0 <= vol_ratio <= 1.5:
-        result["vol_pattern"] = "温和放量"
-        vol_score = 10
-    elif vol_ratio > 2.0:
-        result["vol_pattern"] = "异常放量"
-        vol_score = 5
-    else:
-        result["vol_pattern"] = "缩量"
-        vol_score = 5
-
-    # === 支撑压力 ===
-    recent_20 = close.tail(20)
-    result["support"] = round(recent_20.min(), 2)
-    result["resistance"] = round(recent_20.max(), 2)
-
-    # === 近N日涨跌 ===
-    if len(close) >= 5:
-        result["chg_5d"] = round((latest / close.iloc[-6] - 1) * 100, 2) if close.iloc[-6] > 0 else 0
-    if len(close) >= 10:
-        result["chg_10d"] = round((latest / close.iloc[-11] - 1) * 100, 2) if close.iloc[-11] > 0 else 0
-
-    # === T+1 安全分（回调买入加分，追高扣分）===
-    # 价格贴近MA5支撑=止损距离短=T+1风险低
-    t1_score = 0
-    if abs(bias5) < 1.5:
-        t1_score = 10  # 贴近MA5，止损距离最短
-    elif bias5 < -3:
-        t1_score = 5   # 远低于MA5，超跌但风险大
-    elif bias5 > 5:
-        t1_score = -10  # 远高于MA5，追高危险
-    result["t1_safety"] = t1_score
-
-    # === 总分 ===
-    result["score"] = ma_score + bias_score + rsi_score + macd_score + vol_score + t1_score
-    result["max_score"] = 100
+    result["macd_signal"] = "多头" if dif.iloc[-1] > dea.iloc[-1] else "空头"
 
     return result
 
@@ -319,7 +629,7 @@ def _load_mainline_sectors() -> set:
 
 
 def scan_market(
-    max_price: float = 10.0,
+    max_price: float = 40.0,
     min_turnover: float = 2.0,
     max_market_cap: float = 100.0,
     min_change: float = -3.0,
@@ -407,72 +717,37 @@ def scan_market(
         if df.empty:
             continue
 
-        ta = analyze_kline(df)
+        _kline_mode = "dragon" if mode in ("dragon", "sub_dragon") else mode
+        ta = analyze_kline(df, mode=_kline_mode)
         if ta.get("score", 0) == 0:
             continue
 
-        # ============ 按模式加分 ============
+        # ============ 龙头打板加分（与回测v6同步）============
         bonus = 0
         chg_today = q.get("change_pct", 0)
+        sig_type = ta.get("signal_type", "none")
 
-        # ── T+1 追高惩罚（所有模式通用，最高优先级）──
-        # A股今天买明天才能卖，追高=承受隔夜风险无法止损
-        if chg_today >= 7:
-            bonus -= 30   # 涨停板附近，T+1极度危险
-        elif chg_today >= 5:
-            bonus -= 20   # 涨幅过大，禁止追高
-        elif chg_today >= 3:
-            bonus -= 10   # 追高警告
-        # 回调买入奖励：当日微跌但趋势向上 = 最佳T+1买点
-        if -2 < chg_today < 0.5 and ta.get("ma_trend") in ("多头排列", "短期多头"):
-            bonus += 15   # 强势股回调，明日大概率反弹
+        # 龙头战法：信号类型直接决定加分
+        if sig_type == "board_hit":
+            bonus += 20     # 涨停打板
+        elif sig_type == "relay":
+            bonus += 15     # 涨停接力
+        elif sig_type == "breakout":
+            bonus += 10     # 爆量突破
+        elif sig_type == "momentum":
+            bonus += 5      # 强势动量
 
-        if mode == "trend":
-            if ta.get("ma_trend") == "多头排列":
-                bonus += 10
-            if ta.get("vol_pattern") == "缩量回踩":
-                bonus += 15  # 缩量回踩是T+1最安全的买点（提升权重）
-            elif ta.get("vol_pattern") == "温和放量":
-                bonus += 5
-            if -2 < ta.get("bias5", 99) < 1:
-                bonus += 10  # 贴近均线=止损距离短
+        # 资金流加分（副龙头模式专用）
+        if mode == "sub_dragon" and code in fund_flow_stocks:
+            net = fund_flow_stocks[code]
+            bonus += 15 if net > 5000 else 10 if net > 1000 else 5
 
-        elif mode == "breakout":
-            # 突破模式降权：T+1下追突破风险极高
-            if ta.get("vol_ratio", 0) > 1.5:
-                bonus += 5   # 降低（原来10分）
-            if chg_today > 3:
-                bonus -= 5   # 反而扣分（原来+10）：当日大涨的突破不追
-
-        elif mode == "oversold":
-            if ta.get("rsi", 50) < 30:
-                bonus += 15
-            if ta.get("macd_signal") == "底部收敛":
-                bonus += 10
-            # 超跌反弹也不能追高买：等确认后再入
-            if chg_today > 5:
-                bonus -= 10  # 超跌反弹首日涨太多不追
-
-        elif mode == "sub_dragon":
-            # 副龙头策略：低位 + 题材催化 + 资金流入 + 技术底部
-            if code in fund_flow_stocks:
-                net = fund_flow_stocks[code]
-                bonus += 15 if net > 5000 else 10 if net > 1000 else 5
-            chg_10d = ta.get("chg_10d", 0)
-            if chg_10d < -5 and 0 < chg_today < 3:
-                bonus += 10  # 超跌+温和反弹（非暴涨）
-            elif chg_10d < -3 and chg_today > 0:
-                bonus += 5
-            if ta.get("macd_signal") in ("金叉", "底部收敛"):
-                bonus += 10
-            if q.get("turnover_rate", 0) > 5:
-                bonus += 5
-            if ta.get("rsi", 50) < 45:
-                bonus += 5
-
-        # ── 空头排列惩罚（用户数据：空头排列胜率仅17.5%）──
-        if ta.get("ma_trend") == "空头排列":
-            bonus -= 15
+        # 连板加分
+        consec = ta.get("consec_limit", 0)
+        if consec >= 2:
+            bonus += 15
+        elif consec >= 1:
+            bonus += 5
 
         # 盈利模式加分（基于历史交易数据学习）
         if winning_patterns:

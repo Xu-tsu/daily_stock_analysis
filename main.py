@@ -465,15 +465,17 @@ def run_full_analysis(
         logger.exception(f"分析流程执行失败: {e}")
 
 
-def _auto_build_positions(portfolio: dict, config, args):
+def _auto_build_positions(portfolio: dict, config, args, candidates=None):
     """空仓时自动选股+直接在THS买入。
 
     流程: scan_market → 选3只 → 均分资金 → broker.buy → 更新 portfolio
+    如果传入 candidates 则直接使用，不再重新扫描。
     """
     import os
     try:
-        from market_scanner import scan_market
-        candidates = scan_market(max_price=10.0, min_turnover=2.0, top_n=5, mode="trend")
+        if not candidates:
+            from market_scanner import scan_market
+            candidates = scan_market(max_price=10.0, min_turnover=2.0, top_n=5, mode="trend")
         if not candidates:
             logger.info("[自动建仓] 扫描无合适候选，跳过")
             return
@@ -515,6 +517,7 @@ def _auto_build_positions(portfolio: dict, config, args):
             logger.info(f"[自动建仓] 买入 {name}({code}) {shares}股 × {price:.2f}元 = {amount:,.0f}元")
 
             # 券商下单
+            broker_success = False
             if broker_enabled:
                 try:
                     from src.broker import get_broker
@@ -522,12 +525,38 @@ def _auto_build_positions(portfolio: dict, config, args):
                     if broker and broker.is_connected():
                         result = broker.buy(code, price, shares)
                         logger.info(f"[自动建仓] THS下单: {result.status} {result.message}")
-                        if result.actual_price and result.actual_price > 0:
-                            price = result.actual_price
-                        if result.actual_shares and result.actual_shares > 0:
-                            shares = result.actual_shares
+                        if result.is_success:
+                            broker_success = True
+                            if result.actual_price and result.actual_price > 0:
+                                price = result.actual_price
+                            if result.actual_shares and result.actual_shares > 0:
+                                shares = result.actual_shares
+                        else:
+                            logger.warning(f"[自动建仓] {name}({code}) 下单失败: {result.message}，跳过")
+                            continue  # 下单失败，不记录不更新持仓
                 except Exception as e:
-                    logger.error(f"[自动建仓] THS下单失败: {e}")
+                    logger.error(f"[自动建仓] THS下单失败: {e}，跳过 {name}")
+                    continue
+            else:
+                # 非券商模式（模拟），直接视为成功
+                broker_success = True
+
+            # 记录到交易日志（复盘用）
+            try:
+                from trade_journal import record_buy
+                record_buy(
+                    code=code, name=name, shares=shares, price=price,
+                    ma_trend=c.get("ma_trend", ""),
+                    macd_signal=c.get("macd_signal", ""),
+                    rsi=c.get("rsi", 0),
+                    vol_pattern=c.get("vol_pattern", ""),
+                    tech_score=c.get("tech_score", 0),
+                    sector=c.get("sector", ""),
+                    source="auto_build",
+                    note=f"自动建仓 score={c.get('tech_score', 0)}",
+                )
+            except Exception as e:
+                logger.warning(f"[自动建仓] 交易日志记录失败: {e}")
 
             # 更新本地持仓
             # 先移除同code的0股占位
@@ -783,46 +812,77 @@ def main() -> int:
         return 0
 
     try:
-        # ━━━ 模式A: 全功能模式（Web + 定时 + 监控 + 调仓）━━━
+        # ━━━ 模式A: 全功能模式（所有模块一键启动）━━━
         if getattr(args, 'all', False):
-            logger.info("模式: 全功能（Web + 定时分析 + 盘中监控 + 调仓）")
-            logger.info("附加盘中节点: 9:45 早盘调仓, 13:15 午后调仓")
+            logger.info("=" * 60)
+            logger.info("  全功能模式启动")
+            logger.info("  新闻情报 + 市场环境 + 智能选股 + 调仓")
+            logger.info("  可转债T+0 + 盘中监控 + 技能进化 + 复盘")
+            logger.info("=" * 60)
 
             # 强制跳过交易日检查（监控模块自己判断交易时间）
             args.force_run = True
 
             import threading
 
-            # 后台线程1: 盘中监控
-            def _monitor():
-                from market_monitor import run_monitor_loop
-                run_monitor_loop(
-                    interval_minutes=getattr(args, 'interval', 1),
-                    auto_rebalance=True,
-                )
+            # ━━━ Phase 0: 市场环境检测 ━━━
+            regime = {"regime": "sideways", "score": 0, "detail": ""}
+            try:
+                from market_scanner import detect_market_regime
+                regime = detect_market_regime()
+                regime_map = {"bull": "牛市(追涨/连板)", "sideways": "震荡(均值回归+预埋)", "bear": "熊市(防守/超跌)"}
+                logger.info(f"[Phase 0] 市场环境: {regime_map.get(regime['regime'], regime['regime'])} score={regime['score']}")
+            except Exception as e:
+                logger.warning(f"[Phase 0] 市场环境检测失败: {e}")
 
-            threading.Thread(target=_monitor, daemon=True).start()
-            logger.info("盘中监控已在后台启动")
+            # ━━━ Phase 1: 新闻情报扫描 ━━━
+            hot_concepts = []
+            try:
+                from dual_trader import run_news_scan
+                hot_concepts = run_news_scan()
+                if hot_concepts:
+                    logger.info(f"[Phase 1] 热点概念: {', '.join(c['concept'] for c in hot_concepts[:3])}")
+                else:
+                    logger.info("[Phase 1] 暂无热点概念")
+            except Exception as e:
+                logger.warning(f"[Phase 1] 新闻扫描失败: {e}")
 
-            # 流程：先调仓交易（优先级高），再跑全量分析报告（后台）
-            # 原因：两者共用本地Ollama单GPU，不能真正并行，调仓时效性更高
+            # ━━━ Phase 2: 技能引擎加载 ━━━
+            try:
+                from agent_skill_engine import get_skill_engine
+                skill_engine = get_skill_engine()
+                logger.info(f"[Phase 2] {skill_engine.get_skill_summary()}")
+            except Exception as e:
+                logger.warning(f"[Phase 2] 技能引擎加载失败: {e}")
+
+            # ━━━ Phase 3: 智能选股 + 调仓/建仓 ━━━
             skip_startup_analysis = os.getenv("SKIP_STARTUP_ANALYSIS", "false").lower() in ("true", "1", "yes")
-
-            # 调仓（空仓时自动选股+直接建仓，有仓时正常调仓）
             try:
                 from portfolio_manager import load_portfolio, save_portfolio, format_rebalance_report
                 portfolio = load_portfolio()
-
-                # 判断是否有实际持仓（排除0股占位）
                 real_holdings = [h for h in portfolio.get("holdings", []) if h.get("shares", 0) > 0]
 
                 if not real_holdings:
-                    # ── 空仓：扫描 → 直接在THS买入 ──
-                    logger.info("空仓状态，启动自动选股+建仓...")
-                    _auto_build_positions(portfolio, config, args)
+                    # ── 空仓：智能选股 → 建仓 ──
+                    logger.info("[Phase 3] 空仓状态，智能选股+建仓...")
+
+                    # 用dual_trader的智能选股（结合新闻+市场环境）
+                    try:
+                        from dual_trader import run_stock_scan
+                        smart_candidates = run_stock_scan(hot_concepts=hot_concepts, regime=regime)
+                        if smart_candidates:
+                            logger.info(f"[Phase 3] 智能选股结果: {len(smart_candidates)} 只候选")
+                            # 将智能选股结果传递给建仓（替代默认扫描）
+                            _auto_build_positions(portfolio, config, args, candidates=smart_candidates)
+                        else:
+                            logger.info("[Phase 3] 智能选股无候选，使用默认扫描建仓")
+                            _auto_build_positions(portfolio, config, args)
+                    except Exception as e:
+                        logger.warning(f"[Phase 3] 智能选股失败({e})，使用默认扫描")
+                        _auto_build_positions(portfolio, config, args)
                 else:
                     # ── 有仓：正常调仓 ──
-                    logger.info("立即执行调仓分析...")
+                    logger.info(f"[Phase 3] 有{len(real_holdings)}只持仓，执行调仓分析...")
                     from rebalance_engine import run_rebalance_analysis
                     result = run_rebalance_analysis(config=config)
                     if "error" not in result:
@@ -842,19 +902,60 @@ def main() -> int:
                     else:
                         logger.warning(f"调仓失败: {result.get('error')}")
             except Exception as e:
-                logger.warning(f"首次调仓失败: {e}")
+                logger.warning(f"[Phase 3] 调仓失败: {e}")
 
-            # 调仓完成后，再跑全量分析（生成详细报告推送）
+            # ━━━ Phase 4: 可转债T+0（后台线程）━━━
+            def _cb_trading():
+                try:
+                    from dual_trader import run_cb_trading
+                    broker = None
+                    if os.getenv("BROKER_ENABLED", "false").lower() in ("true", "1", "yes"):
+                        from src.broker import get_broker as _get_broker
+                        broker = _get_broker()
+                    cb_capital = float(os.getenv("CB_CAPITAL", "12000"))
+                    logger.info(f"[Phase 4] 可转债T+0启动, 资金={cb_capital:.0f}")
+                    report = run_cb_trading(broker=broker, capital=cb_capital)
+                    if report:
+                        logger.info(f"[Phase 4] 可转债完成: {report}")
+                except Exception as e:
+                    logger.warning(f"[Phase 4] 可转债跳过: {e}")
+
+            threading.Thread(target=_cb_trading, daemon=True).start()
+
+            # ━━━ Phase 5: 盘中监控（后台线程）━━━
+            def _monitor():
+                from market_monitor import run_monitor_loop
+                run_monitor_loop(
+                    interval_minutes=getattr(args, 'interval', 1),
+                    auto_rebalance=True,
+                )
+
+            threading.Thread(target=_monitor, daemon=True).start()
+            logger.info("[Phase 5] 盘中监控已在后台启动")
+
+            # ━━━ Phase 6: 全量分析报告 ━━━
             if not skip_startup_analysis:
-                logger.info("调仓完成，开始全量分析报告...")
+                logger.info("[Phase 6] 开始全量分析报告...")
                 try:
                     run_full_analysis(config, args, stock_codes)
                 except Exception as e:
-                    logger.warning(f"全量分析失败: {e}")
+                    logger.warning(f"[Phase 6] 全量分析失败: {e}")
             else:
-                logger.info("跳过全量分析（SKIP_STARTUP_ANALYSIS=true）")
+                logger.info("[Phase 6] 跳过全量分析（SKIP_STARTUP_ANALYSIS=true）")
 
-            # 定时循环（每天 SCHEDULE_TIME 再跑一次）
+            # ━━━ 启动摘要 ━━━
+            logger.info("")
+            logger.info("=" * 60)
+            logger.info("  全模块启动完成")
+            logger.info(f"  市场环境: {regime.get('regime', '?').upper()} (score={regime.get('score', 0)})")
+            logger.info(f"  热点概念: {len(hot_concepts)} 个")
+            logger.info(f"  持仓管理: 调仓/建仓已执行")
+            logger.info(f"  可转债T+0: 后台运行中")
+            logger.info(f"  盘中监控: 后台运行中 (1分钟间隔)")
+            logger.info(f"  收盘任务: 复盘报告+技能进化+涨停分析 (15:00自动)")
+            logger.info("=" * 60)
+
+            # ━━━ 定时循环 ━━━
             from src.scheduler import run_with_schedule
             run_with_schedule(
                 task=lambda: run_full_analysis(config, args, stock_codes),

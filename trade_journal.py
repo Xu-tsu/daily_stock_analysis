@@ -516,6 +516,131 @@ def _calc_group_stats(group: list) -> dict:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 3b. 历史决策参考模型（喂给AI Agent防幻觉）
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def build_decision_reference(code: str = None, days: int = 90) -> str:
+    """
+    基于真实交易数据，生成结构化的"决策参考模型"文本
+    直接注入Agent prompt，让AI基于事实判断而不是猜测
+
+    包含：
+    1. 全局统计（胜率/盈亏比/最优条件）
+    2. 各维度胜率表（MA趋势/MACD/持仓天数/资金流向/大盘环境）
+    3. 该股历史交易记录（如果有）
+    4. 历史相似形态的胜率
+    """
+    lines = []
+
+    # ── 1. 全局统计 ──
+    perf = get_performance_summary(days=days)
+    if perf.get("total_trades", 0) >= 3:
+        lines.append("## 历史交易统计（真实数据，必须参考）")
+        lines.append(f"- 样本: 近{days}天 {perf['total_trades']}笔交易")
+        lines.append(f"- 胜率: {perf['win_rate']}%")
+        lines.append(f"- 平均收益: {perf['avg_pnl_pct']}%")
+        lines.append(f"- 平均持仓: {perf['avg_hold_days']}天")
+        lines.append(f"- 最佳: {perf.get('best_trade', 'N/A')}")
+        lines.append(f"- 最差: {perf.get('worst_trade', 'N/A')}")
+        lines.append("")
+
+    # ── 2. 各维度胜率表 ──
+    patterns = analyze_winning_patterns(days=days)
+    if patterns.get("sample_size", 0) >= 5:
+        # MA趋势胜率
+        ma_data = patterns.get("ma_analysis", {})
+        if ma_data:
+            lines.append("### MA趋势胜率（数据驱动，权重最高）")
+            for trend, stats in sorted(ma_data.items(), key=lambda x: x[1]["win_rate"], reverse=True):
+                lines.append(f"  - {trend}: 胜率{stats['win_rate']}% 均收益{stats['avg_pnl']}% (样本{stats['count']})")
+            lines.append("")
+
+        # MACD信号胜率
+        macd_data = patterns.get("macd_analysis", {})
+        if macd_data:
+            lines.append("### MACD信号胜率")
+            for sig, stats in sorted(macd_data.items(), key=lambda x: x[1]["win_rate"], reverse=True):
+                lines.append(f"  - {sig}: 胜率{stats['win_rate']}% 均收益{stats['avg_pnl']}% (样本{stats['count']})")
+            lines.append("")
+
+        # 持仓天数胜率
+        hold_data = patterns.get("hold_period_analysis", {})
+        if hold_data:
+            lines.append("### 持仓天数胜率")
+            for period, stats in hold_data.items():
+                if stats.get("count", 0) > 0:
+                    lines.append(f"  - {period}: 胜率{stats['win_rate']}% 均收益{stats['avg_pnl']}% (样本{stats['count']})")
+            lines.append("")
+
+        # 大盘环境胜率
+        market_data = patterns.get("market_env_analysis", {})
+        if market_data:
+            lines.append("### 大盘环境胜率")
+            for env, stats in market_data.items():
+                if stats.get("count", 0) > 0:
+                    lines.append(f"  - {env}: 胜率{stats['win_rate']}% 均收益{stats['avg_pnl']}% (样本{stats['count']})")
+            lines.append("")
+
+        # 资金流向胜率
+        flow_data = patterns.get("fund_flow_analysis", {})
+        if flow_data:
+            lines.append("### 资金流向胜率")
+            for flow, stats in flow_data.items():
+                if stats.get("count", 0) > 0:
+                    lines.append(f"  - {flow}: 胜率{stats['win_rate']}% 均收益{stats['avg_pnl']}% (样本{stats['count']})")
+            lines.append("")
+
+        # 最优策略总结
+        opt = patterns.get("optimal_strategy", {})
+        if opt.get("best_ma_trend"):
+            lines.append(f"### 最优买入条件（历史验证）")
+            lines.append(f"  MA趋势={opt['best_ma_trend']}, MACD={opt.get('best_macd_signal', 'N/A')}, 板块={opt.get('best_sector', 'N/A')}")
+            lines.append("")
+
+    # ── 3. 该股历史交易记录 ──
+    if code:
+        conn = _conn()
+        stock_trades = conn.execute("""
+            SELECT trade_type, trade_date, price, shares, pnl, pnl_pct, hold_days, note
+            FROM trade_log
+            WHERE code = ?
+            ORDER BY trade_date DESC
+            LIMIT 10
+        """, (code,)).fetchall()
+        conn.close()
+
+        if stock_trades:
+            lines.append(f"### 该股历史交易（最近{len(stock_trades)}笔）")
+            for t in stock_trades:
+                t = dict(t)
+                direction = "买入" if t["trade_type"] == "buy" else "卖出"
+                pnl_str = ""
+                if t["trade_type"] == "sell" and t.get("pnl") is not None:
+                    pnl_str = f" → {'盈利' if t['pnl'] > 0 else '亏损'}{t['pnl_pct']:+.2f}% 持{t.get('hold_days', 0)}天"
+                lines.append(f"  - {t['trade_date']} {direction} @{t['price']}{pnl_str}")
+            lines.append("")
+
+            # 该股胜败统计
+            sells = [dict(t) for t in stock_trades if t["trade_type"] == "sell" and t.get("pnl") is not None]
+            if len(sells) >= 2:
+                wins = [s for s in sells if s["pnl"] > 0]
+                lines.append(f"  → 该股历史: {len(sells)}笔卖出, 胜率{len(wins)/len(sells)*100:.0f}%, 均收益{sum(s['pnl_pct'] for s in sells)/len(sells):.2f}%")
+                lines.append("")
+
+    # ── 4. 决策约束（基于数据的硬规则）──
+    lines.append("### 基于数据的决策约束（必须遵守）")
+    lines.append("- 以上胜率数据来自真实交易记录，你的判断不得与数据明显矛盾")
+    lines.append("- 如果历史数据显示某条件下胜率<40%，不得建议在该条件下加仓")
+    lines.append("- 如果历史数据显示某条件下胜率>65%，应优先参考该信号")
+    lines.append("- 禁止忽略历史数据给出'感觉性'判断")
+    lines.append("- 盘中急跌≥7%可能是量化砸盘（地天板机会），不要在急跌时建议卖出")
+
+    if not lines:
+        return "（暂无历史交易数据，请基于技术面分析）"
+
+    return "\n".join(lines)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 4. 最近交易记录
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def get_recent_trades(limit: int = 20) -> list:

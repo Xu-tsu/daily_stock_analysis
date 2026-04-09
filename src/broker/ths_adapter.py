@@ -7,15 +7,264 @@
   3. 下单程序 xiadan.exe 路径正确
   4. 设置环境变量: THS_EXE_PATH=G:\\同花顺远航版\\transaction\\xiadan.exe
 """
+import ctypes
+import ctypes.wintypes
 import logging
 import os
+import re
 import time
 from typing import List, Optional
+
+import win32con
+import win32gui
 
 from src.broker.base import BrokerAdapter
 from src.broker.models import OrderResult, Position, AccountBalance, Order
 
 logger = logging.getLogger(__name__)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 全局验证码处理（纯 win32 API + OCR）
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# 懒加载 OCR 实例（ddddocr 初始化较慢，只做一次）
+_ocr_instance = None
+
+
+def _get_ocr():
+    global _ocr_instance
+    if _ocr_instance is None:
+        try:
+            import ddddocr
+            _ocr_instance = ddddocr.DdddOcr(show_ad=False)
+            logger.info("[THS-CAPTCHA] ddddocr OCR 初始化成功")
+        except Exception as e:
+            logger.error(f"[THS-CAPTCHA] ddddocr 加载失败: {e}")
+    return _ocr_instance
+
+
+def dismiss_ths_captcha() -> bool:
+    """查找并自动处理同花顺"拷贝数据验证码"弹窗。
+
+    纯 win32gui + OCR 实现。
+
+    弹窗真实结构（通过诊断工具确认）：
+      父窗口: class='#32770', title=''（标题为空！）
+      子控件:
+        - Button  "确定"
+        - Button  "取消"
+        - Static  "检测到您正在拷贝数据..."
+        - Static  ""         (72x32, 验证码图片，GetWindowText 返回空)
+        - Static  "验证码错误!!"
+        - Static  "提示"
+        - Edit    ""         (输入框)
+        - Static  "先输入验证码："
+    """
+    # 1. 枚举所有可见的 #32770 对话框（标题为空）
+    candidate_hwnds = []
+
+    def _enum_windows(hwnd, _):
+        if win32gui.IsWindowVisible(hwnd):
+            try:
+                cls = win32gui.GetClassName(hwnd)
+                if cls == "#32770":
+                    candidate_hwnds.append(hwnd)
+            except Exception:
+                pass
+        return True
+
+    try:
+        win32gui.EnumWindows(_enum_windows, None)
+    except Exception:
+        return False
+
+    for hwnd in candidate_hwnds:
+        if _try_handle_captcha_dialog(hwnd):
+            return True
+
+    return False
+
+
+def _try_handle_captcha_dialog(hwnd: int) -> bool:
+    """尝试处理单个 #32770 对话框。"""
+    children = []
+
+    def _enum_children(child_hwnd, _):
+        children.append(child_hwnd)
+        return True
+
+    try:
+        win32gui.EnumChildWindows(hwnd, _enum_children, None)
+    except Exception:
+        return False
+
+    edit_hwnd = None
+    confirm_hwnd = None
+    captcha_img_hwnd = None
+    is_captcha_dialog = False
+
+    for child in children:
+        try:
+            cls = win32gui.GetClassName(child)
+            text = win32gui.GetWindowText(child)
+        except Exception:
+            continue
+
+        # 识别是否为验证码弹窗
+        if cls == "Static" and ("拷贝数据" in text or "验证码" in text):
+            is_captcha_dialog = True
+
+        # 找 Edit 输入框
+        if cls == "Edit":
+            edit_hwnd = child
+
+        # 找确定按钮
+        if cls == "Button" and text in ("确定", "确认"):
+            confirm_hwnd = child
+
+        # 找验证码图片控件：Static + 文本为空 + 尺寸合适(~72x32)
+        if cls == "Static" and not text:
+            try:
+                rect = win32gui.GetWindowRect(child)
+                w = rect[2] - rect[0]
+                h = rect[3] - rect[1]
+                if 50 <= w <= 200 and 20 <= h <= 60:
+                    captcha_img_hwnd = child
+            except Exception:
+                pass
+
+    if not is_captcha_dialog:
+        return False
+
+    if not edit_hwnd:
+        logger.warning("[THS-CAPTCHA] 弹窗已识别但找不到输入框")
+        return False
+
+    if not captcha_img_hwnd:
+        logger.warning("[THS-CAPTCHA] 弹窗已识别但找不到验证码图片控件")
+        return False
+
+    # ── OCR 识别验证码 ──
+    captcha_code = _ocr_captcha_control(captcha_img_hwnd)
+    if not captcha_code:
+        logger.warning("[THS-CAPTCHA] OCR 识别失败")
+        return False
+
+    logger.info(f"[THS-CAPTCHA] OCR 识别验证码: {captcha_code}")
+
+    # ── 输入验证码 ──
+    try:
+        win32gui.SendMessage(edit_hwnd, win32con.WM_SETTEXT, 0, captcha_code)
+        time.sleep(0.3)
+
+        # 验证是否写入成功
+        buf = ctypes.create_unicode_buffer(32)
+        ctypes.windll.user32.SendMessageW(
+            edit_hwnd, win32con.WM_GETTEXT, 32, buf
+        )
+        actual = buf.value
+        if actual != captcha_code:
+            logger.warning(f"[THS-CAPTCHA] WM_SETTEXT 写入不匹配: "
+                           f"期望={captcha_code} 实际={actual}，用 WM_CHAR 重试")
+            win32gui.SendMessage(edit_hwnd, win32con.WM_SETTEXT, 0, "")
+            for ch in captcha_code:
+                win32gui.PostMessage(edit_hwnd, win32con.WM_CHAR, ord(ch), 0)
+            time.sleep(0.3)
+    except Exception as e:
+        logger.error(f"[THS-CAPTCHA] 输入验证码失败: {e}")
+        return False
+
+    # ── 点击确定 ──
+    try:
+        if confirm_hwnd:
+            win32gui.SendMessage(confirm_hwnd, win32con.BM_CLICK, 0, 0)
+        else:
+            win32gui.PostMessage(edit_hwnd, win32con.WM_KEYDOWN,
+                                win32con.VK_RETURN, 0)
+            win32gui.PostMessage(edit_hwnd, win32con.WM_KEYUP,
+                                win32con.VK_RETURN, 0)
+    except Exception as e:
+        logger.error(f"[THS-CAPTCHA] 点击确定失败: {e}")
+        return False
+
+    time.sleep(0.5)
+    logger.info(f"[THS-CAPTCHA] 验证码 {captcha_code} 已自动输入并确定 ✓")
+    return True
+
+
+def _ocr_captcha_control(hwnd: int) -> str:
+    """截取指定控件区域并 OCR 识别验证码数字。"""
+    import io
+    from PIL import ImageGrab
+
+    try:
+        rect = win32gui.GetWindowRect(hwnd)
+        # 截取控件区域
+        img = ImageGrab.grab(bbox=(rect[0], rect[1], rect[2], rect[3]))
+
+        # 转 bytes
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        img_bytes = buf.getvalue()
+
+        # OCR 识别
+        ocr = _get_ocr()
+        if ocr is None:
+            return ""
+        result = ocr.classification(img_bytes)
+        # 只保留数字
+        digits = re.sub(r"[^\d]", "", result)
+        if 4 <= len(digits) <= 6:
+            return digits
+
+        logger.debug(f"[THS-CAPTCHA] OCR 原始结果: {result!r} → 数字: {digits!r}")
+        return ""
+    except Exception as e:
+        logger.error(f"[THS-CAPTCHA] OCR 异常: {e}")
+        return ""
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 验证码守护线程（最可靠方案）
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+_captcha_watcher_running = False
+
+
+def start_captcha_watcher(interval: float = 1.0):
+    """启动后台守护线程，每隔 interval 秒检测并自动处理验证码弹窗。
+
+    不依赖 easytrader 的任何回调/patch，独立运行。
+    弹窗一出现就立即处理，不管是读数据还是下单触发的。
+    """
+    global _captcha_watcher_running
+    if _captcha_watcher_running:
+        return
+
+    import threading
+
+    def _watcher_loop():
+        global _captcha_watcher_running
+        logger.info(f"[THS-CAPTCHA] 守护线程已启动 (间隔 {interval}s)")
+        while _captcha_watcher_running:
+            try:
+                if dismiss_ths_captcha():
+                    logger.info("[THS-CAPTCHA] 守护线程自动处理了一个验证码")
+            except Exception as e:
+                logger.debug(f"[THS-CAPTCHA] 守护线程异常: {e}")
+            time.sleep(interval)
+        logger.info("[THS-CAPTCHA] 守护线程已停止")
+
+    _captcha_watcher_running = True
+    t = threading.Thread(target=_watcher_loop, daemon=True, name="CaptchaWatcher")
+    t.start()
+
+
+def stop_captcha_watcher():
+    """停止守护线程"""
+    global _captcha_watcher_running
+    _captcha_watcher_running = False
 
 
 def _retry(max_attempts: int = 3, delay: float = 1.0):
@@ -56,6 +305,10 @@ class THSBrokerAdapter(BrokerAdapter):
             self._user.enable_type_keys_for_editor()
             self._connected = True
             logger.info(f"[THS] 连接成功（键盘输入模式）: {self._exe_path}")
+            # 注入验证码拦截补丁
+            self._patch_pop_dialog_handler()
+            # 启动验证码守护线程：每秒检测弹窗，弹窗一出现立刻 OCR + 输入 + 确定
+            start_captcha_watcher(interval=1.0)
             return True
         except Exception as e:
             self._connected = False
@@ -222,24 +475,146 @@ class THSBrokerAdapter(BrokerAdapter):
             logger.error(f"[THS] 获取今日委托失败: {e}")
             return []
 
-    # ── 验证码检测 ──
+    # ── 验证码检测 + 自动处理 ──
+
+    def _patch_pop_dialog_handler(self):
+        """Monkeypatch easytrader 的三个验证码触发点。
+
+        触发点1: Copy._get_clipboard_data() — 读持仓/余额/委托时
+          easytrader 用 Ctrl+A Ctrl+C 复制表格 → THS 弹验证码
+          easytrader 自带的 captcha_recognize() 函数未定义，必然失败
+          → 替换为我们的 dismiss_ths_captcha() + ddddocr
+
+        触发点2: TradePopDialogHandler.handle("提示") — 下单时
+          easytrader 先点确定（没输入验证码）再抛 TradeError
+          → 拦截，先调用 dismiss_ths_captcha()
+
+        触发点3: PopDialogHandler.handle("提示") — 其他操作时
+          同上
+        """
+        # ── Patch 1: Copy._get_clipboard_data（最关键） ──
+        try:
+            from easytrader.grid_strategies import Copy
+            import pywinauto.clipboard
+
+            _original_get_clipboard = Copy._get_clipboard_data
+
+            def _patched_get_clipboard_data(self_copy):
+                """替换 easytrader 坏掉的验证码流程，用 dismiss_ths_captcha()"""
+                # 检查是否有验证码弹窗
+                try:
+                    top = self_copy._trader.app.top_window()
+                    if top.window(class_name="Static", title_re="验证码").exists(timeout=1):
+                        logger.info("[THS-Patch] 剪贴板读取触发验证码，调用自动处理...")
+                        for attempt in range(3):
+                            if dismiss_ths_captcha():
+                                logger.info(f"[THS-Patch] 验证码自动处理成功 (第{attempt+1}次)")
+                                time.sleep(0.5)
+                                break
+                            time.sleep(0.5)
+                        else:
+                            logger.warning("[THS-Patch] 3次自动处理均失败")
+                    else:
+                        Copy._need_captcha_reg = False
+                except Exception as e:
+                    logger.debug(f"[THS-Patch] 验证码检测异常: {e}")
+
+                # 读剪贴板
+                count = 5
+                while count > 0:
+                    try:
+                        return pywinauto.clipboard.GetData()
+                    except Exception as e:
+                        count -= 1
+                        logger.debug(f"[THS-Patch] 剪贴板读取重试: {e}")
+                return ""
+
+            Copy._get_clipboard_data = _patched_get_clipboard_data
+            logger.info("[THS] 验证码补丁已注入 Copy._get_clipboard_data")
+
+        except Exception as e:
+            logger.warning(f"[THS] Copy 补丁注入失败: {e}")
+
+        # ── Patch 2+3: PopDialogHandler + TradePopDialogHandler ──
+        try:
+            from easytrader.pop_dialog_handler import (
+                TradePopDialogHandler, PopDialogHandler,
+            )
+
+            _original_trade_handle = TradePopDialogHandler.handle
+            _original_pop_handle = PopDialogHandler.handle
+
+            def _make_patched(original_fn):
+                def _patched_handle(self_handler, title):
+                    if title == "提示":
+                        try:
+                            content = self_handler._extract_content()
+                        except Exception:
+                            content = ""
+
+                        if "拷贝数据" in content or "验证码" in content:
+                            logger.info(f"[THS-Patch] 拦截验证码弹窗: {content[:60]}")
+                            if dismiss_ths_captcha():
+                                return None  # 已处理，让 easytrader 继续
+                            logger.warning("[THS-Patch] 自动处理失败，走原逻辑")
+
+                    return original_fn(self_handler, title)
+                return _patched_handle
+
+            TradePopDialogHandler.handle = _make_patched(_original_trade_handle)
+            PopDialogHandler.handle = _make_patched(_original_pop_handle)
+            logger.info("[THS] 验证码补丁已注入 (Trade + Pop)")
+
+        except Exception as e:
+            logger.warning(f"[THS] 弹窗补丁注入失败: {e}")
+
+    def _dismiss_copy_captcha(self) -> bool:
+        """自动处理验证码弹窗（委托给全局 win32 API 实现）"""
+        return dismiss_ths_captcha()
 
     def _execute_with_captcha_check(self, trade_fn, code, price, shares, direction):
-        """包装buy/sell，检测验证码拦截并轮询重试。
+        """包装buy/sell，检测验证码拦截并自动处理+轮询重试。
 
-        同花顺验证码弹窗会被 easytrader 的 TradePopDialogHandler 自动关闭
-        （未知弹窗 → _close()），导致订单未提交但返回 {"message":"success"}。
-        检测策略：对比下单前后 today_entrusts 数量。
-        恢复策略：发飞书告警 → 轮询重试（用户在THS手动完成验证后，重试即成功）。
+        同花顺"拷贝数据验证码"会在剪贴板操作时弹出。
+        处理策略：
+        1. 先尝试自动识别并填写验证码
+        2. 自动失败则截图告警+轮询等待用户手动处理
         """
+        # 0. 下单前先检查是否有残留验证码弹窗
+        self._dismiss_copy_captcha()
+
         # 1. 快照当前委托数
         try:
             before_count = len(self._user.today_entrusts)
-        except Exception:
-            before_count = -1  # 无法验证，跳过检测
+        except Exception as e:
+            err_msg = str(e)
+            if "拷贝数据" in err_msg or "验证码" in err_msg:
+                # 读取委托列表时就触发了验证码
+                if self._dismiss_copy_captcha():
+                    try:
+                        before_count = len(self._user.today_entrusts)
+                    except Exception:
+                        before_count = -1
+                else:
+                    before_count = -1
+            else:
+                before_count = -1
 
         # 2. 执行下单
-        result = trade_fn(code, price=price, amount=shares)
+        try:
+            result = trade_fn(code, price=price, amount=shares)
+        except Exception as e:
+            err_msg = str(e)
+            if "拷贝数据" in err_msg or "验证码" in err_msg:
+                # 下单过程中触发了验证码，自动处理后重试
+                logger.warning(f"[THS] 下单触发验证码拦截，尝试自动处理...")
+                if self._dismiss_copy_captcha():
+                    time.sleep(0.5)
+                    result = trade_fn(code, price=price, amount=shares)
+                else:
+                    raise  # 自动处理失败，抛出原异常
+            else:
+                raise
 
         # 3. 有委托号 → 确认成功
         if isinstance(result, dict) and result.get("entrust_no"):
@@ -266,15 +641,29 @@ class THSBrokerAdapter(BrokerAdapter):
             f"(委托数: {before_count} → {after_count})"
         )
 
-        # 7. 截图+飞书告警
+        # 7. 先尝试自动处理验证码
+        if self._dismiss_copy_captcha():
+            logger.info("[THS] 验证码已自动处理，重试下单...")
+            time.sleep(0.5)
+            try:
+                retry_result = trade_fn(code, price=price, amount=shares)
+                if isinstance(retry_result, dict) and retry_result.get("entrust_no"):
+                    logger.info(f"[THS] 自动验证码后{dir_cn}成功")
+                    return retry_result
+                time.sleep(0.5)
+                retry_after = len(self._user.today_entrusts)
+                if retry_after > before_count:
+                    logger.info(f"[THS] 自动验证码后{dir_cn}成功 (委托数+1)")
+                    return retry_result
+            except Exception as e:
+                logger.warning(f"[THS] 自动验证码后重试失败: {e}")
+
+        # 8. 自动处理失败，截图+飞书告警+轮询等待人工
         screenshot = self._capture_screen()
         self._send_captcha_alert(screenshot, code, price, shares, direction)
 
-        # 8. 轮询重试：等待用户在THS客户端手动完成验证码，然后重试下单
-        #    easytrader会关闭验证码弹窗，所以不能等弹窗消失，
-        #    而是周期性重试下单并检查委托数是否增加
         timeout = int(os.getenv("CAPTCHA_WAIT_TIMEOUT", "180"))
-        poll_interval = 15  # 每15秒重试一次
+        poll_interval = 15
         start = time.time()
 
         while time.time() - start < timeout:
@@ -284,20 +673,20 @@ class THSBrokerAdapter(BrokerAdapter):
             )
             time.sleep(poll_interval)
 
+            # 每轮先尝试自动处理
+            self._dismiss_copy_captcha()
+            time.sleep(0.5)
+
             try:
-                # 快照委托数
                 retry_before = len(self._user.today_entrusts)
-                # 重试下单
                 retry_result = trade_fn(code, price=price, amount=shares)
                 time.sleep(0.5)
                 retry_after = len(self._user.today_entrusts)
 
-                # 有委托号 → 成功
                 if isinstance(retry_result, dict) and retry_result.get("entrust_no"):
                     logger.info(f"[THS] 验证码已通过，{dir_cn}成功 (entrust_no)")
                     return retry_result
 
-                # 委托数增加 → 成功
                 if retry_after > retry_before:
                     logger.info(f"[THS] 验证码已通过，{dir_cn}成功 (委托数+1)")
                     return retry_result
@@ -305,9 +694,11 @@ class THSBrokerAdapter(BrokerAdapter):
                 logger.debug(f"[THS] 重试未成功，继续等待... (委托数: {retry_before}→{retry_after})")
 
             except Exception as e:
+                err_msg = str(e)
+                if "拷贝数据" in err_msg or "验证码" in err_msg:
+                    self._dismiss_copy_captcha()
                 logger.debug(f"[THS] 重试异常: {e}，继续等待...")
 
-        # 超时
         raise Exception(
             f"验证码超时未处理({timeout}秒)，{dir_cn} {code} {shares}股 @ {price} 交易取消"
         )
