@@ -257,7 +257,7 @@ def check_market_anomaly(
     except Exception as e:
         logger.warning(f"指数异动检测失败: {e}")
 
-    # 持仓股异动
+    # 持仓股异动（去重：同一股票只检测一次）
     try:
         from macro_data_collector import _stock_code_to_tencent
         if holdings is None:
@@ -266,6 +266,16 @@ def check_market_anomaly(
             portfolio = load_portfolio()
             holdings = portfolio.get("holdings", [])
         if holdings:
+            # 按code去重，避免重复异动
+            _seen_codes = set()
+            _unique_holdings = []
+            for h in holdings:
+                code = h.get("code", "")
+                if code and code not in _seen_codes:
+                    _seen_codes.add(code)
+                    _unique_holdings.append(h)
+            holdings = _unique_holdings
+
             tc_codes = [_stock_code_to_tencent(h["code"]) for h in holdings if h.get("code")]
             quotes = _fetch_quotes_cached(tc_codes, timeout=8, ttl_seconds=5.0)
             for h in holdings:
@@ -316,8 +326,12 @@ def check_market_anomaly(
 # 4. 推送
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def _get_current_holdings() -> list:
-    """获取当前持仓（供风控检查用）。优先从 broker 真实持仓获取。"""
-    # 第一优先级：broker 真实持仓（最准确）
+    """获取当前持仓（供风控检查用）。
+
+    优先级：broker 真实持仓 → portfolio.json（已由盘中循环同步）。
+    不再 fallback 到 DB/trade_journal，避免返回过期的老股票。
+    """
+    # 第一优先级：broker 真实持仓（最准确，30秒缓存）
     try:
         if os.getenv("BROKER_ENABLED", "false").lower() in ("true", "1", "yes"):
             from src.broker import get_broker
@@ -350,7 +364,24 @@ def _get_current_holdings() -> list:
     except Exception:
         pass
 
-    # 第二优先级：数据库
+    # 第二优先级：portfolio.json（盘中循环已从 broker 同步过来）
+    try:
+        from portfolio_manager import load_portfolio
+        holdings = load_portfolio().get("holdings", [])
+        result = [h for h in holdings if h.get("shares", 0) > 0]
+        if result:
+            return result
+    except Exception:
+        pass
+
+    # 不再 fallback 到 DB/trade_journal（数据可能过期，会报出已清仓的老股票）
+    logger.debug("[_get_current_holdings] broker 和 portfolio.json 均无有效持仓")
+    return []
+
+
+def _get_current_holdings_legacy_db() -> list:
+    """【已弃用】从DB获取持仓，仅保留代码供特殊场景调用。"""
+    # 数据库
     try:
         from src.storage import get_engine
         from sqlalchemy import text
@@ -365,7 +396,7 @@ def _get_current_holdings() -> list:
     except Exception:
         pass
 
-    # 第三优先级：trade_journal 推算
+    # trade_journal 推算
     try:
         from trade_journal import _conn
         conn = _conn()
@@ -2216,8 +2247,41 @@ def run_monitor_loop(interval_minutes: int = 10, auto_rebalance: bool = True):
         # ── 盘中监控 09:30-15:00 ──
         elif is_trading_time():
             logger.info(f"[{now.strftime('%H:%M:%S')}] 盘中检查...")
+
+            # ── 核心：同步 broker 持仓到 portfolio.json（每轮1次）──
+            _cached_holdings = []
             try:
-                result = check_market_anomaly()
+                from portfolio_manager import load_portfolio as _lp, sync_portfolio_from_broker, save_portfolio as _sp
+                _portfolio = _lp()
+                _portfolio = sync_portfolio_from_broker(_portfolio)
+                # sync 内部有变化时已 save，这里确保 holdings 有数据
+                _cached_holdings = [
+                    {
+                        "code": h.get("code", ""),
+                        "name": h.get("name", ""),
+                        "cost_price": h.get("cost_price", 0),
+                        "current_price": h.get("current_price", 0),
+                        "shares": h.get("shares", 0),
+                        "sellable_shares": h.get("sellable_shares", 0),
+                        "buy_date": h.get("buy_date", ""),
+                        "pnl_pct": h.get("pnl_pct", 0),
+                        "market_value": h.get("market_value", 0),
+                    }
+                    for h in _portfolio.get("holdings", [])
+                    if h.get("shares", 0) > 0
+                ]
+                if not _cached_holdings:
+                    # broker 同步可能失败，回退到直接调 broker
+                    _cached_holdings = _get_current_holdings()
+            except Exception as e:
+                logger.debug(f"持仓同步跳过: {e}")
+                try:
+                    _cached_holdings = _get_current_holdings()
+                except Exception:
+                    pass
+
+            try:
+                result = check_market_anomaly(holdings=_cached_holdings)
                 if result["has_critical"] or result["has_high"]:
                     alert = format_anomaly_alert(result)
                     if alert:
@@ -2241,7 +2305,7 @@ def run_monitor_loop(interval_minutes: int = 10, auto_rebalance: bool = True):
             # ── 风控检查：止损/止盈/持仓天数（去重，每只股票每级别只报一次）──
             try:
                 from risk_control import check_stop_loss, format_risk_alerts
-                holdings = _get_current_holdings()
+                holdings = _cached_holdings
                 if holdings:
                     alerts = check_stop_loss(holdings)
                     # 去重：同一股票+同一级别只保留第一条

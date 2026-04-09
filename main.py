@@ -860,6 +860,16 @@ def main() -> int:
             try:
                 from portfolio_manager import load_portfolio, save_portfolio, format_rebalance_report
                 portfolio = load_portfolio()
+
+                # ── 关键：先从 broker 同步真实持仓到 portfolio.json ──
+                # 否则 portfolio.json 可能是空的，导致误判为空仓去建仓
+                try:
+                    from portfolio_manager import sync_portfolio_from_broker
+                    portfolio = sync_portfolio_from_broker(portfolio)
+                    logger.info(f"[Phase 3] broker 持仓已同步: {len(portfolio.get('holdings', []))} 只")
+                except Exception as e:
+                    logger.debug(f"[Phase 3] broker 同步跳过: {e}")
+
                 real_holdings = [h for h in portfolio.get("holdings", []) if h.get("shares", 0) > 0]
 
                 if not real_holdings:
@@ -934,14 +944,16 @@ def main() -> int:
             logger.info("[Phase 5] 盘中监控已在后台启动")
 
             # ━━━ Phase 6: 全量分析报告 ━━━
-            if not skip_startup_analysis:
+            # Phase 3 已做调仓/建仓分析，启动时默认跳过全量分析（避免重复扫描持仓）
+            # 全量分析改为由定时循环在 schedule_time 执行
+            if not skip_startup_analysis and os.getenv("FORCE_STARTUP_ANALYSIS", "false").lower() in ("true", "1", "yes"):
                 logger.info("[Phase 6] 开始全量分析报告...")
                 try:
                     run_full_analysis(config, args, stock_codes)
                 except Exception as e:
                     logger.warning(f"[Phase 6] 全量分析失败: {e}")
             else:
-                logger.info("[Phase 6] 跳过全量分析（SKIP_STARTUP_ANALYSIS=true）")
+                logger.info("[Phase 6] 启动时跳过全量分析（Phase 3已完成调仓，全量分析将由定时任务触发）")
 
             # ━━━ 启动摘要 ━━━
             logger.info("")

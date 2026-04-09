@@ -295,6 +295,10 @@ class THSBrokerAdapter(BrokerAdapter):
         self._user = None
         self._connected = False
         self._exe_path = os.getenv("THS_EXE_PATH", r"C:\同花顺\xiadan.exe")
+        # 持仓缓存：避免每分钟多次调用THS触发验证码
+        self._positions_cache = None       # List[Position]
+        self._positions_cache_ts = 0.0     # 上次刷新时间戳
+        self._positions_cache_ttl = 30.0   # 缓存有效期（秒）
 
     def connect(self) -> bool:
         try:
@@ -401,9 +405,19 @@ class THSBrokerAdapter(BrokerAdapter):
             return False
 
     @_retry(max_attempts=2, delay=0.5)
-    def get_positions(self) -> List[Position]:
+    def get_positions(self, force_refresh: bool = False) -> List[Position]:
+        # ── 缓存：30秒内不重复调THS，避免频繁触发验证码 ──
+        now = time.time()
+        if (
+            not force_refresh
+            and self._positions_cache is not None
+            and (now - self._positions_cache_ts) < self._positions_cache_ttl
+        ):
+            logger.debug(f"[THS] 使用持仓缓存 ({now - self._positions_cache_ts:.0f}s前刷新)")
+            return self._positions_cache
+
         if not self._ensure_connected():
-            return []
+            return self._positions_cache or []
         try:
             raw_positions = self._user.position
             positions = []
@@ -421,11 +435,14 @@ class THSBrokerAdapter(BrokerAdapter):
                 )
                 if pos.code and pos.shares > 0:
                     positions.append(pos)
+            # 更新缓存
+            self._positions_cache = positions
+            self._positions_cache_ts = now
             logger.info(f"[THS] 获取持仓: {len(positions)}只")
             return positions
         except Exception as e:
             logger.error(f"[THS] 获取持仓失败: {e}")
-            return []
+            return self._positions_cache or []
 
     @_retry(max_attempts=2, delay=0.5)
     def get_balance(self) -> AccountBalance:

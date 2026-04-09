@@ -203,14 +203,22 @@ def run_stock_scan(hot_concepts: List[dict] = None, regime: dict = None) -> List
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def run_cb_trading(broker=None, capital: float = 12000):
-    """可转债T+0日内交易"""
+    """可转债T+0日内交易（盘中循环版）
+
+    生命周期：
+      1. run_morning_scan()  → 扫描选债
+      2. 盘中循环: 获取实时行情 → update_prices → check_signals（每60秒）
+      3. 14:50 close_day() 强制清仓
+    """
+    import time as _time
     logger.info("")
     logger.info("=" * 60)
-    logger.info(f"  Phase 2: CB T+0 (capital: {capital:.0f})")
+    logger.info(f"  CB T+0 Trading (capital: {capital:.0f})")
     logger.info("=" * 60)
 
     try:
         from cb_trader import CBDayTrader
+        from macro_data_collector import _stock_code_to_tencent, _fetch_tencent_quote
 
         trader = CBDayTrader(broker=broker, total_capital=capital / 0.4)
         trader.cb_capital = capital
@@ -222,12 +230,76 @@ def run_cb_trading(broker=None, capital: float = 12000):
             logger.info("  [CB] No candidates, skip")
             return None
 
-        # 2. 交易信号
-        signals = trader.check_signals()
-        logger.info(f"  [CB] Signals triggered: {len(signals)}")
+        # 2. 盘中循环：持续检查信号
+        check_interval = int(os.getenv("CB_CHECK_INTERVAL", "60"))  # 默认60秒
+        total_signals = 0
+
+        while True:
+            try:
+                now = datetime.now()
+                hhmm = now.strftime("%H:%M")
+
+                # 14:50 之后强制清仓退出
+                if hhmm >= "14:50":
+                    logger.info("[CB T+0] 14:50 尾盘清仓...")
+                    break
+
+                # 非交易时间跳过（09:30之前 or 午休11:30-13:00）
+                if hhmm < "09:30":
+                    _time.sleep(30)
+                    continue
+                if "11:30" <= hhmm < "13:00":
+                    _time.sleep(30)
+                    continue
+
+                # 获取候选转债实时行情
+                watch_codes = [w["code"] for w in watchlist]
+                # 持仓中的转债也需要实时价格
+                for code in trader.positions:
+                    if code not in watch_codes:
+                        watch_codes.append(code)
+
+                if watch_codes:
+                    try:
+                        tc_map = {}
+                        for code in watch_codes:
+                            tc = _stock_code_to_tencent(code)
+                            tc_map[tc] = code
+                        quotes = _fetch_tencent_quote(list(tc_map.keys()), timeout=8)
+                        prices = {}
+                        for tc, q in quotes.items():
+                            raw_code = tc_map.get(tc, tc.replace("sh", "").replace("sz", ""))
+                            if q.get("price", 0) > 0:
+                                prices[raw_code] = q["price"]
+                        # 更新watchlist价格
+                        for w in watchlist:
+                            if w["code"] in prices:
+                                w["price"] = prices[w["code"]]
+                        # 更新持仓价格
+                        if prices:
+                            trader.update_prices(prices)
+                    except Exception as e:
+                        logger.debug(f"[CB T+0] 行情获取失败: {e}")
+
+                # 检查交易信号
+                signals = trader.check_signals()
+                if signals:
+                    total_signals += len(signals)
+                    for sig in signals:
+                        logger.info(f"  [CB T+0] Signal: {sig}")
+
+                _time.sleep(check_interval)
+
+            except KeyboardInterrupt:
+                logger.info("[CB T+0] 用户中断")
+                break
+            except Exception as e:
+                logger.warning(f"[CB T+0] 循环异常: {e}")
+                _time.sleep(check_interval)
 
         # 3. 尾盘清仓
         report = trader.close_day()
+        logger.info(f"[CB T+0] 日内完成: {total_signals} 笔信号")
         return report
 
     except Exception as e:

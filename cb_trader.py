@@ -109,21 +109,26 @@ def generate_cb_signal(
     current_price: float,
     daily_df: pd.DataFrame,
     position: Optional[CBPosition] = None,
+    scanner_score: float = 0,
 ) -> dict:
     """生成可转债T+0交易信号
 
-    基于日K线的技术面判断（实盘中可替换为分时数据）
+    结合 scanner 评分 + 日K线趋势 + 盘中价格动态综合判断。
 
     Args:
         cb_code: 转债代码
         current_price: 当前价格
         daily_df: 日K线数据
         position: 当前持仓（None=未持仓）
+        scanner_score: cb_scanner 综合评分（0-100），≥70 表示高质量标的
 
     Returns:
         {"action": "buy"/"sell"/"hold", "reason": str, "strength": float}
     """
-    if daily_df is None or len(daily_df) < 5:
+    if daily_df is None or len(daily_df) < 3:
+        # scanner 高分标的即使K线少也可以尝试
+        if scanner_score >= 80 and position is None:
+            return {"action": "buy", "reason": f"Scanner高分{scanner_score:.0f}(K线不足)", "strength": 55}
         return {"action": "hold", "reason": "数据不足", "strength": 0}
 
     close = daily_df["close"].values
@@ -133,7 +138,7 @@ def generate_cb_signal(
 
     # 技术指标
     ma3 = np.mean(close[-3:])
-    ma5 = np.mean(close[-5:])
+    ma5 = np.mean(close[-min(5, len(close)):])
     ma10 = np.mean(close[-10:]) if len(close) >= 10 else ma5
 
     # 近3日动量
@@ -146,36 +151,66 @@ def generate_cb_signal(
     vol_ratio = vol[-1] / np.mean(vol[-5:]) if len(vol) >= 5 and np.mean(vol[-5:]) > 0 else 1
 
     # 支撑位/阻力位
-    support = np.min(low[-5:])
-    resistance = np.max(high[-5:])
+    support = np.min(low[-min(5, len(low)):])
+    resistance = np.max(high[-min(5, len(high)):])
+
+    # 昨收（日K最后一根的收盘价）
+    prev_close = close[-1]
+    # 盘中涨跌幅（当前价 vs 昨收）
+    intraday_chg = (current_price / prev_close - 1) * 100 if prev_close > 0 else 0
 
     # ─── 买入信号 ───
     if position is None:
         strength = 0
+        reasons = []
 
-        # 信号1: 放量突破（量比>1.5 + 价格>MA3）
-        if vol_ratio > 1.5 and current_price > ma3:
-            strength += 30
-
-        # 信号2: 短期上涨趋势（MA3>MA5>MA10）
-        if ma3 > ma5 and (len(close) < 10 or ma5 > ma10):
+        # 基础分: scanner 评分加成（scanner 已评估溢价率、成交量、正股质量）
+        if scanner_score >= 80:
             strength += 25
-
-        # 信号3: 靠近支撑位（距支撑<2%）
-        dist_to_support = (current_price - support) / support * 100
-        if 0 < dist_to_support < 2:
-            strength += 20
-
-        # 信号4: 连涨动量（3日涨3-10%）
-        if 3 <= chg_3d <= 10:
+            reasons.append(f"Scanner{scanner_score:.0f}")
+        elif scanner_score >= 70:
             strength += 15
+            reasons.append(f"Scanner{scanner_score:.0f}")
 
-        # 信号5: 日内波幅大（>3%=做T空间大）
-        if today_range > 3:
+        # 信号1: 放量（量比>1.3）
+        if vol_ratio > 1.3:
+            strength += 15
+            reasons.append(f"放量{vol_ratio:.1f}")
+
+        # 信号2: 价格在MA3上方（短期趋势向上）
+        if current_price > ma3:
             strength += 10
+            reasons.append("上穿MA3")
 
-        if strength >= 60:
-            return {"action": "buy", "reason": f"动量{chg_3d:.1f}% 量比{vol_ratio:.1f}", "strength": strength}
+        # 信号3: 短期上涨趋势（MA3>MA5）
+        if ma3 > ma5:
+            strength += 10
+            reasons.append("MA趋势上")
+
+        # 信号4: 盘中价格回踩支撑后反弹（距支撑<3%）
+        if support > 0:
+            dist_to_support = (current_price - support) / support * 100
+            if 0 < dist_to_support < 3:
+                strength += 10
+                reasons.append(f"近支撑{dist_to_support:.1f}%")
+
+        # 信号5: 盘中微涨（0~2%涨幅=上升初期，做T空间大）
+        if 0 < intraday_chg <= 2:
+            strength += 10
+            reasons.append(f"盘中+{intraday_chg:.1f}%")
+        # 盘中回调（-1%~0%=低吸机会）
+        elif -1 <= intraday_chg < 0 and scanner_score >= 70:
+            strength += 10
+            reasons.append(f"盘中回调{intraday_chg:.1f}%")
+
+        # 信号6: 日内波幅大（>2%=做T空间足）
+        if today_range > 2:
+            strength += 5
+            reasons.append(f"振幅{today_range:.1f}%")
+
+        # T+0 当天清仓，风险可控，门槛设为 45
+        if strength >= 45:
+            return {"action": "buy", "reason": " ".join(reasons), "strength": strength}
 
     # ─── 卖出信号（持仓中）───
     if position is not None:
@@ -293,12 +328,14 @@ class CBDayTrader:
                     continue
 
                 daily_df = self.daily_data.get(code)
-                if daily_df is None:
-                    continue
+                # daily_df 可以为 None，generate_cb_signal 会用 scanner_score 兜底
 
-                sig = generate_cb_signal(code, w["price"], daily_df)
+                sig = generate_cb_signal(
+                    code, w["price"], daily_df,
+                    scanner_score=w.get("score", 0),
+                )
 
-                if sig["action"] == "buy" and sig["strength"] >= 60:
+                if sig["action"] == "buy" and sig["strength"] >= 45:
                     result = self._execute_buy(
                         code, w["name"], w["price"], sig["reason"]
                     )

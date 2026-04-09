@@ -150,11 +150,18 @@ def _fetch_tencent_quote(codes: list, timeout: int = 15) -> dict:
 
 
 def _stock_code_to_tencent(code: str) -> str:
-    """股票代码转腾讯格式: 600519 → sh600519"""
+    """股票/转债代码转腾讯格式: 600519 → sh600519, 123254 → sz123254, 113042 → sh113042
+
+    可转债规则:
+      沪市转债: 110xxx, 113xxx → sh
+      深市转债: 123xxx, 127xxx, 128xxx, 118xxx → sz
+    """
     if code.startswith("6") or code.startswith("9"):
         return f"sh{code}"
-    else:
-        return f"sz{code}"
+    # 沪市可转债: 110xxx, 113xxx
+    if code.startswith("110") or code.startswith("113"):
+        return f"sh{code}"
+    return f"sz{code}"
 
 
 def _fetch_tencent_kline(code: str, days: int = 60) -> pd.DataFrame:

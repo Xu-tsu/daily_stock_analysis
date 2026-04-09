@@ -250,7 +250,33 @@ class RebalanceExecutor:
         code = action.get("code", "")
         name = action.get("name", code)
         act = action.get("action", "")
-        price = float(action.get("suggested_price", action.get("current_price", 0)))
+
+        # 价格获取优先级: suggested_price > reference_price > current_price > target_sell/buy_price > broker实时
+        price = float(
+            action.get("suggested_price", 0)
+            or action.get("reference_price", 0)
+            or action.get("current_price", 0)
+            or 0
+        )
+        # 如果 AI 给了 target_sell_price / stop_loss_price / target_buy_price，也可用
+        if price <= 0:
+            if act in ("sell", "reduce"):
+                price = float(action.get("target_sell_price", 0) or action.get("stop_loss_price", 0) or 0)
+            else:
+                price = float(action.get("target_buy_price", 0) or 0)
+
+        # 最终兜底：从 broker 实时持仓获取价格
+        if price <= 0 and code:
+            try:
+                positions = self._broker.get_positions()
+                for p in positions:
+                    if p.code == code and p.current_price > 0:
+                        price = p.current_price
+                        logger.info(f"[执行器] {name}({code}) 价格从broker实时获取: {price}")
+                        break
+            except Exception:
+                pass
+
         shares = int(action.get("suggested_shares", 0))
 
         # 如果没有 suggested_shares，尝试从 detail 提取或使用全部持仓
@@ -367,7 +393,7 @@ class RebalanceExecutor:
             code = action.get("code", "")
             name = action.get("name", code)
             act = action.get("action", "")
-            price = float(action.get("suggested_price", action.get("current_price", 0)))
+            price = float(action.get("suggested_price", 0) or action.get("reference_price", 0) or action.get("current_price", 0))
             shares = int(action.get("suggested_shares", 0))
             if shares <= 0:
                 shares = self._infer_shares(action)
@@ -423,7 +449,7 @@ class RebalanceExecutor:
         if sells:
             lines.append("🔴 **卖出/减仓:**")
             for a in sells:
-                price = a.get("suggested_price", a.get("current_price", "?"))
+                price = a.get("suggested_price") or a.get("reference_price") or a.get("current_price", "?")
                 shares = a.get("suggested_shares", "?")
                 act_cn = "清仓" if a.get("action") == "sell" else "减仓"
                 lines.append(f"  • {a.get('name','')}({a.get('code','')}) {act_cn} {shares}股 @ {price}")
@@ -432,7 +458,7 @@ class RebalanceExecutor:
         if buys:
             lines.append("🟢 **买入:**")
             for a in buys:
-                price = a.get("suggested_price", a.get("current_price", "?"))
+                price = a.get("suggested_price") or a.get("reference_price") or a.get("current_price", "?")
                 shares = a.get("suggested_shares", "?")
                 lines.append(f"  • {a.get('name','')}({a.get('code','')}) {shares}股 @ {price}")
             lines.append("")

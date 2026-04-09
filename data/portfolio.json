@@ -1,31 +1,113 @@
 {
-  "updated_at": "2026-04-09 10:46:32",
-  "cash": 7122.34,
-  "total_asset": 202421.34,
+  "updated_at": "2026-04-09 16:14:40",
+  "cash": 4329.53,
+  "total_asset": 199581.53,
   "target_position_ratio": 0.7,
   "holdings": [
+    {
+      "code": "000790",
+      "name": "华神科技",
+      "shares": 9000,
+      "sellable_shares": 9000,
+      "cost_price": 4.195,
+      "current_price": 4.08,
+      "market_value": 36720.0,
+      "pnl_pct": -2.74,
+      "sector": "",
+      "buy_date": "",
+      "strategy_tag": ""
+    },
+    {
+      "code": "000968",
+      "name": "蓝焰控股",
+      "shares": 300,
+      "sellable_shares": 0,
+      "cost_price": 9.293,
+      "current_price": 9.53,
+      "market_value": 2859.0,
+      "pnl_pct": 2.55,
+      "sector": "",
+      "buy_date": "",
+      "strategy_tag": ""
+    },
+    {
+      "code": "000989",
+      "name": "九芝堂",
+      "shares": 1300,
+      "sellable_shares": 1300,
+      "cost_price": 9.572,
+      "current_price": 9.54,
+      "market_value": 12402.0,
+      "pnl_pct": -0.33,
+      "sector": "",
+      "buy_date": "",
+      "strategy_tag": ""
+    },
+    {
+      "code": "002219",
+      "name": "新里程",
+      "shares": 20600,
+      "sellable_shares": 20600,
+      "cost_price": 2.421,
+      "current_price": 2.42,
+      "market_value": 49852.0,
+      "pnl_pct": -0.04,
+      "sector": "",
+      "buy_date": "",
+      "strategy_tag": ""
+    },
     {
       "code": "002348",
       "name": "高乐股份",
       "shares": 300,
-      "cost_price": 9.25,
-      "current_price": 9.25,
-      "market_value": 2775.0,
+      "sellable_shares": 0,
+      "cost_price": 9.263,
+      "current_price": 9.21,
+      "market_value": 2763.0,
+      "pnl_pct": -0.57,
       "sector": "",
-      "buy_date": "2026-04-09",
-      "strategy_tag": "auto_scan"
+      "buy_date": "",
+      "strategy_tag": ""
+    },
+    {
+      "code": "002629",
+      "name": "仁智股份",
+      "shares": 5600,
+      "sellable_shares": 5600,
+      "cost_price": 6.662,
+      "current_price": 6.57,
+      "market_value": 36792.0,
+      "pnl_pct": -1.38,
+      "sector": "",
+      "buy_date": "",
+      "strategy_tag": ""
     },
     {
       "code": "002685",
       "name": "华东重机",
       "shares": 400,
-      "cost_price": 7.97,
-      "current_price": 7.97,
-      "market_value": 3188.0,
+      "sellable_shares": 0,
+      "cost_price": 7.973,
+      "current_price": 7.78,
+      "market_value": 3112.0,
+      "pnl_pct": -2.42,
       "sector": "",
-      "buy_date": "2026-04-09",
-      "strategy_tag": "auto_scan"
+      "buy_date": "",
+      "strategy_tag": ""
+    },
+    {
+      "code": "002795",
+      "name": "永和智控",
+      "shares": 6400,
+      "sellable_shares": 6400,
+      "cost_price": 7.742,
+      "current_price": 7.93,
+      "market_value": 50752.0,
+      "pnl_pct": 2.43,
+      "sector": "",
+      "buy_date": "",
+      "strategy_tag": ""
     }
   ],
-  "actual_position_ratio": 0.0
+  "actual_position_ratio": 0.9783
 }
