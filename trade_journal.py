@@ -516,6 +516,51 @@ def _calc_group_stats(group: list) -> dict:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 3a-2. 近期亏损股（选股降权用）
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def get_recent_losers(days: int = 10) -> list:
+    """获取近N天卖出且亏损的股票，供选股时避坑。
+
+    Returns:
+        [{"code": "002506", "name": "协鑫集成", "pnl_pct": -5.2, "sell_date": "2026-04-08"}, ...]
+    """
+    conn = _conn()
+    try:
+        from datetime import datetime, timedelta
+        cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        rows = conn.execute(
+            """
+            SELECT code, name, price, trade_date,
+                   pnl_pct
+            FROM trade_log
+            WHERE trade_type = 'sell'
+              AND trade_date >= ?
+              AND (pnl_pct < 0 OR pnl_pct IS NULL)
+            ORDER BY trade_date DESC
+            """,
+            (cutoff,),
+        ).fetchall()
+        result = []
+        seen = set()
+        for r in rows:
+            code = r[0]
+            if code in seen:
+                continue
+            seen.add(code)
+            result.append({
+                "code": code,
+                "name": r[1] or "",
+                "pnl_pct": r[4] or 0,
+                "sell_date": r[3] or "",
+            })
+        return result
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 3b. 历史决策参考模型（喂给AI Agent防幻觉）
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def build_decision_reference(code: str = None, days: int = 90) -> str:

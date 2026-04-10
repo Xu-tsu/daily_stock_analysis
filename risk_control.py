@@ -28,22 +28,22 @@ logger = logging.getLogger(__name__)
 
 # 止损 / 止盈（可通过 .env 同名变量覆盖）
 import os as _os
-HARD_STOP_LOSS_PCT = float(_os.getenv("HARD_STOP_LOSS_PCT", "-5"))
-FORCE_EXIT_LOSS_PCT = float(_os.getenv("FORCE_EXIT_LOSS_PCT", "-8"))
+HARD_STOP_LOSS_PCT = float(_os.getenv("HARD_STOP_LOSS_PCT", "-3"))
+FORCE_EXIT_LOSS_PCT = float(_os.getenv("FORCE_EXIT_LOSS_PCT", "-5"))
 TRAILING_STOP_TRIGGER = float(_os.getenv("TRAILING_STOP_TRIGGER", "3"))
-TRAILING_STOP_PCT = float(_os.getenv("TRAILING_STOP_PCT", "0"))
-TAKE_PROFIT_HALF_PCT = float(_os.getenv("TAKE_PROFIT_HALF_PCT", "8"))
-TAKE_PROFIT_FULL_PCT = float(_os.getenv("TAKE_PROFIT_FULL_PCT", "15"))
+TRAILING_STOP_PCT = float(_os.getenv("TRAILING_STOP_PCT", "2"))
+TAKE_PROFIT_HALF_PCT = float(_os.getenv("TAKE_PROFIT_HALF_PCT", "5"))
+TAKE_PROFIT_FULL_PCT = float(_os.getenv("TAKE_PROFIT_FULL_PCT", "12"))
 
-# 持仓天数
-HOLD_DAYS_WARNING = 3              # 超过 3 天开始降级看待
-HOLD_DAYS_FORCE_REVIEW = 5         # 超过 5 天必须复盘
-HOLD_DAYS_MAX = 7                  # 超过 7 天且没有明显利润，优先退出
+# 持仓天数（龙头打板：快进快出）
+HOLD_DAYS_WARNING = 1              # 超过 1 天开始降级看待
+HOLD_DAYS_FORCE_REVIEW = 2         # 超过 2 天必须复盘
+HOLD_DAYS_MAX = 2                  # 超过 2 天且盈利不足，优先退出
 
-# 仓位管理
-MAX_SINGLE_POSITION_PCT = 15.0     # 单只股票最大仓位
-MAX_POSITIONS = 5                  # 同时持有股票数量上限
-MAX_DAILY_NEW_BUYS = 3             # 每日新增标的上限
+# 仓位管理（龙头打板：集中火力）
+MAX_SINGLE_POSITION_PCT = 95.0     # 单只ALL-IN
+MAX_POSITIONS = 1                  # 同时只持1只（龙头战法核心）
+MAX_DAILY_NEW_BUYS = 1             # 每日最多1只
 
 # 补仓约束
 FORBID_AVERAGING_DOWN = True       # 默认禁止对亏损股补仓
@@ -53,8 +53,8 @@ MAX_SAME_STOCK_TRADES = 3          # 同一只股票 30 天内最大交易次数
 MAX_DAILY_TRADES = 8
 
 # T+1 追高风控
-CHASE_HIGH_WARN_PCT = 3.0
-CHASE_HIGH_BLOCK_PCT = 5.0
+CHASE_HIGH_WARN_PCT = 9.5
+CHASE_HIGH_BLOCK_PCT = 20.0          # 龙头打板：涨停板可以追
 CHASE_HIGH_PENALTY = -20
 LATE_SESSION_CHASE_BLOCK = True
 

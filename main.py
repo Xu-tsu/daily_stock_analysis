@@ -289,7 +289,7 @@ def run_full_analysis(
             try:
                 from market_scanner import scan_market as new_scan
                 logger.info("正在执行全市场扫描（新版）...")
-                candidates = new_scan(max_price=10.0, min_turnover=2.0, top_n=10, mode="trend")
+                candidates = new_scan(max_price=50.0, min_turnover=3.0, top_n=10, mode="dragon")
                 if candidates:
                     scan_codes = [c["code"] for c in candidates]
                     logger.info(f"扫描到 {len(scan_codes)} 只候选: {scan_codes}")
@@ -475,17 +475,17 @@ def _auto_build_positions(portfolio: dict, config, args, candidates=None):
     try:
         if not candidates:
             from market_scanner import scan_market
-            candidates = scan_market(max_price=10.0, min_turnover=2.0, top_n=5, mode="trend")
+            candidates = scan_market(max_price=50.0, min_turnover=3.0, top_n=5, mode="dragon")
         if not candidates:
             logger.info("[自动建仓] 扫描无合适候选，跳过")
             return
 
-        picks = candidates[:3]
-        logger.info(f"[自动建仓] 候选: {[(c['code'], c.get('name','')) for c in picks]}")
+        picks = candidates[:1]  # 龙头打板：只选最强的1只ALL-IN
+        logger.info(f"[自动建仓] 龙头候选: {[(c['code'], c.get('name','')) for c in picks]}")
 
         broker_enabled = os.getenv("BROKER_ENABLED", "false").lower() == "true"
         total_cash = portfolio.get("cash", 0) or 200000
-        per_stock_cash = total_cash * 0.25  # 每只分配25%资金，保留25%现金
+        per_stock_cash = total_cash * 0.95  # ALL-IN 95%资金
 
         bought = []
         for c in picks:

@@ -658,3 +658,69 @@ def get_recent_reviews(days: int = 5) -> list:
         except Exception:
             continue
     return reviews
+
+
+def build_review_lessons(days: int = 3, max_chars: int = 800) -> str:
+    """提取最近复盘的核心教训，格式化为可注入 prompt 的文本。
+
+    从 AI 复盘报告中提取：改进方案、亏损分析、执行力评分。
+    只取关键教训，不是完整报告。
+
+    Returns:
+        格式化文本，空字符串表示无历史复盘。
+    """
+    if not REVIEW_DIR.exists():
+        return ""
+
+    lessons = []
+    for f in sorted(REVIEW_DIR.glob("review_*.json"), reverse=True)[:days]:
+        try:
+            with open(f, "r", encoding="utf-8") as fp:
+                data = json.load(fp)
+        except Exception:
+            continue
+
+        trade_date = data.get("trade_date", "")
+        ai_text = data.get("ai_review", "") or ""
+        if not ai_text:
+            continue
+
+        # 提取关键段落：改进方案 / 亏损分析 / 执行力评分
+        extracted = []
+        for section_title in ["改进方案", "改进建议", "亏损交易分析", "执行力评分", "教训"]:
+            idx = ai_text.find(section_title)
+            if idx >= 0:
+                # 取这个标题到下一个 "##" 之间的内容
+                start = idx
+                end = ai_text.find("\n##", start + 1)
+                if end < 0:
+                    end = min(start + 300, len(ai_text))
+                chunk = ai_text[start:end].strip()
+                if chunk:
+                    extracted.append(chunk)
+
+        if not extracted:
+            # 没找到结构化段落，取最后300字（通常包含总结）
+            extracted.append(ai_text[-300:].strip())
+
+        # 补充当日交易统计
+        perf = data.get("performance_30d", {})
+        win_rate = perf.get("win_rate", "")
+        total_pnl = perf.get("total_pnl", "")
+        stats = []
+        if win_rate:
+            stats.append(f"胜率{win_rate}")
+        if total_pnl:
+            stats.append(f"总盈亏{total_pnl}")
+        stats_text = f" ({', '.join(stats)})" if stats else ""
+
+        lessons.append(f"[{trade_date}]{stats_text}\n" + "\n".join(extracted))
+
+    if not lessons:
+        return ""
+
+    text = "## 近期复盘教训（必须参考，避免重蹈覆辙）\n" + "\n---\n".join(lessons)
+    # 截断防止 prompt 过长
+    if len(text) > max_chars:
+        text = text[:max_chars] + "\n...(已截断)"
+    return text

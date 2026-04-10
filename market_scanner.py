@@ -648,11 +648,16 @@ def scan_market(
       5. 按技术得分排序
 
     mode:
+      dragon — 龙头打板（涨停/连板/接力/爆量突破）
       trend  — 趋势股（MA多头+缩量回踩）
       breakout — 突破股（放量突破近期高点）
       oversold — 超跌反弹（RSI低+MACD底背离）
       sub_dragon — 副龙头（短期题材+低位+资金流入+即将拉升）
     """
+    # 龙头模式自动放宽涨跌幅范围（允许涨停板）
+    if mode == "dragon":
+        max_change = max(max_change, 20.0)
+        min_change = min(min_change, -5.0)
     start_time = time.time()
 
     # 预加载辅助数据（用于打分增强）

@@ -137,10 +137,10 @@ def run_pre_market_scan() -> list:
     logger.info(f"盘前扫描 {today}")
     logger.info("=" * 60)
 
-    # 1. 全市场扫描（趋势模式）
-    logger.info("[盘前 1/4] 全市场趋势扫描...")
-    candidates = scan_market(max_price=10.0, min_turnover=2.0, top_n=30, mode="trend")
-    save_scan_results(candidates, scan_date=today, mode="trend")
+    # 1. 全市场扫描（龙头打板模式）
+    logger.info("[盘前 1/4] 全市场龙头打板扫描...")
+    candidates = scan_market(max_price=50.0, min_turnover=3.0, top_n=30, mode="dragon")
+    save_scan_results(candidates, scan_date=today, mode="dragon")
 
     # 1.5 副龙头扫描（短期题材+低位+资金流入）
     logger.info("[盘前 1.5/4] 副龙头扫描...")
@@ -2499,7 +2499,7 @@ if __name__ == "__main__":
 
         print("\n=== 3. 扫描测试（5只）===")
         from market_scanner import scan_market
-        r = scan_market(max_price=10, top_n=5, mode="trend")
+        r = scan_market(max_price=50, top_n=5, mode="dragon")
         for s in r:
             print(f"  {s['code']} {s['name']} {s['price']} 得分:{s['tech_score']}")
 

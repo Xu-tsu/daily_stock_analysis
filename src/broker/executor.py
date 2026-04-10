@@ -14,6 +14,21 @@ from src.broker.safety import check_order_allowed, increment_order_count, is_tra
 logger = logging.getLogger(__name__)
 
 
+def _normalize_price(code: str, price: float) -> float:
+    """统一价格精度：转债3位小数，股票2位小数。
+
+    THS规则：
+    - 股票（A股）：最小变动 0.01 元，保留2位
+    - 可转债（110/113/123/127/128/118开头）：最小变动 0.001 元，保留3位
+    """
+    code_str = str(code).strip()
+    # 可转债代码前缀
+    cb_prefixes = ("110", "113", "123", "127", "128", "118")
+    if code_str.startswith(cb_prefixes):
+        return round(price, 3)
+    return round(price, 2)
+
+
 class RebalanceExecutor:
     """调仓批量执行器
 
@@ -301,6 +316,9 @@ class RebalanceExecutor:
                 message=f"安全限制: {reason}",
             )
 
+        # 统一价格精度（股票2位，转债3位）
+        price = _normalize_price(code, price)
+
         # 下单：根据 AI execution_strategy 决定执行方式
         strategy = action.get("execution_strategy", {})
         order_type = str(strategy.get("order_type", "")).lower()
@@ -319,7 +337,8 @@ class RebalanceExecutor:
             # AI 给了追单参数
             if order_type == "aggressive":
                 # 对手价：买用卖一(+0.01)，卖用买一(-0.01)
-                price = round(price + (0.01 if direction == "buy" else -0.01), 2)
+                tick = 0.001 if str(code).startswith(("110","113","123","127","128","118")) else 0.01
+                price = _normalize_price(code, price + (tick if direction == "buy" else -tick))
             if direction == "sell":
                 result = self._broker.smart_sell(
                     code, price, shares,
@@ -376,7 +395,7 @@ class RebalanceExecutor:
             if hasattr(self._broker, "_get_realtime_price"):
                 new_p = self._broker._get_realtime_price(code)
                 if new_p > 0:
-                    price = round(new_p, 2)
+                    price = _normalize_price(code, new_p)
 
         return OrderResult(
             code=code, direction=direction,

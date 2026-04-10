@@ -343,7 +343,9 @@ class THSBrokerAdapter(BrokerAdapter):
 
     @_retry(max_attempts=3, delay=1.0)
     def buy(self, code: str, price: float, shares: int) -> OrderResult:
-        price = round(price, 2)  # A股价格精度2位小数
+        # 价格精度：转债3位小数，股票2位小数
+        cb_prefixes = ("110", "113", "123", "127", "128", "118")
+        price = round(price, 3) if str(code).startswith(cb_prefixes) else round(price, 2)
         if not self._ensure_connected():
             return OrderResult(
                 code=code, direction="buy", status="error",
@@ -369,7 +371,9 @@ class THSBrokerAdapter(BrokerAdapter):
 
     @_retry(max_attempts=3, delay=1.0)
     def sell(self, code: str, price: float, shares: int) -> OrderResult:
-        price = round(price, 2)  # A股价格精度2位小数
+        # 价格精度：转债3位小数，股票2位小数
+        cb_prefixes = ("110", "113", "123", "127", "128", "118")
+        price = round(price, 3) if str(code).startswith(cb_prefixes) else round(price, 2)
         if not self._ensure_connected():
             return OrderResult(
                 code=code, direction="sell", status="error",
@@ -760,7 +764,8 @@ class THSBrokerAdapter(BrokerAdapter):
             max_chase_pct: AI 根据紧迫度决定最多追高多少（止损紧急=1-2%，正常=0.3-0.5%）
             timeout: AI 根据紧迫度决定追单超时（紧急=30-60s，正常=60-120s）
         """
-        ceiling = round(price * (1 + max_chase_pct / 100), 2)
+        decimals = 3 if str(code).startswith(("110","113","123","127","128","118")) else 2
+        ceiling = round(price * (1 + max_chase_pct / 100), decimals)
         return self._smart_execute("buy", code, price, shares, ceiling, timeout)
 
     def smart_sell(self, code: str, price: float, shares: int,
@@ -771,7 +776,8 @@ class THSBrokerAdapter(BrokerAdapter):
             max_chase_pct: AI 根据紧迫度决定最多降价多少
             timeout: AI 根据紧迫度决定追单超时
         """
-        floor = round(price * (1 - max_chase_pct / 100), 2)
+        decimals = 3 if str(code).startswith(("110","113","123","127","128","118")) else 2
+        floor = round(price * (1 - max_chase_pct / 100), decimals)
         return self._smart_execute("sell", code, price, shares, floor, timeout)
 
     def _smart_execute(self, direction: str, code: str, price: float,
@@ -782,7 +788,8 @@ class THSBrokerAdapter(BrokerAdapter):
         trade_fn = self.buy if direction == "buy" else self.sell
 
         # 第一次下单
-        current_price = round(price, 2)
+        decimals = 3 if str(code).startswith(("110","113","123","127","128","118")) else 2
+        current_price = round(price, decimals)
         result = trade_fn(code, current_price, shares)
         if not result.is_success:
             return result
@@ -834,7 +841,7 @@ class THSBrokerAdapter(BrokerAdapter):
                 break
 
             # 价格没变，继续等
-            new_price = round(new_price, 2)
+            new_price = round(new_price, decimals)
             if new_price == current_price:
                 continue
 

@@ -915,7 +915,7 @@ def _handle_rebalance() -> str:
 def _handle_scan() -> str:
     try:
         from market_scanner import scan_market
-        results = scan_market(max_price=10.0, min_turnover=2.0, top_n=15, mode="trend")
+        results = scan_market(max_price=50.0, min_turnover=3.0, top_n=15, mode="dragon")
         if not results:
             return "📡 扫描完成，未找到符合条件的候选股"
 

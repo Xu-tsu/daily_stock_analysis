@@ -266,7 +266,7 @@ def run_full_enhanced_analysis(config=None) -> str:
         lines.append("═══ 全市场扫描 Top10 ═══")
         lines.append("")
         from market_scanner import scan_market
-        candidates = scan_market(max_price=10.0, min_turnover=2.0, top_n=10, mode="trend")
+        candidates = scan_market(max_price=50.0, min_turnover=3.0, top_n=10, mode="dragon")
         for s in candidates:
             lines.append(
                 f"  {s['code']} {s['name']} {s['price']:.2f}元 "

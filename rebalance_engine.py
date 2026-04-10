@@ -740,7 +740,16 @@ def _build_relay_candidate_pool(
         if not code:
             continue
         row = dict(item)
-        row.setdefault("candidate_source", "trend_hot")
+        row.setdefault("candidate_source", "dragon_hot")
+        merged[code] = row
+
+    for item in _load_scan_mode_candidates("dragon", limit=max(limit, 8)):
+        code = str(item.get("code", "") or "").strip()
+        if not code:
+            continue
+        existing = merged.get(code, {})
+        row = {**item, **existing}
+        row["candidate_source"] = "dragon"
         merged[code] = row
 
     for item in _load_scan_mode_candidates("sub_dragon", limit=max(limit, 8)):
@@ -1175,22 +1184,16 @@ def _apply_hard_rules(proposal: dict, portfolio: dict) -> dict:
         pnl = holding.get("pnl_pct", 0)
         sellable = holding.get("sellable_shares", holding.get("shares", 0))
 
-        # 硬规则1：亏损>5%必须清仓
-        if pnl <= -8.0 and action.get("action") not in ("sell",):
+        # 硬规则1：亏损>5%强制清仓
+        if pnl <= -5.0 and action.get("action") not in ("sell",):
             action["action"] = "sell"
-            action["detail"] = f"硬规则风控: 亏损{pnl}%超5%止损线，强制清仓"
-            action["reason"] = "止损5%硬规则触发"
-
-        # 硬规则2：卖出数不能超过可卖余额
-            action["detail"] = f"自适应风控: 亏损{pnl}%已跌破-8%强制退出线，执行清仓"
+            action["detail"] = f"硬规则风控: 亏损{pnl}%超-5%强制退出线，执行清仓"
             action["reason"] = "深度亏损超出容错区间，优先保护本金"
-        elif pnl <= -5.0 and action.get("action") in ("buy", "hold"):
+        # 硬规则2：亏损>3%减仓
+        elif pnl <= -3.0 and action.get("action") in ("buy", "hold"):
             action["action"] = "reduce"
-            action["detail"] = f"自适应风控: 亏损{pnl}%已到风险复核线，先降到观察仓"
-            action["reason"] = "5%亏损先降风险，再看是否有板块回流确认"
-
-            action["detail"] = f"自适应风控: 亏损{pnl}%已到-5%风险复核线，先降到观察仓"
-            action["reason"] = "先降风险，再观察是否出现板块回流和资金承接"
+            action["detail"] = f"自适应风控: 亏损{pnl}%已到-3%止损线，先降到观察仓"
+            action["reason"] = "龙头走弱先止损，再观察是否出现反包"
         if action.get("action") in ("sell", "reduce") and sellable == 0:
             action["action"] = "hold"
             action["detail"] = f"T+1约束: 今天无可卖余额（全部为今日买入），只能明天操作"
@@ -1444,6 +1447,8 @@ PROMPT_HOLDING_SCAN = """你是一位专业的A股短线交易顾问，专注低
 
 {decision_reference}
 
+{review_lessons}
+
 ### T+1风险评估
 - 如果该股今日已大涨(>3%)，不建议加仓（明天大概率回调，T+1无法当天止损）
 - 评估该股是否处于"追高买入"状态：远高于MA5 = 高风险
@@ -1528,6 +1533,8 @@ PROMPT_DEBATE_CRITIQUE = """你是一位严谨保守的A股风控专家，你的
 
 ## 历史交易数据参考（基于真实交易，必须参考）
 {decision_reference}
+
+{review_lessons}
 
 ## 市场数据摘要
 - 大盘研判: {market_summary}
@@ -2053,8 +2060,17 @@ def run_rebalance_analysis(config: Config = None) -> dict:
         except Exception:
             pass
 
+        # 注入复盘教训（让今天的决策吸取昨天的教训）
+        _review_lessons = ""
+        try:
+            from src.core.trade_review import build_review_lessons
+            _review_lessons = build_review_lessons(days=3, max_chars=600)
+        except Exception:
+            pass
+
         prompt_holding = PROMPT_HOLDING_SCAN.format(
             decision_reference=decision_ref,
+            review_lessons=_review_lessons,
             market_judge=json.dumps(market_judge, ensure_ascii=False),
             sector_judge=json.dumps(sector_judge, ensure_ascii=False),
             stock_analysis=stock_analysis_text,
@@ -2435,10 +2451,19 @@ def run_rebalance_analysis(config: Config = None) -> dict:
         except Exception:
             pass
 
+        # 复盘教训注入辩论
+        _debate_review_lessons = ""
+        try:
+            from src.core.trade_review import build_review_lessons
+            _debate_review_lessons = build_review_lessons(days=3, max_chars=400)
+        except Exception:
+            pass
+
         prompt_critique = PROMPT_DEBATE_CRITIQUE.format(
             proposal=json.dumps(proposal, ensure_ascii=False, indent=2),
             portfolio=portfolio_json,
             decision_reference=debate_ref,
+            review_lessons=_debate_review_lessons,
             market_summary=market_judge.get("summary", ""),
             sector_summary=sector_judge.get("summary", ""),
         )

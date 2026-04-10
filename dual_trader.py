@@ -178,6 +178,21 @@ def run_stock_scan(hot_concepts: List[dict] = None, regime: dict = None) -> List
 
             results.sort(key=lambda x: x.get("tech_score", 0), reverse=True)
 
+        # ── 复盘反馈：近期亏损过的股票降权（避免反复踩同一坑）──
+        try:
+            from trade_journal import get_recent_losers
+            recent_losers = get_recent_losers(days=10)  # 近10天亏损卖出的股票
+            if recent_losers:
+                loser_codes = {l["code"] for l in recent_losers}
+                for r in results:
+                    if r.get("code") in loser_codes:
+                        r["tech_score"] = r.get("tech_score", 0) - 30
+                        r["recent_loser"] = True
+                        logger.info(f"  [REVIEW] {r.get('name', '')}({r['code']}) 近期亏损-30分")
+                results.sort(key=lambda x: x.get("tech_score", 0), reverse=True)
+        except Exception:
+            pass
+
         # 打印结果
         logger.info(f"  [STOCK] Top candidates:")
         for i, r in enumerate(results[:10]):

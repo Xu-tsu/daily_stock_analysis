@@ -778,8 +778,9 @@ class BacktestEngine:
         import sys, io
         out = io.StringIO()
 
+        period_label = getattr(self, '_period_label', '2025')
         out.write("\n" + "=" * 70 + "\n")
-        out.write("Wolf of Wall Street 2025 Backtest Report\n")
+        out.write(f"Wolf of Wall Street {period_label} Backtest Report\n")
         out.write("=" * 70 + "\n")
         out.write(f"\n[Overall Performance]\n")
         out.write(f"  Initial Capital: Y{self.initial_capital:>12,.0f}\n")
@@ -831,9 +832,9 @@ class BacktestEngine:
 
         out.write(f"\n[Conclusion]\n")
         if total_return > 0:
-            out.write(f"  2025 full year profit {total_return:.2f}%, annualized {annual_return:.2f}%\n")
+            out.write(f"  {period_label} profit {total_return:.2f}%, annualized {annual_return:.2f}%\n")
         else:
-            out.write(f"  2025 full year loss {total_return:.2f}%\n")
+            out.write(f"  {period_label} loss {total_return:.2f}%\n")
         out.write(f"  Win rate {win_rate:.1f}%, profit factor {profit_factor:.2f}\n")
         out.write(f"  Max drawdown {max_dd:.2f}%\n")
         out.write("=" * 70 + "\n")
@@ -842,7 +843,7 @@ class BacktestEngine:
         print(report_text)
 
         # Also save as text file
-        report_path = Path("data/backtest_2025/report.txt")
+        report_path = Path(f"data/backtest_{period_label.lower().replace(' ', '_')}/report.txt")
         report_path.parent.mkdir(parents=True, exist_ok=True)
         with open(report_path, "w", encoding="utf-8") as f:
             f.write(report_text)
@@ -852,7 +853,8 @@ class BacktestEngine:
 
     def _save_results(self, total_return, annual_return, max_dd, win_rate, sharpe):
         """保存回测结果"""
-        out_dir = Path("data/backtest_2025")
+        period_label = getattr(self, '_period_label', '2025')
+        out_dir = Path(f"data/backtest_{period_label.lower().replace(' ', '_')}")
         out_dir.mkdir(parents=True, exist_ok=True)
 
         # 快照
@@ -897,21 +899,30 @@ class BacktestEngine:
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--period", default="2025", choices=["2025", "2026q1"],
-                        help="2025=full year 2025, 2026q1=2026 Jan-Mar")
+    parser.add_argument("--period", default="2025", choices=["2025", "2026q1", "2026ytd"],
+                        help="2025=full year 2025, 2026q1=2026 Jan-Mar, 2026ytd=2026 YTD")
     args = parser.parse_args()
 
-    if args.period == "2026q1":
+    if args.period == "2026ytd":
+        logger.info("华尔街之狼 2026年YTD回测 开始 (截止2026-04-10)")
+        logger.info("=" * 60)
+        all_data = fetch_all_a_share_daily("20251001", "20260410",
+                                           cache_name="backtest_cache_2026ytd.pkl")
+        engine = BacktestEngine(all_data, INITIAL_CAPITAL)
+        engine._period_label = "2026YTD"
+        engine.run("2026-01-05", "2026-04-10")
+    elif args.period == "2026q1":
         logger.info("华尔街之狼 2026年Q1回测 开始")
         logger.info("=" * 60)
-        # 需要2025-10开始的数据做技术指标lookback
         all_data = fetch_all_a_share_daily("20251001", "20260331",
                                            cache_name="backtest_cache_2026q1.pkl")
         engine = BacktestEngine(all_data, INITIAL_CAPITAL)
+        engine._period_label = "2026Q1"
         engine.run("2026-01-05", "2026-03-31")
     else:
         logger.info("华尔街之狼 2025年回测 开始")
         logger.info("=" * 60)
         all_data = fetch_all_a_share_daily("20250101", "20251231")
         engine = BacktestEngine(all_data, INITIAL_CAPITAL)
+        engine._period_label = "2025"
         engine.run("2025-01-06", "2025-12-31")

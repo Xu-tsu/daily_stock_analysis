@@ -422,7 +422,8 @@ class CBDayTrader:
 
         logger.info(f"[CB BUY] {name}({code}) {shares}张 @{price:.3f} = {amount:.0f}元 | {reason}")
 
-        # 实盘下单
+        # 实盘下单（转债价格保留3位小数）
+        price = round(price, 3)
         if self.broker:
             try:
                 self.broker.buy(code, price, shares)
@@ -464,7 +465,8 @@ class CBDayTrader:
         else:
             pos.shares -= shares
 
-        # 实盘下单
+        # 实盘下单（转债价格保留3位小数）
+        price = round(price, 3)
         if self.broker:
             try:
                 self.broker.sell(code, price, shares)
