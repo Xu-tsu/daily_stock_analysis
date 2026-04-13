@@ -494,6 +494,9 @@ class TestAnalyzeWithAgentStockName(unittest.TestCase):
             )
 
             self.assertIsNotNone(result)
+            factory_context = mock_build_executor.call_args.kwargs["context"]
+            self.assertEqual(factory_context["market_context"]["bias"], "positive")
+            self.assertEqual(factory_context["current_holding"]["sector"], "Liquor")
             passed_context = mock_executor.run.call_args.kwargs["context"]
             self.assertEqual(passed_context["current_holding"]["sector"], "Liquor")
             self.assertEqual(passed_context["market_context"]["bias"], "positive")

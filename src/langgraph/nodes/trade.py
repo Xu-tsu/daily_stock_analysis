@@ -168,6 +168,9 @@ def _execute_via_broker(code: str, name: str, action: str, shares: int, price: f
             return {"success": False, "result": None,
                     "message": f"安全限制: {safety.get('reason', '未知')}"}
 
+        # 价格精度：转债3位小数，股票2位小数
+        _d = 3 if str(code).startswith(("110","113","123","127","128","118")) else 2
+        price = round(price, _d)
         if action == "buy":
             result = broker.buy(code, price, shares)
         else:

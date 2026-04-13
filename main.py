@@ -465,10 +465,10 @@ def run_full_analysis(
         logger.exception(f"分析流程执行失败: {e}")
 
 
-def _auto_build_positions(portfolio: dict, config, args, candidates=None):
+def _auto_build_positions(portfolio: dict, config, args, candidates=None, event_signals=None):
     """空仓时自动选股+直接在THS买入。
 
-    流程: scan_market → 选3只 → 均分资金 → broker.buy → 更新 portfolio
+    流程: scan_market → 选最强1只 → 自适应仓位 → broker.buy → 更新 portfolio
     如果传入 candidates 则直接使用，不再重新扫描。
     """
     import os
@@ -485,7 +485,40 @@ def _auto_build_positions(portfolio: dict, config, args, candidates=None):
 
         broker_enabled = os.getenv("BROKER_ENABLED", "false").lower() == "true"
         total_cash = portfolio.get("cash", 0) or 200000
-        per_stock_cash = total_cash * 0.95  # ALL-IN 95%资金
+
+        # ── blind_base 默认实盘入口: 用近期交易结果自适应调整仓位, 不再写死牛熊比例 ──
+        try:
+            from event_signal import (
+                get_event_action,
+                get_recent_event_action,
+                load_adaptive_state,
+                save_adaptive_state,
+            )
+            adaptive = load_adaptive_state()
+            # 用broker总资产更新净值
+            adaptive.update_equity(total_cash)
+            save_adaptive_state(adaptive)
+            position_pct = adaptive.position_coeff
+
+            # 事件防御: 有重大负面事件时额外降仓
+            event_action = (
+                get_event_action(event_signals)
+                if event_signals
+                else get_recent_event_action(max_age_hours=1.0)
+            )
+            if event_action == "defense":
+                position_pct *= 0.5  # 事件防御: 仓位减半
+                logger.info("[自动建仓] 事件防御生效，仓位减半")
+
+            logger.info(f"[自动建仓] 自适应仓位={position_pct*100:.0f}% "
+                        f"(胜率={adaptive.recent_win_rate:.0%} 连亏={adaptive.consecutive_losses} "
+                        f"回撤={adaptive.drawdown_pct:.1f}% 事件={event_action})")
+        except Exception as e:
+            logger.warning(f"[自动建仓] 自适应仓位加载失败({e}), 使用默认60%")
+            position_pct = 0.60
+
+        per_stock_cash = total_cash * position_pct
+        logger.info(f"[自动建仓] 仓位={position_pct*100:.0f}% 金额={per_stock_cash:,.0f}")
 
         bought = []
         for c in picks:
@@ -523,7 +556,9 @@ def _auto_build_positions(portfolio: dict, config, args, candidates=None):
                     from src.broker import get_broker
                     broker = get_broker()
                     if broker and broker.is_connected():
-                        result = broker.buy(code, price, shares)
+                        # 价格精度：转债3位，股票2位
+                        _d = 3 if str(code).startswith(("110","113","123","127","128","118")) else 2
+                        result = broker.buy(code, round(price, _d), shares)
                         logger.info(f"[自动建仓] THS下单: {result.status} {result.message}")
                         if result.is_success:
                             broker_success = True
@@ -835,8 +870,9 @@ def main() -> int:
             except Exception as e:
                 logger.warning(f"[Phase 0] 市场环境检测失败: {e}")
 
-            # ━━━ Phase 1: 新闻情报扫描 ━━━
+            # ━━━ Phase 1: 新闻情报扫描 + 事件信号生成 ━━━
             hot_concepts = []
+            event_signals = []
             try:
                 from dual_trader import run_news_scan
                 hot_concepts = run_news_scan()
@@ -846,6 +882,35 @@ def main() -> int:
                     logger.info("[Phase 1] 暂无热点概念")
             except Exception as e:
                 logger.warning(f"[Phase 1] 新闻扫描失败: {e}")
+
+            # 事件信号分析: 新闻 → 板块 → 个股
+            try:
+                from event_signal import analyze_news_events, get_event_action, get_event_watchlist
+
+                # 获取特朗普新闻(如果macro_data_collector已采集)
+                trump_news = None
+                try:
+                    from macro_data_collector import fetch_trump_news
+                    trump_news = fetch_trump_news()
+                except Exception:
+                    pass
+
+                event_signals = analyze_news_events(
+                    hot_concepts=hot_concepts,
+                    trump_news=trump_news,
+                )
+                if event_signals:
+                    action = get_event_action(event_signals)
+                    watchlist = get_event_watchlist(event_signals)
+                    logger.info(f"[Phase 1] 事件信号: {len(event_signals)}个 | "
+                                f"行动={action} | 关注池={len(watchlist)}只")
+                    for sig in event_signals[:3]:
+                        logger.info(f"  [{sig.event_type}] {sig.trigger} → {sig.action} "
+                                    f"(severity={sig.severity}, sectors={sig.affected_sectors[:3]})")
+                else:
+                    logger.info("[Phase 1] 无事件信号")
+            except Exception as e:
+                logger.warning(f"[Phase 1] 事件信号分析失败: {e}")
 
             # ━━━ Phase 2: 技能引擎加载 ━━━
             try:
@@ -879,22 +944,46 @@ def main() -> int:
                     # 用dual_trader的智能选股（结合新闻+市场环境）
                     try:
                         from dual_trader import run_stock_scan
-                        smart_candidates = run_stock_scan(hot_concepts=hot_concepts, regime=regime)
+                        smart_candidates = run_stock_scan(
+                            hot_concepts=hot_concepts,
+                            regime=regime,
+                            event_signals=event_signals,
+                        )
                         if smart_candidates:
                             logger.info(f"[Phase 3] 智能选股结果: {len(smart_candidates)} 只候选")
                             # 将智能选股结果传递给建仓（替代默认扫描）
-                            _auto_build_positions(portfolio, config, args, candidates=smart_candidates)
+                            _auto_build_positions(
+                                portfolio,
+                                config,
+                                args,
+                                candidates=smart_candidates,
+                                event_signals=event_signals,
+                            )
                         else:
                             logger.info("[Phase 3] 智能选股无候选，使用默认扫描建仓")
-                            _auto_build_positions(portfolio, config, args)
+                            _auto_build_positions(
+                                portfolio,
+                                config,
+                                args,
+                                event_signals=event_signals,
+                            )
                     except Exception as e:
                         logger.warning(f"[Phase 3] 智能选股失败({e})，使用默认扫描")
-                        _auto_build_positions(portfolio, config, args)
+                        _auto_build_positions(
+                            portfolio,
+                            config,
+                            args,
+                            event_signals=event_signals,
+                        )
                 else:
                     # ── 有仓：正常调仓 ──
                     logger.info(f"[Phase 3] 有{len(real_holdings)}只持仓，执行调仓分析...")
                     from rebalance_engine import run_rebalance_analysis
-                    result = run_rebalance_analysis(config=config)
+                    result = run_rebalance_analysis(
+                        config=config,
+                        hot_concepts=hot_concepts,
+                        event_signals=event_signals,
+                    )
                     if "error" not in result:
                         report = format_rebalance_report(result)
                         logger.info(f"\n{report}")
@@ -930,7 +1019,11 @@ def main() -> int:
                 except Exception as e:
                     logger.warning(f"[Phase 4] 可转债跳过: {e}")
 
-            threading.Thread(target=_cb_trading, daemon=True).start()
+            cb_enabled = os.getenv("CB_TRADING_ENABLED", "false").lower() in ("true", "1", "yes")
+            if cb_enabled:
+                threading.Thread(target=_cb_trading, daemon=True).start()
+            else:
+                logger.info("[Phase 4] 可转债T+0已关闭 (CB_TRADING_ENABLED=false)，资金集中龙头打板")
 
             # ━━━ Phase 5: 盘中监控（后台线程）━━━
             def _monitor():
@@ -962,7 +1055,7 @@ def main() -> int:
             logger.info(f"  市场环境: {regime.get('regime', '?').upper()} (score={regime.get('score', 0)})")
             logger.info(f"  热点概念: {len(hot_concepts)} 个")
             logger.info(f"  持仓管理: 调仓/建仓已执行")
-            logger.info(f"  可转债T+0: 后台运行中")
+            logger.info(f"  可转债T+0: {'后台运行中' if cb_enabled else '已关闭'}")
             logger.info(f"  盘中监控: 后台运行中 (1分钟间隔)")
             logger.info(f"  收盘任务: 复盘报告+技能进化+涨停分析 (15:00自动)")
             logger.info("=" * 60)
@@ -1022,9 +1115,33 @@ def main() -> int:
                 logger.info(f"当前持仓 {len(portfolio['holdings'])} 只: {', '.join(holding_names)}")
                 logger.info(f"现金: {portfolio.get('cash', 0)}")
 
+                hot_concepts = []
+                event_signals = []
+                try:
+                    from dual_trader import run_news_scan
+                    from event_signal import analyze_news_events
+
+                    hot_concepts = run_news_scan()
+                    trump_news = None
+                    try:
+                        from macro_data_collector import fetch_trump_news
+                        trump_news = fetch_trump_news()
+                    except Exception:
+                        pass
+                    event_signals = analyze_news_events(
+                        hot_concepts=hot_concepts,
+                        trump_news=trump_news,
+                    )
+                except Exception as e:
+                    logger.warning(f"调仓前事件上下文采集失败: {e}")
+
                 # 执行多Agent调仓分析
                 logger.info("开始执行多Agent调仓分析...")
-                rebalance_result = run_rebalance_analysis(config=config)
+                rebalance_result = run_rebalance_analysis(
+                    config=config,
+                    hot_concepts=hot_concepts,
+                    event_signals=event_signals,
+                )
 
                 if "error" in rebalance_result:
                     logger.error(f"调仓分析失败: {rebalance_result['error']}")

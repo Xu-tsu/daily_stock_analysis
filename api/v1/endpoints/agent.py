@@ -117,14 +117,10 @@ async def agent_chat(request: ChatRequest):
     
     try:
         strategies = request.effective_strategies
-        executor = _build_executor(config, strategies)
-
-        # Pass explicit strategies into context for the orchestrator.
-        # Direct assignment so caller-provided strategies always take precedence
-        # over any stale value carried in the context dict.
         ctx = dict(request.context or {})
         if strategies:
             ctx["strategies"] = strategies
+        executor = _build_executor(config, strategies, ctx)
 
         # Offload the blocking call to a thread to avoid blocking the event loop.
         loop = asyncio.get_running_loop()
@@ -228,10 +224,14 @@ async def send_chat_to_notification(request: SendChatRequest):
     return {"success": True}
 
 
-def _build_executor(config, strategies: Optional[List[str]] = None):
+def _build_executor(
+    config,
+    strategies: Optional[List[str]] = None,
+    context: Optional[dict] = None,
+):
     """Build and return a configured AgentExecutor (sync helper)."""
     from src.agent.factory import build_agent_executor
-    return build_agent_executor(config, skills=strategies)
+    return build_agent_executor(config, skills=strategies, context=context)
 
 
 @router.post("/chat/stream")
@@ -270,7 +270,7 @@ async def agent_chat_stream(request: ChatRequest):
 
     def run_sync():
         try:
-            executor = _build_executor(config, strategies)
+            executor = _build_executor(config, strategies, stream_ctx)
             result = executor.chat(
                 message=request.message,
                 session_id=session_id,

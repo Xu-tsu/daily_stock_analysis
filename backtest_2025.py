@@ -381,6 +381,21 @@ def compute_technical_score(df: pd.DataFrame, idx: int) -> dict:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class BacktestEngine:
+    """无未来函数回测引擎 v3
+
+    核心原则: 智能体在 Day T 收盘后只能看到 ≤Day T 的数据，
+    所有决策都在盘后做出，次日开盘执行。
+
+    时间线:
+      Day T 收盘后 → 复盘分析（只看 ≤T 的数据）
+        → 选股: 评分 → pending_buy（明日开盘买入）
+        → 调仓: 检查持仓盈亏 → pending_sell（明日开盘卖出）
+      Day T+1 开盘 → 先执行 pending_sell（以 T+1 OPEN 价）
+                   → 再执行 pending_buy（以 T+1 OPEN 价）
+                   → 盘中只做极端止损（跌停保护，用 T+1 LOW 模拟）
+      Day T+1 收盘 → 再次复盘分析 → 新的 pending_buy / pending_sell
+    """
+
     def __init__(self, all_data: Dict[str, pd.DataFrame], initial_capital: float):
         self.all_data = all_data
         self.cash = initial_capital
@@ -390,6 +405,10 @@ class BacktestEngine:
         self.snapshots: List[DailySnapshot] = []
         self.prev_total = initial_capital
 
+        # 待执行的订单 (T日盘后决策 → T+1日开盘执行)
+        self._pending_buy: Optional[dict] = None
+        self._pending_sells: List[tuple] = []  # [(code, shares, reason), ...]
+
         # 获取所有交易日
         dates_set = set()
         for df in all_data.values():
@@ -397,11 +416,32 @@ class BacktestEngine:
         self.trading_days = sorted(dates_set)
         self.day_idx_map = {d: i for i, d in enumerate(self.trading_days)}
 
+    def _get_next_open(self, code: str, after_date: str) -> Optional[float]:
+        """获取 after_date 之后第一个交易日的开盘价"""
+        df = self.all_data.get(code)
+        if df is None:
+            return None
+        future = df[df["date"] > after_date]
+        if future.empty:
+            return None
+        return float(future.iloc[0]["open"])
+
+    def _get_row(self, code: str, date: str):
+        """获取指定日期的行数据"""
+        df = self.all_data.get(code)
+        if df is None:
+            return None
+        rows = df[df["date"] == date]
+        if rows.empty:
+            return None
+        return rows.iloc[0]
+
     def run(self, start_date: str = "2025-01-06", end_date: str = "2025-12-31"):
         """运行回测"""
         logger.info(f"回测区间: {start_date} ~ {end_date}")
         logger.info(f"初始资金: ¥{self.initial_capital:,.0f}")
         logger.info(f"股票数据: {len(self.all_data)} 只")
+        logger.info(f"模式: 无未来函数 (T日信号 → T+1日开盘价执行)")
 
         days = [d for d in self.trading_days if start_date <= d <= end_date]
         logger.info(f"交易日数: {len(days)} 天")
@@ -419,60 +459,33 @@ class BacktestEngine:
 
         self._print_summary()
 
-    def _get_market_breadth(self, date: str) -> float:
-        """计算市场宽度：今日上涨股票比例"""
-        up, total = 0, 0
-        for code, df in self.all_data.items():
-            row = df[df["date"] == date]
-            if row.empty:
-                continue
-            chg = float(row.iloc[0].get("change_pct", 0))
-            if pd.isna(chg):
-                continue
-            total += 1
-            if chg > 0:
-                up += 1
-        return up / total if total > 0 else 0.5
-
     def _process_day(self, date: str, day_num: int):
-        """处理一个交易日"""
+        """处理一个交易日 — 严格禁止未来函数
+
+        执行顺序:
+          1. 开盘: 执行昨晚挂的 pending_sell (以今日 OPEN 价)
+          2. 开盘: 执行昨晚挂的 pending_buy  (以今日 OPEN 价)
+          3. 盘中: 仅做极端止损保护 (跌停/暴跌，用今日 LOW 模拟)
+          4. 收盘: 更新持仓价格
+          5. 盘后复盘: 用 ≤今日 数据分析 → 生成明日 pending_sell / pending_buy
+        """
         day_idx = self.day_idx_map.get(date, day_num)
 
-        # 1. 更新持仓价格
-        self._update_prices(date)
+        # ═══ Step 1: 开盘 — 执行昨晚的卖出决策 (以今日 OPEN 价) ═══
+        self._execute_pending_sells(date, day_idx)
 
-        # 2. 卖出检查（先卖后买）
-        self._check_exits(date, day_idx)
+        # ═══ Step 2: 开盘 — 执行昨晚的买入信号 (以今日 OPEN 价) ═══
+        self._execute_pending_buy(date, day_idx)
 
-        # 3. 选股 + 买入（大盘择时：只在市场情绪好时入场）
-        # 用20日均线上方股票比例作为大盘情绪指标
-        if not hasattr(self, '_market_mood_cache'):
-            self._market_mood_cache = {}
+        # ═══ Step 3: 盘中 — 仅极端止损保护 (跌停/暴跌) ═══
+        self._emergency_stop_loss(date, day_idx)
 
-        above_ma20_count = 0
-        total_count = 0
-        for code, sdf in self.all_data.items():
-            row = sdf[sdf["date"] == date]
-            if row.empty:
-                continue
-            total_count += 1
-            c = float(row.iloc[0]["close"])
-            # 简单判断：price > 20日均价
-            idx_in_df = sdf.index[sdf["date"] == date]
-            if len(idx_in_df) > 0:
-                i = idx_in_df[0]
-                if i >= 20:
-                    ma20_val = sdf["close"].iloc[i-19:i+1].mean()
-                    if c > ma20_val:
-                        above_ma20_count += 1
+        # ═══ Step 4: 收盘 — 更新持仓价格 ═══
+        self._update_prices_close(date)
 
-        market_mood = above_ma20_count / total_count if total_count > 0 else 0.5
+        # ═══ Step 5: 盘后复盘 — 分析持仓+选股 (仅看 ≤今日数据) ═══
+        market_mood = self._calc_market_mood(date)
 
-        # 龙头战法择时：
-        # - 正常市(>40%): 全力做
-        # - 弱市(30-40%): 只做连板股(最强信号)
-        # - 极端弱市(<30%): 空仓
-        # 额外：如果近期回撤>15%，暂停交易3天恢复心态
         if not hasattr(self, '_pause_until_day'):
             self._pause_until_day = -1
 
@@ -481,17 +494,16 @@ class BacktestEngine:
             current_total = self.cash + sum(h.market_value for h in self.holdings.values())
             recent_dd = (recent_peak - current_total) / recent_peak * 100
             if recent_dd > 15:
-                self._pause_until_day = day_num + 3  # 暂停3天
+                self._pause_until_day = day_num + 3
 
-        if day_num < self._pause_until_day:
-            pass  # 暂停中，不入场
-        elif market_mood >= 0.40:
-            self._check_entries(date, day_idx)
-        elif market_mood >= 0.30:
-            # 弱市只做最强信号（连板接力）
-            self._check_entries(date, day_idx)  # 评分系统自然会筛掉弱信号
+        # 5a: 盘后复盘 — 检查持仓是否需要明天卖
+        self._review_and_queue_sells(date, day_idx)
 
-        # 4. 记录快照
+        # 5b: 盘后选股 — 信号存入 pending_buy（明天开盘执行）
+        if day_num >= self._pause_until_day and market_mood >= 0.30:
+            self._scan_and_queue(date, day_idx)
+
+        # ═══ 记录快照 ═══
         total_mv = sum(h.market_value for h in self.holdings.values())
         total = self.cash + total_mv
         daily_ret = (total - self.prev_total) / self.prev_total * 100 if self.prev_total > 0 else 0
@@ -506,96 +518,281 @@ class BacktestEngine:
             daily_return_pct=daily_ret,
         ))
 
-    def _update_prices(self, date: str):
-        """更新所有持仓的当前价格（含盘中最高/最低）"""
-        for code, h in self.holdings.items():
-            df = self.all_data.get(code)
-            if df is None:
-                continue
-            row = df[df["date"] == date]
-            if row.empty:
-                continue
-            h.current_price = float(row.iloc[0]["close"])
-            h.peak_price = max(h.peak_price, float(row.iloc[0]["high"]))
-            # 记录盘中最低价用于止损判断
-            h._intraday_low = float(row.iloc[0]["low"])
+    # ────────────────────────────────────────
+    # Step 1: 执行昨日挂单
+    # ────────────────────────────────────────
 
-    def _check_exits(self, date: str, day_idx: int):
-        """龙头战法卖出 — 快进快出，隔日就走"""
-        to_sell = []
+    def _execute_pending_buy(self, date: str, day_idx: int):
+        """执行昨日收盘生成的买入信号 — 以今日开盘价成交"""
+        if self._pending_buy is None:
+            return
 
-        for code, h in self.holdings.items():
-            # T+1：买入当天不可卖出
+        pb = self._pending_buy
+        self._pending_buy = None  # 不管成不成功，清空
+
+        code = pb["code"]
+
+        # 如果已持仓，跳过
+        if code in self.holdings or len(self.holdings) >= MAX_POSITIONS:
+            return
+
+        # 获取今天的开盘价（这是真实可获得的执行价格）
+        row = self._get_row(code, date)
+        if row is None:
+            return  # 今天停牌
+
+        open_price = float(row["open"])
+        if open_price <= 0:
+            return
+
+        # 涨停一字板检测：开盘价=涨停价 → 买不进去
+        prev_close = pb.get("signal_close", 0)
+        if prev_close > 0:
+            limit_up = prev_close * 1.1
+            if open_price >= limit_up * 0.998:  # 开盘几乎涨停
+                return  # 一字板，实盘排队也买不到
+
+        # 以开盘价 + 滑点买入
+        cost_price = open_price * (1 + SLIPPAGE_PCT)
+
+        total_asset = self.cash + sum(h.market_value for h in self.holdings.values())
+        buy_amount = min(self.cash * 0.95, total_asset * MAX_SINGLE_PCT)
+
+        shares = int(buy_amount / cost_price / 100) * 100
+        if shares < 100 or cost_price * shares > self.cash:
+            return
+
+        amount = cost_price * shares
+        commission = max(amount * COMMISSION_RATE, 5)
+        if amount + commission > self.cash:
+            return
+
+        self.cash -= (amount + commission)
+        self.holdings[code] = Holding(
+            code=code, name=pb.get("name", code), shares=shares,
+            cost_price=cost_price, buy_date=date,
+            buy_day_idx=day_idx, current_price=open_price,
+            peak_price=open_price,
+        )
+        self.trades.append(TradeRecord(
+            date=date, code=code, name=pb.get("name", code), direction="buy",
+            shares=shares, price=cost_price, amount=amount,
+            commission=commission,
+            reason=f"T+1开盘买入|{pb.get('reason', '')}|signal@{pb.get('signal_date', '')}",
+        ))
+
+    # ────────────────────────────────────────
+    # Step 1b: 执行昨晚挂的卖出订单
+    # ────────────────────────────────────────
+
+    def _execute_pending_sells(self, date: str, day_idx: int):
+        """执行昨晚盘后复盘决定的卖出 — 以今日开盘价成交"""
+        if not self._pending_sells:
+            return
+
+        sells = self._pending_sells[:]
+        self._pending_sells = []
+
+        for code, shares, reason in sells:
+            h = self.holdings.get(code)
+            if not h:
+                continue
+
+            # T+1检查: 昨天买入的今天才能卖（buy_day_idx < today's day_idx）
             if h.buy_day_idx >= day_idx:
+                # 还不能卖，重新挂到明天
+                self._pending_sells.append((code, shares, reason + "(T+1延后)"))
                 continue
 
-            pnl = h.pnl_pct
-            hold_days = day_idx - h.buy_day_idx
+            row = self._get_row(code, date)
+            if row is None:
+                continue  # 停牌
 
-            # 盘中最低价止损
-            intraday_low = getattr(h, '_intraday_low', h.current_price)
-            intraday_pnl = (intraday_low - h.cost_price) / h.cost_price * 100 if h.cost_price > 0 else 0
-
-            peak_pnl = (h.peak_price - h.cost_price) / h.cost_price * 100 if h.cost_price > 0 else 0
-            drawdown_from_peak = (h.peak_price - h.current_price) / h.peak_price * 100 if h.peak_price > 0 else 0
-
-            # 获取今日涨幅
-            df = self.all_data.get(code)
-            today_chg = 0
-            if df is not None:
-                row = df[df["date"] == date]
-                if not row.empty:
-                    today_chg = float(row.iloc[0].get("change_pct", 0))
-                    if pd.isna(today_chg):
-                        today_chg = 0
-
-            # 1. 强制止损
-            if intraday_pnl <= FORCE_EXIT_PCT:
-                to_sell.append((code, h.shares, f"Force StopLoss {pnl:.1f}%"))
+            open_price = float(row["open"])
+            if open_price <= 0:
                 continue
 
-            # 2. 止盈全清（12%+）
-            if pnl >= TAKE_PROFIT_FULL_PCT:
-                to_sell.append((code, h.shares, f"Full TakeProfit {pnl:.1f}%"))
-                continue
-
-            # 3. 龙头特殊规则：如果今天继续涨停(>9.5%)，不卖！继续持有
-            if today_chg > 9.5 and hold_days <= 2:
-                continue  # 连板中，不卖
-
-            # 4. 移动止盈：高点回落2%+
-            if peak_pnl >= 3.0 and drawdown_from_peak >= 2.0:
-                to_sell.append((code, h.shares, f"Trail Stop peak{peak_pnl:.1f}% dd{drawdown_from_peak:.1f}%"))
-                continue
-
-            # 5. 半仓止盈（5%+）
-            if pnl >= TAKE_PROFIT_HALF_PCT:
-                sell_shares = (h.shares // 200) * 100
-                if sell_shares >= 100:
-                    to_sell.append((code, sell_shares, f"Half TakeProfit {pnl:.1f}%"))
+            # 跌停一字板检测：开盘即跌停 → 卖不掉
+            prev_close = h.current_price
+            if prev_close > 0:
+                limit_down = prev_close * 0.9
+                if open_price <= limit_down * 1.002:
+                    # 跌停开盘，挂单可能排不到，再挂一天
+                    self._pending_sells.append((code, shares, reason + "(跌停重挂)"))
                     continue
 
-            # 6. 超期清仓（2天到期就走）
-            if hold_days >= HOLD_DAYS_MAX and pnl < HOLD_DAYS_PROFIT_MIN:
-                to_sell.append((code, h.shares, f"Expired Close {hold_days}d {pnl:.1f}%"))
+            self._execute_sell(code, min(shares, h.shares), open_price, date,
+                               f"盘后决策→开盘卖|{reason}")
+
+    # ────────────────────────────────────────
+    # Step 3: 盘中极端止损保护（仅跌停/暴跌）
+    # ────────────────────────────────────────
+
+    def _emergency_stop_loss(self, date: str, day_idx: int):
+        """盘中极端止损 — 只处理今日盘中暴跌触发 -5% 强制止损线
+
+        这是唯一允许在盘中做的操作（条件单/自动止损），
+        普通止盈止损都在盘后复盘决定。
+        """
+        to_sell = []
+        for code, h in list(self.holdings.items()):
+            # T+1: 买入当天和次日都不能盘中卖
+            # buy_day_idx 是实际买入的那天，当天(buy_day)不能卖，
+            # 最早第二天(buy_day+1)才能卖
+            if h.buy_day_idx >= day_idx:
+                continue  # 今天或今天之后买入的，还不能卖
+
+            row = self._get_row(code, date)
+            if row is None:
                 continue
 
-            # 7. 止损
-            if pnl <= STOP_LOSS_PCT:
-                to_sell.append((code, h.shares, f"StopLoss {pnl:.1f}%"))
+            today_low = float(row["low"])
+            cost = h.cost_price
+            low_pnl = (today_low - cost) / cost * 100 if cost > 0 else 0
+
+            # 仅极端情况：盘中低点触及 FORCE_EXIT(-5%) → 条件单自动卖
+            if low_pnl <= FORCE_EXIT_PCT:
+                trigger_price = cost * (1 + FORCE_EXIT_PCT / 100)
+                to_sell.append((code, h.shares, trigger_price,
+                                f"盘中条件单止损 low_pnl={low_pnl:.1f}%"))
+
+        for code, shares, price, reason in to_sell:
+            self._execute_sell(code, shares, price, date, reason)
+
+    # ────────────────────────────────────────
+    # Step 5a: 盘后复盘 — 决定明天卖什么
+    # ────────────────────────────────────────
+
+    def _review_and_queue_sells(self, date: str, day_idx: int):
+        """盘后复盘持仓 — 用 ≤今日 收盘数据分析，决定明天开盘卖什么
+
+        这里看到的都是今天收盘后已知的信息：
+        - 今天的收盘价、涨跌幅、成交量
+        - 持仓盈亏（按今天收盘价计算）
+        - 持仓天数
+        """
+        for code, h in list(self.holdings.items()):
+            # T+1规则: T+1买入 → 最早T+2卖出
+            # 盘后复盘决定"明天卖不卖"，明天=day_idx+1
+            # 所以必须 h.buy_day_idx <= day_idx - 1（即至少昨天买入的），明天才能卖
+            # 今天刚买入的(buy_day_idx==day_idx)，明天还不能卖，后天才行
+            next_day_idx = day_idx + 1
+            if h.buy_day_idx >= next_day_idx:
+                continue  # 这不该发生，但防御性编程
+            if h.buy_day_idx == day_idx:
+                continue  # 今天买入，明天(T+1)还不能卖，要到后天(T+2)
+
+            hold_days = day_idx - h.buy_day_idx
+            cost = h.cost_price
+            close_pnl = h.pnl_pct  # 按收盘价算
+
+            row = self._get_row(code, date)
+            if row is None:
                 continue
 
-            # 8. 龙头走弱（今天跌了=人气散了，赶紧走）
-            if hold_days >= 1 and today_chg < -2 and pnl < 1:
-                to_sell.append((code, h.shares, f"Dragon Weak {today_chg:.1f}% {pnl:.1f}%"))
+            today_chg = float(row.get("change_pct", 0))
+            if pd.isna(today_chg):
+                today_chg = 0
+
+            today_close = float(row["close"])
+            today_high = float(row["high"])
+
+            # 更新peak
+            h.peak_price = max(h.peak_price, today_high)
+            peak_pnl = (h.peak_price - cost) / cost * 100 if cost > 0 else 0
+            dd_from_peak = (h.peak_price - today_close) / h.peak_price * 100 if h.peak_price > 0 else 0
+
+            # ── 盘后决策：明天是否卖出 ──
+
+            # 1. 龙头连板中 → 不卖（今天涨停，明天继续看）
+            if today_chg > 9.5 and hold_days <= 3:
                 continue
 
-        for code, shares, reason in to_sell:
-            self._execute_sell(code, shares, date, reason)
+            # 2. 止盈全清：收盘盈利 >= 12% → 明天开盘卖
+            if close_pnl >= TAKE_PROFIT_FULL_PCT:
+                self._pending_sells.append(
+                    (code, h.shares, f"止盈全清 {close_pnl:.1f}%"))
+                continue
 
-    def _check_entries(self, date: str, day_idx: int):
-        """龙头打板选股 — 找最强的1只ALL-IN"""
+            # 3. 移动止盈：高点回落 2%+ → 明天卖
+            if peak_pnl >= 3.0 and dd_from_peak >= 2.0:
+                self._pending_sells.append(
+                    (code, h.shares,
+                     f"移动止盈 peak{peak_pnl:.1f}% dd{dd_from_peak:.1f}%"))
+                continue
+
+            # 4. 半仓止盈：收盘盈利 >= 5% → 明天卖一半
+            if close_pnl >= TAKE_PROFIT_HALF_PCT:
+                sell_shares = (h.shares // 200) * 100
+                if sell_shares >= 100:
+                    self._pending_sells.append(
+                        (code, sell_shares, f"半仓止盈 {close_pnl:.1f}%"))
+                    continue
+
+            # 5. 止损：收盘亏损 >= 3% → 明天开盘割肉
+            if close_pnl <= STOP_LOSS_PCT:
+                self._pending_sells.append(
+                    (code, h.shares, f"止损 {close_pnl:.1f}%"))
+                continue
+
+            # 6. 超期清仓：持仓 >= 2天且盈利不足
+            if hold_days >= HOLD_DAYS_MAX and close_pnl < HOLD_DAYS_PROFIT_MIN:
+                self._pending_sells.append(
+                    (code, h.shares,
+                     f"超期清仓 {hold_days}d {close_pnl:.1f}%"))
+                continue
+
+            # 7. 龙头走弱：今天大跌且盈利不佳 → 明天卖
+            if hold_days >= 1 and today_chg < -2 and close_pnl < 1:
+                self._pending_sells.append(
+                    (code, h.shares,
+                     f"龙头走弱 chg{today_chg:.1f}% pnl{close_pnl:.1f}%"))
+                continue
+
+    # ────────────────────────────────────────
+    # Step 3: 收盘更新价格
+    # ────────────────────────────────────────
+
+    def _update_prices_close(self, date: str):
+        """收盘后更新持仓价格"""
+        for code, h in self.holdings.items():
+            row = self._get_row(code, date)
+            if row is None:
+                continue
+            h.current_price = float(row["close"])
+            h.peak_price = max(h.peak_price, float(row["high"]))
+
+    # ────────────────────────────────────────
+    # Step 4: 盘后评分选股（存入 pending）
+    # ────────────────────────────────────────
+
+    def _calc_market_mood(self, date: str) -> float:
+        """计算大盘情绪（当日数据，收盘后可知）"""
+        above_ma20 = 0
+        total = 0
+        for code, sdf in self.all_data.items():
+            idx_arr = sdf.index[sdf["date"] == date]
+            if len(idx_arr) == 0:
+                continue
+            i = idx_arr[0]
+            total += 1
+            if i >= 20:
+                c = float(sdf["close"].iloc[i])
+                ma20 = sdf["close"].iloc[i-19:i+1].mean()
+                if c > ma20:
+                    above_ma20 += 1
+        return above_ma20 / total if total > 0 else 0.5
+
+    def _scan_and_queue(self, date: str, day_idx: int):
+        """盘后选股 — 用≤今天的数据评分，信号存入 pending_buy 明天执行
+
+        关键: 这里评分用的 idx 是当天的，但买入在明天 → 无未来函数
+        """
         if len(self.holdings) >= MAX_POSITIONS:
+            return
+
+        # 今天已经有 pending_buy 了就不覆盖
+        if self._pending_buy is not None:
             return
 
         today_buys = sum(1 for t in self.trades if t.date == date and t.direction == "buy")
@@ -625,11 +822,10 @@ class BacktestEngine:
             if pd.isna(turnover):
                 turnover = 0
 
-            # 龙头战法：换手率必须>3%（有人气）
             if turnover < 3:
                 continue
 
-            # 技术评分
+            # 技术评分: 只用 ≤idx 的数据（compute_technical_score 使用 df.iloc[:idx+1]）
             tech = compute_technical_score(df, idx)
             if tech["score"] < MIN_TECH_SCORE:
                 continue
@@ -637,14 +833,15 @@ class BacktestEngine:
             candidates.append({
                 "code": code,
                 "name": str(row.get("股票简称", code)),
-                "price": price,
+                "signal_close": price,       # 信号日收盘价（用于判断明日一字板）
+                "signal_date": date,
                 "score": tech["score"],
                 "change_pct": change_pct,
                 "signal_type": tech.get("signal_type", ""),
                 "consec_limit": tech.get("consec_limit", 0),
             })
 
-        # 优先级排序：连板>打板>接力>突破>动量，同类内按分数排
+        # 排序
         type_priority = {"board_hit": 4, "relay": 3, "breakout": 2, "momentum": 1}
         candidates.sort(
             key=lambda x: (type_priority.get(x["signal_type"], 0),
@@ -653,51 +850,27 @@ class BacktestEngine:
             reverse=True,
         )
 
-        # 只选最强的1只，ALL-IN
-        for c in candidates[:1]:
-            total_asset = self.cash + sum(h.market_value for h in self.holdings.values())
-            buy_amount = min(self.cash * 0.95, total_asset * MAX_SINGLE_PCT)
+        # 挂单：只选最强的1只，明天开盘买入
+        if candidates:
+            best = candidates[0]
+            best["reason"] = (
+                f"{best['signal_type']}|score{best['score']}"
+                f"|chg{best['change_pct']:.1f}%"
+            )
+            self._pending_buy = best
 
-            if buy_amount < c["price"] * 100:
-                continue
+    # ────────────────────────────────────────
+    # 成交执行
+    # ────────────────────────────────────────
 
-            shares = int(buy_amount / c["price"] / 100) * 100
-            if shares < 100:
-                continue
-
-            self._execute_buy(c["code"], c["name"], shares, c["price"], date, day_idx,
-                              f"{c['signal_type']}|score{c['score']}|chg{c['change_pct']:.1f}%")
-
-    def _execute_buy(self, code, name, shares, price, date, day_idx, reason):
-        """执行买入"""
-        cost_price = price * (1 + SLIPPAGE_PCT)  # 滑点
-        amount = cost_price * shares
-        commission = max(amount * COMMISSION_RATE, 5)  # 最低 5 元
-
-        if amount + commission > self.cash:
-            return
-
-        self.cash -= (amount + commission)
-        self.holdings[code] = Holding(
-            code=code, name=name, shares=shares,
-            cost_price=cost_price, buy_date=date,
-            buy_day_idx=day_idx, current_price=price,
-            peak_price=price,
-        )
-        self.trades.append(TradeRecord(
-            date=date, code=code, name=name, direction="buy",
-            shares=shares, price=cost_price, amount=amount,
-            commission=commission, reason=reason,
-        ))
-
-    def _execute_sell(self, code, shares, date, reason):
-        """执行卖出"""
+    def _execute_sell(self, code, shares, sell_price, date, reason):
+        """执行卖出（sell_price 由调用方决定，而非统一用收盘价）"""
         h = self.holdings.get(code)
         if not h:
             return
 
-        sell_price = h.current_price * (1 - SLIPPAGE_PCT)
-        amount = sell_price * shares
+        actual_price = sell_price * (1 - SLIPPAGE_PCT)
+        amount = actual_price * shares
         commission = max(amount * COMMISSION_RATE, 5)
         tax = amount * STAMP_TAX_RATE
 
@@ -705,7 +878,7 @@ class BacktestEngine:
 
         self.trades.append(TradeRecord(
             date=date, code=code, name=h.name, direction="sell",
-            shares=shares, price=sell_price, amount=amount,
+            shares=shares, price=actual_price, amount=amount,
             commission=commission + tax, reason=reason,
         ))
 

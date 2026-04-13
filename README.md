@@ -54,6 +54,12 @@
 | 精密ポイント | エントリー価格・損切り価格・目標価格を提示 |
 | チェックリスト | 各条件を「合格 / 注意 / 不合格」でマーキング |
 
+### 实盘事件链路
+
+- `python main.py` 的 A 股实盘链路现在会把 `news_scanner -> event_signal -> run_stock_scan / run_rebalance_analysis` 串起来，新闻热点不再只用于一次性选股打分。
+- 事件信号会生成板块级关注池，并把防御/进攻动作直接传给建仓和调仓；遇到 `defense` 级事件时，自动建仓仓位会在自适应仓位基础上再减半。
+- 自适应仓位会根据真实卖出后的盈亏持续更新，后续建仓不再依赖写死的牛/熊固定仓位。
+
 ---
 
 ## 🤖 マルチモデル討論アーキテクチャ
@@ -157,8 +163,26 @@ python main.py --schedule               # 定時モード（毎日自動）
 python main.py --stocks AAPL,TSLA       # 特定銘柄のみ
 python main.py --monitor --interval 5   # 寄付オークション監視
 python main.py --rebalance              # リバランス分析
+python train_blind_agent.py             # 用2025训练 blind agent 并回测 2026YTD
+python backtest_blind_agent_distilled.py # blind agent + 在线高手skill偏置回测
+python backtest_blind_agent_v4b.py      # blind agent 结构升级版 V4b 回测
+python backtest_blind_agent_v4c.py      # 环境路由 + V4b 结构层联合回测（用于和 V4b 做同口径对比）
+python backtest_blind_agent_v4d.py      # MA5 + MA30 + 月线 的多周期个股分析回测（用于和 V4b 做同口径对比）
+python backtest_blind_agent_v4e.py      # 四种原生策略按环境和最近胜率自适应切换的回测
+python backtest_blind_agent_v4f.py      # 在 V4b 上叠加轻量自适应策略选择的回测
+python backtest_blind_agent_agentic.py  # 真正的 agentic_backtest：AI teams 逐日 proposal/critique/arbitrate，并输出每日思考记录
+python distill_expert_skills.py         # 蒸馏高手成交记录为 YAML strategy skills
 python main.py --serve                  # Web UI + API起動
 ```
+
+蒸馏生成的 strategy 会写到 `strategies/distilled/`，如果你想让 agent 优先加载这批高手经验，可以把 `AGENT_STRATEGY_DIR=./strategies/distilled` 写进 `.env`。
+
+`AGENT_STRATEGY_ROUTING=auto` 现在不只影响 multi-agent 的 strategy stage；单 Agent 分析路径也会结合当前 `trend_result + market_context` 自动切换更合适的策略技能，只有显式指定策略时才会覆盖这层自动路由。
+`python main.py` 的自动建仓默认回到训练后的 `blind_base` 链路：保留 blind agent 的自适应仓位和事件防御，不再默认叠加 `V4b` 的结构过滤。当前推荐这么做，是因为 `2024 + 2025 + 2026YTD` 的三窗口严格回测里，`blind_base` 的复合收益高于 `V4b`。
+`backtest_blind_agent.py` 的冷静期状态机现在只会对同一波 `连亏>=4` 触发一次冷静日；冷静期结束后会重新评估新候选，不会再因为旧亏损序列被永久锁死在空仓。
+`backtest_blind_agent_v4d.py` 会把个股分析从纯日线扩展到 `MA5 + MA30 + 月线趋势`，但它目前是实验性同口径回测版本，是否替代 `blind_base` / `V4b` 应以回测结果为准。
+`backtest_blind_agent_v4e.py` / `backtest_blind_agent_v4f.py` 会让 agent 在 `低吸 / 回踩 / 突破 / 接力` 之间按环境和最近模式表现做自适应选择；其中 `V4f` 是更保守的叠加层版本，避免错误切换把主策略完全带偏。
+`backtest_blind_agent_agentic.py` 会把回测改成真正的 “AI 内核”：每天只给 AI teams 当天及以前的数据，由进攻派 proposal、风控 critique、仲裁派 final decision 共同决定下一交易日 `buy / sell / hold / empty`，并把三段原始响应、结构化决策和候选池写入 `thought_logs.jsonl`、`thought_summary.csv` 供复盘检查。
 
 **銘柄コード形式:**
 A株 = 6桁（`600519`）、香港株 = `hk` + 5桁（`hk00700`）、米国株 = ティッカー（`AAPL`）

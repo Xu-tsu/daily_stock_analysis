@@ -98,8 +98,12 @@ def run_news_scan() -> List[dict]:
 # Phase 1: 龙头打板选股
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def run_stock_scan(hot_concepts: List[dict] = None, regime: dict = None) -> List[dict]:
-    """智能选股（根据市场环境自动切换策略）"""
+def run_stock_scan(
+    hot_concepts: List[dict] = None,
+    regime: dict = None,
+    event_signals: List[dict] = None,
+) -> List[dict]:
+    """智能选股（龙头打板主策略 + 新闻/事件加分）"""
     logger.info("")
     logger.info("=" * 60)
     logger.info("  Phase 1: SMART STOCK SCAN")
@@ -115,40 +119,17 @@ def run_stock_scan(hot_concepts: List[dict] = None, regime: dict = None) -> List
         market = regime.get("regime", "sideways")
         logger.info(f"  [REGIME] {market.upper()} (score={regime.get('score', 0)})")
 
-        # 根据市场环境选择策略
-        if market == "bull":
-            # 牛市：龙头打板，追连板，激进
-            logger.info("  [STRATEGY] 牛市策略 → 龙头打板 + 连板接力")
-            results = scan_market(
-                mode="dragon",
-                max_price=50.0,
-                min_turnover=3.0,
-                max_change=20.0,    # 允许涨停
-                min_change=-3.0,
-                top_n=15,
-            )
-        elif market == "bear":
-            # 熊市：超跌反弹为主，极少出手
-            logger.info("  [STRATEGY] 熊市策略 → 超跌反弹 + 极低仓位")
-            results = scan_market(
-                mode="oversold",
-                max_price=30.0,
-                min_turnover=1.5,
-                max_change=5.0,     # 不追涨
-                min_change=-8.0,    # 买深跌
-                top_n=10,
-            )
-        else:
-            # 震荡市：均值回归 + 提前埋伏龙头预期
-            logger.info("  [STRATEGY] 震荡策略 → 均值回归 + 龙头预埋")
-            results = scan_market(
-                mode="trend",
-                max_price=30.0,
-                min_turnover=2.0,
-                max_change=7.0,     # 不追高（7%以上不买）
-                min_change=-5.0,
-                top_n=15,
-            )
+        # 全天候龙头打板（与回测策略一致）
+        # 市场环境只影响仓位大小，不切换策略
+        logger.info(f"  [STRATEGY] 龙头打板 ALL-IN (市场={market.upper()}, 仓位={'95%' if market=='bull' else '60%' if market=='sideways' else '30%'})")
+        results = scan_market(
+            mode="dragon",
+            max_price=50.0,
+            min_turnover=3.0,
+            max_change=20.0,    # 允许涨停
+            min_change=-3.0,
+            top_n=15,
+        )
 
         if not results:
             logger.info("  [STOCK] No candidates from market scan")
@@ -168,7 +149,6 @@ def run_stock_scan(hot_concepts: List[dict] = None, regime: dict = None) -> List
 
             for r in results:
                 code = str(r.get("code", "")).strip()
-                # 去掉可能的前缀 SH/SZ
                 clean_code = code.replace("SH", "").replace("SZ", "").replace("sh", "").replace("sz", "")
                 if clean_code in hot_stock_codes:
                     r["tech_score"] = r.get("tech_score", 0) + 20
@@ -177,6 +157,32 @@ def run_stock_scan(hot_concepts: List[dict] = None, regime: dict = None) -> List
                     r["hot_concept"] = False
 
             results.sort(key=lambda x: x.get("tech_score", 0), reverse=True)
+
+        # ── 事件关注池加分: 被事件影响的超跌个股额外加分 ──
+        try:
+            from event_signal import get_event_watchlist, get_recent_event_watchlist
+
+            event_watchlist = (
+                get_event_watchlist(event_signals)
+                if event_signals
+                else get_recent_event_watchlist(max_age_hours=6.0)
+            )
+            if event_watchlist:
+                boosted = 0
+                for r in results:
+                    code = str(r.get("code", "")).strip()
+                    clean_code = code.replace("SH", "").replace("SZ", "").replace("sh", "").replace("sz", "")
+                    bonus = event_watchlist.get(clean_code, 0)
+                    if bonus > 0:
+                        r["tech_score"] = r.get("tech_score", 0) + bonus
+                        r["event_boost"] = True
+                        r["event_bonus"] = bonus
+                        boosted += 1
+                if boosted:
+                    logger.info(f"  [EVENT->STOCK] {boosted} stocks boosted by event signals")
+                    results.sort(key=lambda x: x.get("tech_score", 0), reverse=True)
+        except Exception:
+            pass
 
         # ── 复盘反馈：近期亏损过的股票降权（避免反复踩同一坑）──
         try:

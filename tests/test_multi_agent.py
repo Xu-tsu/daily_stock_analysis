@@ -319,6 +319,84 @@ class TestStrategyRouter(unittest.TestCase):
         regime = router._detect_regime(ctx)
         self.assertIsNone(regime)
 
+    def test_detect_regime_from_prefetched_trend_result(self):
+        from src.agent.strategies.router import StrategyRouter
+        router = StrategyRouter()
+        ctx = AgentContext()
+        ctx.set_data("trend_result", {
+            "ma_alignment": "多头排列 MA5>MA10>MA20",
+            "signal_score": 82,
+            "volume_status": "量能正常",
+        })
+        regime = router._detect_regime(ctx)
+        self.assertEqual(regime, "trending_up")
+
+    def test_sector_hot_overrides_sideways_when_flow_is_active(self):
+        from src.agent.strategies.router import StrategyRouter
+        router = StrategyRouter()
+        ctx = AgentContext()
+        ctx.set_data("trend_result", {
+            "ma_alignment": "neutral",
+            "trend_score": 56,
+            "volume_status": "normal",
+        })
+        ctx.meta["sector_hot"] = True
+        ctx.meta["hot_money_signal"] = "active"
+        ctx.meta["market_bias"] = "positive"
+        ctx.meta["quant_pressure_signal"] = "low"
+        regime = router._detect_regime(ctx)
+        self.assertEqual(regime, "sector_hot")
+
+
+class TestAgentFactoryRouting(unittest.TestCase):
+    """Test environment-aware strategy activation in the shared factory."""
+
+    @patch("src.agent.executor.AgentExecutor")
+    @patch("src.agent.llm_adapter.LLMToolAdapter", return_value=MagicMock())
+    @patch("src.agent.factory.get_skill_manager")
+    @patch("src.agent.factory.get_tool_registry", return_value=MagicMock())
+    @patch("src.agent.strategies.router.StrategyRouter.select_strategies", return_value=["dragon_head", "emotion_cycle"])
+    def test_build_agent_executor_auto_routes_from_context(
+        self,
+        _mock_router,
+        _mock_registry,
+        mock_get_skill_manager,
+        _mock_llm_adapter,
+        _mock_executor_cls,
+    ):
+        from src.agent.factory import build_agent_executor
+
+        mock_skill_manager = MagicMock()
+        mock_skill_manager.get_skill_instructions.return_value = "skills"
+        mock_get_skill_manager.return_value = mock_skill_manager
+
+        config = SimpleNamespace(
+            agent_arch="single",
+            agent_skills=["bull_trend", "ma_golden_cross"],
+            agent_strategy_routing="auto",
+            agent_max_steps=10,
+        )
+
+        build_agent_executor(
+            config=config,
+            context={
+                "stock_code": "600519",
+                "stock_name": "茅台",
+                "trend_result": {
+                    "ma_alignment": "多头排列 MA5>MA10>MA20",
+                    "signal_score": 80,
+                    "volume_status": "量能正常",
+                },
+                "market_context": {
+                    "bias": "positive",
+                    "sector_confirmation": {"confirmed": True},
+                    "hot_money_probe": {"signal": "active"},
+                },
+            },
+        )
+
+        mock_skill_manager.activate.assert_called_once_with(["dragon_head", "emotion_cycle"])
+
 
 # ============================================================
 # StrategyAggregator

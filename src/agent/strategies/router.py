@@ -87,40 +87,124 @@ class StrategyRouter:
 
     def _detect_regime(self, ctx: AgentContext) -> Optional[str]:
         """Infer market regime from technical agent's opinion data."""
+        quant_pressure = str(ctx.meta.get("quant_pressure_signal", "") or "").lower()
+        market_bias = str(ctx.meta.get("market_bias", "") or "").lower()
+        hot_money_signal = str(ctx.meta.get("hot_money_signal", "") or "").lower()
+
         for op in ctx.opinions:
             if op.agent_name != "technical":
                 continue
-            raw = op.raw_data or {}
+            regime = self._detect_regime_from_payload(op.raw_data or {})
+            if regime:
+                if self._should_prefer_sector_hot(ctx, regime, market_bias, quant_pressure, hot_money_signal):
+                    return "sector_hot"
+                return regime
 
-            ma_alignment = raw.get("ma_alignment", "").lower()
-            try:
-                trend_score = float(raw.get("trend_score", 50))
-            except (TypeError, ValueError):
-                trend_score = 50.0
-            volume_status = raw.get("volume_status", "").lower()
+        # Single-agent and report pipelines often pre-fetch trend_result before
+        # the executor is built, so route from that deterministic snapshot too.
+        prefetched_trend = ctx.get_data("trend_result")
+        if isinstance(prefetched_trend, dict):
+            regime = self._detect_regime_from_payload(prefetched_trend)
+            if regime:
+                if self._should_prefer_sector_hot(ctx, regime, market_bias, quant_pressure, hot_money_signal):
+                    return "sector_hot"
+                return regime
 
-            if ma_alignment == "bullish" and trend_score >= 70:
-                return "trending_up"
-            if ma_alignment == "bearish" and trend_score <= 30:
-                return "trending_down"
-            if ma_alignment == "neutral" or 35 <= trend_score <= 65:
-                return "sideways"
-            if volume_status == "heavy" and 30 < trend_score < 70:
-                return "volatile"
-
-        quant_pressure = str(ctx.meta.get("quant_pressure_signal", "") or "").lower()
         if quant_pressure == "high":
             return "volatile"
 
-        market_bias = str(ctx.meta.get("market_bias", "") or "").lower()
+        if ctx.meta.get("sector_hot") and hot_money_signal in {"active", "constructive"}:
+            return "sector_hot"
+
         if market_bias == "negative":
             return "trending_down"
+        if market_bias == "positive" and ctx.meta.get("sector_hot"):
+            return "sector_hot"
 
         # Check sector context in meta
         if ctx.meta.get("sector_hot"):
             return "sector_hot"
 
         return None
+
+    def _detect_regime_from_payload(self, raw: Dict[str, object]) -> Optional[str]:
+        """Infer regime from a technical payload.
+
+        Supports both:
+        - multi-agent technical JSON (`bullish|neutral|bearish`, `heavy|normal|light`)
+        - pre-fetched `TrendAnalysisResult.to_dict()` payloads from the report path
+          (`多头排列`, `空头排列`, `缩量回调`, `放量下跌`, ...)
+        """
+        if not isinstance(raw, dict):
+            return None
+
+        ma_alignment = self._normalize_ma_alignment(raw.get("ma_alignment"))
+        trend_score = self._coerce_trend_score(raw)
+        volume_status = self._normalize_volume_status(raw.get("volume_status"))
+
+        if ma_alignment == "bullish" and trend_score >= 70:
+            return "trending_up"
+        if ma_alignment == "bearish" and trend_score <= 30:
+            return "trending_down"
+        if volume_status == "heavy" and 30 < trend_score < 70:
+            return "volatile"
+        if ma_alignment == "neutral" or 35 <= trend_score <= 65:
+            return "sideways"
+        return None
+
+    @staticmethod
+    def _coerce_trend_score(raw: Dict[str, object]) -> float:
+        for key in ("trend_score", "signal_score", "trend_strength"):
+            try:
+                value = raw.get(key)
+                if value is None:
+                    continue
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return 50.0
+
+    @staticmethod
+    def _normalize_ma_alignment(value: object) -> str:
+        text = str(value or "").strip().lower()
+        if not text:
+            return ""
+        if "bullish" in text or "多头" in text:
+            return "bullish"
+        if "bearish" in text or "空头" in text:
+            return "bearish"
+        if "neutral" in text or "缠绕" in text or "盘整" in text:
+            return "neutral"
+        return text
+
+    @staticmethod
+    def _normalize_volume_status(value: object) -> str:
+        text = str(value or "").strip().lower()
+        if not text:
+            return ""
+        if "heavy" in text or "放量" in text:
+            return "heavy"
+        if "light" in text or "shrink" in text or "缩量" in text:
+            return "light"
+        if "normal" in text or "正常" in text:
+            return "normal"
+        return text
+
+    @staticmethod
+    def _should_prefer_sector_hot(
+        ctx: AgentContext,
+        regime: str,
+        market_bias: str,
+        quant_pressure: str,
+        hot_money_signal: str,
+    ) -> bool:
+        return (
+            regime == "sideways"
+            and bool(ctx.meta.get("sector_hot"))
+            and hot_money_signal in {"active", "constructive"}
+            and market_bias != "negative"
+            and quant_pressure != "high"
+        )
 
     @staticmethod
     def _get_routing_mode() -> str:

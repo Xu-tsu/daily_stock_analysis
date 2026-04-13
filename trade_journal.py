@@ -136,7 +136,7 @@ init_trade_tables()
 # 1. 记录交易
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def record_buy(code: str, name: str, shares: int, price: float,
-               sector: str = "", source: str = "bot", note: str = ""):
+               sector: str = "", source: str = "bot", note: str = "", **kwargs):
     """记录买入，同时抓取当时的技术指标"""
     # 获取买入时技术指标
     ta = _get_current_technical(code)
@@ -166,8 +166,13 @@ def record_buy(code: str, name: str, shares: int, price: float,
 
 
 def record_sell(code: str, name: str, shares: int, price: float,
-                cost_price: float = 0, source: str = "bot", note: str = ""):
+                cost_price: float = 0, source: str = "bot", note: str = "",
+                buy_price: float = None, **kwargs):
+    # buy_price 是某些调用方传入的别名，映射到 cost_price
     """记录卖出，计算盈亏"""
+    # buy_price 别名 → cost_price
+    if buy_price is not None and cost_price == 0:
+        cost_price = buy_price
     # 查找最近的买入记录
     conn = _conn()
     buy_record = conn.execute("""
@@ -231,6 +236,12 @@ def record_sell(code: str, name: str, shares: int, price: float,
         save_market_context(trade_id, code)
     except Exception:
         pass
+    try:
+        from event_signal import record_adaptive_trade_result
+
+        record_adaptive_trade_result(pnl_pct)
+    except Exception as e:
+        logger.debug(f"[交易日志] 自适应状态更新跳过: {e}")
     logger.info(f"[交易日志] 卖出 {name}({code}) {shares}股 {price}元 盈亏:{pnl}({pnl_pct}%)")
 
 

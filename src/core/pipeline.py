@@ -625,10 +625,8 @@ class StockAnalysisPipeline:
         try:
             from src.agent.factory import build_agent_executor
 
-            # Build executor from shared factory (ToolRegistry and SkillManager prototype are cached)
-            executor = build_agent_executor(self.config, getattr(self.config, 'agent_skills', None) or None)
-
-            # Build initial context to avoid redundant tool calls
+            # Build initial context to avoid redundant tool calls and to let the
+            # agent factory auto-route strategies from the current environment.
             initial_context = {
                 "stock_code": code,
                 "stock_name": stock_name,
@@ -697,6 +695,11 @@ class StockAnalysisPipeline:
                     )
                 except Exception:
                     pass
+
+            # Build executor from shared factory (ToolRegistry and SkillManager
+            # prototype are cached). In auto mode this now uses the current
+            # runtime context to activate environment-appropriate strategies.
+            executor = build_agent_executor(self.config, context=initial_context)
 
             # Agent path: inject social sentiment as news_context so both
             # executor (_build_user_message) and orchestrator (ctx.set_data)

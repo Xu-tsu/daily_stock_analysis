@@ -11,6 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Runtime
 
+- Added `backtest_blind_agent_v4e.py`: introduced a strict no-future adaptive selector that scores the four native entry styles (`oversold / breakout / pullback / relay`) independently and chooses a strategy from same-day context plus recent mode-specific results.
+- Added `backtest_blind_agent_v4f.py`: introduced a lighter adaptive overlay that keeps V4b as the base alpha source and applies adaptive strategy choice only as a bounded score adjustment.
+- Added `backtest_blind_agent_v4d.py`: introduced a strict no-future multi-timeframe variant that scores stocks with `MA5 + MA30 + monthly trend` on top of the V4b structure layer and saves comparable outputs to `data/backtest_blind_agent_v4d/`.
+- Added `backtest_blind_agent_v4c.py`: synced environment-aware `StrategyRouter` into the strict no-future blind-agent backtest path and saved comparable outputs to `data/backtest_blind_agent_v4c/` for same-protocol evaluation against V4b.
+- Added `backtest_blind_agent_agentic.py`: introduced a strict no-future team-based backtest loop where the existing AI teams now make next-day `buy / sell / hold / empty` decisions through `proposal -> critique -> arbitration`, while saving daily audit trails to `thought_logs.jsonl` and `thought_summary.csv`.
+- Changed `main.py`: auto-build positions now default back to the trained `blind_base` live path, keeping adaptive position sizing plus event-defense logic but no longer applying the V4b structure guard by default after the `2024 + 2025 + 2026YTD` comparison favored `blind_base`.
+
+- 新增 `train_blind_agent.py` walk-forward 训练脚本：只使用 `2025` 历史窗口搜索 `backtest_blind_agent.py` 的风险参数，再把选中的参数拿去跑 `2026YTD` 独立回测，并把候选打分、最佳参数档案和测试集 `summary/trades/daily` 落盘到 `data/blind_agent_training/` 与 `data/backtest_blind_agent_trained/`。
+- 新增 `backtest_blind_agent_v4b.py`：在 blind agent 的无未来函数框架上加入“盘面热度上下文”结构层，只根据当日横截面热度决定是否阻断极弱环境下的开仓，并在热度充足时适度放宽盈利单的持有/止盈条件，输出 `summary/trades/daily` 到 `data/backtest_blind_agent_v4b/` 供和主 blind agent 做同口径对比。
+- 新增 `backtest_blind_agent_distilled.py`：在 `backtest_blind_agent.py` 的无未来函数框架上，按日期在线蒸馏 `broker_export` 已完成高手交易，只把当日之前已经兑现的高手模式转成候选加分，再输出 `summary/trades/daily` 到 `data/backtest_blind_agent_distilled*/` 以便和主 blind agent 做同口径对比。
+- 新增 `distill_expert_skills.py`：从 `trade_log` 的高手成交记录中做 FIFO 买卖配对，只用买点当天及以前的历史 K 线重建技术特征，蒸馏出可被 `SkillManager` 直接加载的 YAML strategy skills，并把摘要写到 `data/expert_skill_distillation/`、把策略写到 `strategies/distilled/`。
+- `src/agent/strategies/router.py` 与 `src/agent/factory.py` 现在把环境自适应策略路由补到了单 Agent 默认执行链路：当 `AGENT_STRATEGY_ROUTING=auto` 且调用方提供了 `trend_result` / `market_context` 时，工厂会在建 executor 前先按当前环境自动激活更合适的策略技能，而不再只依赖固定的 `AGENT_SKILLS` 列表；`src/core/pipeline.py` 与 Agent API 入口也同步把上下文前传给这层路由。
+- `main.py` 实盘链路补齐事件驱动闭环：`news_scanner` 产出的热点概念现在会标准化后传入 `event_signal.py`，并继续注入 `dual_trader.py` 的候选加分、`rebalance_engine.py` 的调仓 prompt 和自动建仓的防御降仓逻辑；同时真实卖出会回写 `adaptive_trade_state.json`，让后续仓位真正随近期盈亏自适应变化。
 - LiteLLM 运行时现在会自动为 `azure/gpt-5.4-nano-2026-03-17` 这类带日期后缀的版本化模型名注册 alias，并压低 `litellm` / `LiteLLM` 默认 debug 噪音，避免能力探测、成本估算阶段反复刷出 “model isn't mapped yet / provider not provided” 的日志。
 - Windows 上 A 股历史数据的 AkShare 新浪兜底分支现在会先做保护性短路，再继续回退到腾讯历史接口，避免 `ak.stock_zh_a_daily()` 触发 `py_mini_racer` / V8 fatal crash 把整个 Python 进程直接打掉。
 - 调仓与盘中建议新增“买在分歧、卖在高潮”的逆向执行偏好：弱市但主线未坏时允许小仓低吸，红盘冲高且题材拥挤时优先兑现；换股候选也会更偏向轻微回调/平盘承接的标的，而不是当天最热最挤的票。
@@ -27,6 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Fixed `backtest_blind_agent.py`: the blind-agent cooldown state machine no longer re-arms itself every day after the first `consecutive_losses >= 4` event, so same-streak losses cannot permanently lock the backtest into zero-position mode after the one-day cooldown expires.
 - `portfolio_bot.py` 现在会把飞书里的真实买卖同步写入 `trade_log`，这样后续只发“7.61 清仓后拉到 7.77”这类不带股票名的反馈时，也能优先结合最近成交记录反推出对应标的，而不是误判成新的清仓指令。
 
 - 飞书 Stream 持仓口令拦截新增本地模型识别层：`portfolio_bot.py` 现在会优先复用 `REBALANCE_LOCAL_MODEL` / 本地 Ollama 把自由表达识别成结构化动作，再回退到原有规则解析，因此不再只接受“买入/卖出 + 6位代码 + 股数 + 价格”的死格式；像“帮我把协鑫集成再补三手，挂5块05”“看下我现在仓位”这类自然语言也能落到加仓/减仓/清仓/查看持仓。对当前已持仓个股还会结合持仓名称、拼音和近似名称做纠错，降低 `协鑫集成` 被语音转成 `写信继承` 后无法落账的问题。
