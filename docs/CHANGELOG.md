@@ -41,6 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 - Fixed `backtest_blind_agent.py`: the blind-agent cooldown state machine no longer re-arms itself every day after the first `consecutive_losses >= 4` event, so same-streak losses cannot permanently lock the backtest into zero-position mode after the one-day cooldown expires.
+- Fixed `src/broker/ths_adapter.py`: THS live order entry now normalizes `证券代码 / 委托价格 / 委托数量` at the final Edit-control write step and reads the value back for verification, preventing stock sell orders from leaking long float strings such as `2.31232` into the price box and triggering the broker's decimal-precision confirmation dialog.
 - `portfolio_bot.py` 现在会把飞书里的真实买卖同步写入 `trade_log`，这样后续只发“7.61 清仓后拉到 7.77”这类不带股票名的反馈时，也能优先结合最近成交记录反推出对应标的，而不是误判成新的清仓指令。
 
 - 飞书 Stream 持仓口令拦截新增本地模型识别层：`portfolio_bot.py` 现在会优先复用 `REBALANCE_LOCAL_MODEL` / 本地 Ollama 把自由表达识别成结构化动作，再回退到原有规则解析，因此不再只接受“买入/卖出 + 6位代码 + 股数 + 价格”的死格式；像“帮我把协鑫集成再补三手，挂5块05”“看下我现在仓位”这类自然语言也能落到加仓/减仓/清仓/查看持仓。对当前已持仓个股还会结合持仓名称、拼音和近似名称做纠错，降低 `协鑫集成` 被语音转成 `写信继承` 后无法落账的问题。

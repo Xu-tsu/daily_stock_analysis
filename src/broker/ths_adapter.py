@@ -25,11 +25,50 @@ logger = logging.getLogger(__name__)
 
 # ── 价格小数位工具 ──
 _CB_PREFIXES = ("110", "113", "123", "127", "128", "118")
+_THS_SECURITY_CONTROL_ID = 1032
+_THS_PRICE_CONTROL_ID = 1033
+_THS_AMOUNT_CONTROL_ID = 1034
 
 
 def _price_decimals(code: str) -> int:
     """转债3位小数，股票2位小数。"""
     return 3 if str(code).strip().startswith(_CB_PREFIXES) else 2
+
+
+def _normalize_trade_input_text(control_id: int, text, code: str = "") -> str:
+    """规范 THS 交易输入框文本，确保最终写入控件的是合法字符串。"""
+    raw = "" if text is None else str(text).strip()
+
+    if control_id == _THS_SECURITY_CONTROL_ID:
+        digits = re.sub(r"\D", "", raw)
+        return (digits or raw)[-6:]
+
+    if control_id == _THS_AMOUNT_CONTROL_ID:
+        try:
+            return str(int(float(raw)))
+        except (TypeError, ValueError):
+            return raw
+
+    if control_id == _THS_PRICE_CONTROL_ID and raw:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return raw
+        return f"{value:.{_price_decimals(code or '')}f}"
+
+    return raw
+
+
+def _read_edit_text(hwnd: int, buf_size: int = 256) -> str:
+    """读取 Edit 控件文本，用于写入后的回读校验。"""
+    buf = ctypes.create_unicode_buffer(buf_size)
+    ctypes.windll.user32.SendMessageW(hwnd, win32con.WM_GETTEXT, buf_size, buf)
+    return buf.value.strip()
+
+
+def _write_edit_text(hwnd: int, text: str) -> None:
+    """使用 WM_SETTEXT 精确写入 Edit 控件。"""
+    ctypes.windll.user32.SendMessageW(hwnd, win32con.WM_SETTEXT, 0, text)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -303,6 +342,8 @@ class THSBrokerAdapter(BrokerAdapter):
         self._user = None
         self._connected = False
         self._exe_path = os.getenv("THS_EXE_PATH", r"C:\同花顺\xiadan.exe")
+        self._active_trade_code = ""
+        self._last_trade_code = ""
         # 持仓缓存：避免每分钟多次调用THS触发验证码
         self._positions_cache = None       # List[Position]
         self._positions_cache_ts = 0.0     # 上次刷新时间戳
@@ -315,8 +356,108 @@ class THSBrokerAdapter(BrokerAdapter):
             self._user.connect(self._exe_path)
             # 启用键盘输入模式（解决64位Python控制32位THS的剪贴板兼容问题）
             self._user.enable_type_keys_for_editor()
+            # ── 修复：monkey-patch easytrader 的输入函数 ──
+            # 原版 type_keys 模式下 editor.select() 只聚焦不选全，
+            # THS 自动填入的旧价格没被清掉，新价格叠加上去导致超精度。
+            # 修复：打字前先 Ctrl+A 全选 → Delete 清空 → 再打新内容。
+            _original_type_edit = self._user._type_edit_control_keys.__func__
+
+            def _fixed_type_edit_control_keys(trader_self, control_id, text):
+                code_hint = self._active_trade_code or self._last_trade_code
+                normalized_text = _normalize_trade_input_text(control_id, text, code_hint)
+                if control_id == _THS_SECURITY_CONTROL_ID:
+                    self._last_trade_code = normalized_text
+
+                editor = trader_self._main.child_window(
+                    control_id=control_id, class_name="Edit"
+                )
+                editor.set_focus()
+                time.sleep(0.05)
+
+                # 证券代码输入更依赖键盘事件触发行情联想，因此保留 type_keys。
+                if control_id == _THS_SECURITY_CONTROL_ID:
+                    editor.type_keys("^a{DELETE}", set_foreground=False)
+                    time.sleep(0.05)
+                    editor.type_keys(normalized_text, set_foreground=False)
+                    return
+
+                # ── 价格控件特殊处理：THS 输入证券代码后会异步回填"当前价"
+                # （常带 3~5 位小数），如果我们在回填完成前写入，值会被它覆盖。
+                # 策略：先等 THS 回填完毕，再写；写完后多次回读校验，被覆盖就重写。
+                if control_id == _THS_PRICE_CONTROL_ID:
+                    # 先等 THS 自己把行情价回填进去（最多 400ms）
+                    time.sleep(0.35)
+
+                    final_text = ""
+                    for attempt in range(4):
+                        try:
+                            _write_edit_text(editor.handle, normalized_text)
+                        except Exception as e:
+                            logger.debug(f"[THS] 价格 WM_SETTEXT 失败 attempt={attempt}: {e}")
+
+                        # 等 150ms，给 THS 一次"又回填"的机会
+                        time.sleep(0.15)
+                        try:
+                            final_text = _read_edit_text(editor.handle)
+                        except Exception:
+                            final_text = ""
+
+                        if final_text == normalized_text:
+                            return  # 成功写入且未被覆盖
+
+                        # 被覆盖或写入失败，稍等再试（递增退避）
+                        time.sleep(0.1 * (attempt + 1))
+
+                    # WM_SETTEXT 反复被覆盖 → 用 type_keys 兜底
+                    try:
+                        editor.type_keys("^a{DELETE}", set_foreground=False)
+                        time.sleep(0.1)
+                        editor.type_keys(normalized_text, set_foreground=False)
+                        time.sleep(0.2)
+                        final_text = _read_edit_text(editor.handle)
+                    except Exception as e:
+                        logger.debug(f"[THS] 价格 type_keys 兜底失败: {e}")
+                        final_text = ""
+
+                    if final_text != normalized_text:
+                        logger.error(
+                            f"[THS] 价格输入最终不一致 control_id={control_id}: "
+                            f"expect={normalized_text!r} actual={final_text!r} "
+                            f"(可能是 THS 自动回填 tick 精度价格覆盖了我们的写入)"
+                        )
+                    return
+
+                # 数量 / 其他控件：短路径写入
+                actual_text = ""
+                try:
+                    _write_edit_text(editor.handle, normalized_text)
+                    time.sleep(0.05)
+                    actual_text = _read_edit_text(editor.handle)
+                except Exception as e:
+                    logger.debug(f"[THS] WM_SETTEXT 写入失败 control_id={control_id}: {e}")
+
+                if actual_text != normalized_text:
+                    editor.type_keys("^a{DELETE}", set_foreground=False)
+                    time.sleep(0.05)
+                    editor.type_keys(normalized_text, set_foreground=False)
+                    time.sleep(0.05)
+                    try:
+                        actual_text = _read_edit_text(editor.handle)
+                    except Exception:
+                        actual_text = ""
+
+                if actual_text and actual_text != normalized_text:
+                    logger.warning(
+                        f"[THS] 输入框回读不一致 control_id={control_id}: "
+                        f"expect={normalized_text!r} actual={actual_text!r}"
+                    )
+
+            import types
+            self._user._type_edit_control_keys = types.MethodType(
+                _fixed_type_edit_control_keys, self._user
+            )
             self._connected = True
-            logger.info(f"[THS] 连接成功（键盘输入模式）: {self._exe_path}")
+            logger.info(f"[THS] 连接成功（键盘输入模式+输入补丁）: {self._exe_path}")
             # 注入验证码拦截补丁
             self._patch_pop_dialog_handler()
             # 启动验证码守护线程：每秒检测弹窗，弹窗一出现立刻 OCR + 输入 + 确定
@@ -351,10 +492,15 @@ class THSBrokerAdapter(BrokerAdapter):
 
     @_retry(max_attempts=3, delay=1.0)
     def buy(self, code: str, price: float, shares: int) -> OrderResult:
-        # 价格精度：转债3位小数，股票2位小数
-        # 兜底：任何证券价格绝不超过3位小数
-        price = round(price, _price_decimals(code))
+        # ── 价格精度：本地保留 float（OrderResult 字段要 float），
+        # 但传给 easytrader 的是字符串 —— easyutils.round_price_by_code 对 str
+        # 直接原样返回，这样下游拿到的永远是干净的 "9.54"/"123.456"，
+        # 不会出现浮点 repr 残余（如 8.070000001）。
+        d = _price_decimals(code)
+        price = float(f"{float(price):.{d}f}")  # 截断到 d 位小数的 float
+        self._active_trade_code = str(code).strip()
         if not self._ensure_connected():
+            self._active_trade_code = ""
             return OrderResult(
                 code=code, direction="buy", status="error",
                 requested_price=price, requested_shares=shares,
@@ -376,16 +522,44 @@ class THSBrokerAdapter(BrokerAdapter):
                 requested_price=price, requested_shares=shares,
                 message=str(e)[:200],
             )
+        finally:
+            self._active_trade_code = ""
 
     @_retry(max_attempts=3, delay=1.0)
     def sell(self, code: str, price: float, shares: int) -> OrderResult:
-        price = round(price, _price_decimals(code))
+        # ── 价格精度：本地保留 float（OrderResult 字段要 float），
+        # 字符串化延后到调用 easytrader 那一刻进行。
+        d = _price_decimals(code)
+        price = float(f"{float(price):.{d}f}")
+        self._active_trade_code = str(code).strip()
+
         if not self._ensure_connected():
+            self._active_trade_code = ""
             return OrderResult(
                 code=code, direction="sell", status="error",
                 requested_price=price, requested_shares=shares,
                 message="同花顺客户端未连接",
             )
+
+        # ── 可卖余额检查：已清仓则直接拒绝，防止重复卖出 ──
+        try:
+            positions = self.get_positions()
+            pos = next((p for p in positions if p.code == code), None)
+            if pos is None or pos.sellable_shares <= 0:
+                msg = f"{code} 可卖余额为0，跳过卖出"
+                logger.warning(f"[THS] {msg}")
+                return OrderResult(
+                    code=code, direction="sell", status="rejected",
+                    requested_price=price, requested_shares=shares,
+                    message=msg,
+                )
+            # 卖出数量不能超过可卖余额
+            if shares > pos.sellable_shares:
+                logger.warning(f"[THS] {code} 请求卖{shares}股 > 可卖{pos.sellable_shares}股，自动修正")
+                shares = pos.sellable_shares
+        except Exception as e:
+            logger.debug(f"[THS] 可卖余额检查跳过: {e}")
+
         try:
             result = self._execute_with_captcha_check(
                 self._user.sell, code, price, shares, "sell"
@@ -402,6 +576,8 @@ class THSBrokerAdapter(BrokerAdapter):
                 requested_price=price, requested_shares=shares,
                 message=str(e)[:200],
             )
+        finally:
+            self._active_trade_code = ""
 
     def cancel_order(self, order_id: str) -> bool:
         if not self._ensure_connected():
@@ -609,6 +785,19 @@ class THSBrokerAdapter(BrokerAdapter):
         """
         # 0. 下单前先检查是否有残留验证码弹窗
         self._dismiss_copy_captcha()
+
+        # ── 关键修复：防止 float 精度泄漏到 THS 输入框 ──
+        # easytrader type_keys 会把 float 转 str 打字，round(8.06808,2) 在
+        # 二进制浮点下可能 repr 出多余小数位（如 8.07000000000001）。
+        # 统一格式化为字符串：easyutils.round_price_by_code 对 str 入参直接返回，
+        # 再配合 monkey-patch 的 _normalize_trade_input_text，最终写入的永远是精确值。
+        d = _price_decimals(code)
+        try:
+            price_val = float(price) if not isinstance(price, (int, float)) else price
+        except (TypeError, ValueError):
+            price_val = price
+        if isinstance(price_val, (int, float)):
+            price = f"{float(price_val):.{d}f}"
 
         # 1. 快照当前委托数
         try:

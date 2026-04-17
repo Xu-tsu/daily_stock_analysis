@@ -1,8 +1,47 @@
 {
-  "updated_at": "2026-04-10 16:27:07",
-  "cash": 1062.04,
-  "total_asset": 18623.04,
-  "target_position_ratio": 0.7,
-  "holdings": [],
-  "actual_position_ratio": 0.0
+  "holdings": [
+    {
+      "code": "000010",
+      "name": "美丽生态",
+      "shares": 300,
+      "sellable_shares": 0,
+      "cost_price": 0.0,
+      "current_price": 4.07,
+      "market_value": 1221.0,
+      "pnl_pct": 0.0,
+      "sector": "",
+      "buy_date": "",
+      "strategy_tag": ""
+    },
+    {
+      "code": "601778",
+      "name": "晶科科技",
+      "shares": 500,
+      "sellable_shares": 0,
+      "cost_price": 0.0,
+      "current_price": 6.9,
+      "market_value": 3450.0,
+      "pnl_pct": 0.0,
+      "sector": "",
+      "buy_date": "",
+      "strategy_tag": ""
+    },
+    {
+      "code": "600227",
+      "name": "赤天化",
+      "shares": 200,
+      "sellable_shares": 200,
+      "cost_price": 3.95,
+      "current_price": 3.46,
+      "market_value": 10380.0,
+      "pnl_pct": 0.0,
+      "sector": "",
+      "buy_date": "2026-03-31",
+      "strategy_tag": ""
+    }
+  ],
+  "cash": 2945.41,
+  "total_asset": 17996.41,
+  "actual_position_ratio": 0.8363,
+  "updated_at": "2026-04-17 16:10:48"
 }

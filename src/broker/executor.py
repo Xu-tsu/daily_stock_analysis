@@ -307,8 +307,8 @@ class RebalanceExecutor:
 
         direction = "sell" if act in ("sell", "reduce") else "buy"
 
-        # 安全检查
-        allowed, reason = check_order_allowed(code, price, shares, total_asset)
+        # 安全检查（带方向，支持"只关买"/"只关卖"）
+        allowed, reason = check_order_allowed(code, price, shares, total_asset, direction=direction)
         if not allowed:
             return OrderResult(
                 code=code, name=name, direction=direction,

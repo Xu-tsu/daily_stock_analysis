@@ -29,6 +29,9 @@ from src.langgraph.nodes.portfolio_update import update_portfolio_node
 from src.langgraph.nodes.broker_commands import (
     broker_sync_node, broker_quality_node,
     broker_halt_node, broker_resume_node,
+    broker_halt_buy_node, broker_resume_buy_node,
+    broker_halt_sell_node, broker_resume_sell_node,
+    broker_status_node,
 )
 
 logger = logging.getLogger(__name__)
@@ -60,6 +63,11 @@ def route_intent(state: dict) -> str:
         "broker_quality": "broker_quality",
         "broker_halt": "broker_halt",
         "broker_resume": "broker_resume",
+        "broker_halt_buy": "broker_halt_buy",
+        "broker_resume_buy": "broker_resume_buy",
+        "broker_halt_sell": "broker_halt_sell",
+        "broker_resume_sell": "broker_resume_sell",
+        "broker_status": "broker_status",
         "alert": "chat",      # 暂时用chat处理
         "mainline": "chat",   # 暂时用chat处理
         "chat": "chat",
@@ -141,6 +149,11 @@ def build_portfolio_graph() -> StateGraph:
     graph.add_node("broker_quality", broker_quality_node)
     graph.add_node("broker_halt", broker_halt_node)
     graph.add_node("broker_resume", broker_resume_node)
+    graph.add_node("broker_halt_buy", broker_halt_buy_node)
+    graph.add_node("broker_resume_buy", broker_resume_buy_node)
+    graph.add_node("broker_halt_sell", broker_halt_sell_node)
+    graph.add_node("broker_resume_sell", broker_resume_sell_node)
+    graph.add_node("broker_status", broker_status_node)
     graph.add_node("chat", chat_node)
 
     # 入口
@@ -173,6 +186,11 @@ def build_portfolio_graph() -> StateGraph:
         "broker_quality": "broker_quality",
         "broker_halt": "broker_halt",
         "broker_resume": "broker_resume",
+        "broker_halt_buy": "broker_halt_buy",
+        "broker_resume_buy": "broker_resume_buy",
+        "broker_halt_sell": "broker_halt_sell",
+        "broker_resume_sell": "broker_resume_sell",
+        "broker_status": "broker_status",
         "chat": "chat",
         "end": END,
     })
@@ -189,6 +207,11 @@ def build_portfolio_graph() -> StateGraph:
     graph.add_edge("broker_quality", END)
     graph.add_edge("broker_halt", END)
     graph.add_edge("broker_resume", END)
+    graph.add_edge("broker_halt_buy", END)
+    graph.add_edge("broker_resume_buy", END)
+    graph.add_edge("broker_halt_sell", END)
+    graph.add_edge("broker_resume_sell", END)
+    graph.add_edge("broker_status", END)
     graph.add_edge("chat", END)
 
     # 交易流程: risk_check → confirm → (等待) → execute_trade → END

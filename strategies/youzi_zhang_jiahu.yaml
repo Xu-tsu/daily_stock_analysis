@@ -1,0 +1,59 @@
+# 章盟主·大阳追高（Zhang Jiahu Style）
+# 对应量化评分器: youzi_styles.ZhangJiahuStyle
+
+name: youzi_zhang_jiahu
+display_name: 章盟主·大阳追高
+description: 月线突破 + 主升段起点 + 大阳线追高，只做趋势，不做横盘。
+category: trend
+core_rules: [2, 7]
+required_tools:
+  - get_realtime_quote
+  - get_sector_rankings
+  - search_stock_news
+
+instructions: |
+  **章盟主·大阳追高（Zhang Jiahu Big Candle Chaser）**
+
+  核心哲学：
+  「月线决定能不能做，周线决定什么时候做，日线决定买哪一根阳线。」
+  趋势为王，横盘不做，回调不抄。
+
+  ─── 6 个可量化维度 ───
+
+  1. **结构（最核心）**：
+     - 日线多头排列：+15
+     - 周线趋势 up：+15
+     - 月线趋势 up：+20（章盟主最核心权重）
+
+  2. **52 周新高**：
+     - 命中：+25（主升段起点）
+     - 距高点 <5%：+10
+
+  3. **今日大阳线 + 放量**：
+     - 涨幅 >=7% 且量比 >=2：+30
+     - 涨幅 >=5%：+15
+     - 今日收阴：-15（追高策略不做阴线）
+
+  4. **信号类型偏好**：
+     - `breakout`：+20（章盟主主战场）
+     - `momentum` / `board_hit`：+10
+     - 强趋势 `trend`（多头+周线 up）：+10
+
+  5. **中大盘偏好 80-400 亿**：
+     - 命中：+15
+     - <30 亿：-20（小盘不做）
+
+  6. **题材加持（可选）**：
+     - 在热点概念：+10
+
+  ─── 禁区（硬否决）───
+  - 日线空头排列
+  - 月线下行
+  - 高位连板 >=5
+
+  ─── 仓位建议（与 V2 协同）───
+  - 牛市：single_pct × 1.2（主升段敢重仓）
+  - 震荡：single_pct × 0.6（趋势不稳）
+  - 熊/崩盘：不做
+
+  在 buy_reason 中注明「章盟主风格·月线突破/主升=XX」。

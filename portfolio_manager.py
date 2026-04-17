@@ -10,6 +10,16 @@ logger = logging.getLogger(__name__)
 
 PORTFOLIO_FILE = os.getenv("PORTFOLIO_FILE", "data/portfolio.json")
 
+
+def _fmt_price(v, digits: int = 2):
+    """把 AI / 实时报价来的价格格式化成 2 位小数；非数值或区间字符串原样返回。"""
+    if v is None:
+        return v
+    try:
+        return f"{float(v):.{digits}f}"
+    except (TypeError, ValueError):
+        return v
+
 # ──────────────────────────────────────────────
 # 1. 持仓数据读写
 # ──────────────────────────────────────────────
@@ -280,7 +290,9 @@ def update_current_prices(portfolio: dict, price_map: dict) -> dict:
     for h in portfolio["holdings"]:
         code = h["code"]
         if code in price_map:
-            h["current_price"] = price_map[code]
+            # 价格精度：转债 3 位，股票 2 位（避免实时报价带来的 5-8 位小数污染 AI prompt）
+            _d = 3 if str(code).startswith(("110", "113", "123", "127", "128", "118")) else 2
+            h["current_price"] = round(float(price_map[code]), _d)
             h["market_value"] = round(h["current_price"] * h["shares"], 2)
             h["pnl_pct"] = round(
                 (h["current_price"] - h["cost_price"]) / h["cost_price"] * 100, 2
@@ -476,9 +488,9 @@ def _format_rebalance_report_legacy(rebalance: dict) -> str:
             if tp or sl:
                 price_info = []
                 if tp:
-                    price_info.append(f"目标卖出价: {tp}")
+                    price_info.append(f"目标卖出价: {_fmt_price(tp)}")
                 if sl:
-                    price_info.append(f"止损价: {sl}")
+                    price_info.append(f"止损价: {_fmt_price(sl)}")
                 lines.append(f"   🎯 {' | '.join(price_info)}")
             if st:
                 lines.append(f"   ⏰ 卖出时机: {st}")
@@ -498,9 +510,9 @@ def _format_rebalance_report_legacy(rebalance: dict) -> str:
                 if bp:
                     prices.append(f"买入区间:{bp}")
                 if tp:
-                    prices.append(f"目标:{tp}")
+                    prices.append(f"目标:{_fmt_price(tp)}")
                 if sl:
-                    prices.append(f"止损:{sl}")
+                    prices.append(f"止损:{_fmt_price(sl)}")
                 line += f"\n    🎯 {' | '.join(prices)}"
             lines.append(line)
             _append_execution_plan(lines, c, indent="    ")
@@ -573,9 +585,9 @@ def format_rebalance_report(rebalance: dict) -> str:
             if target_price or stop_loss:
                 price_info = []
                 if target_price:
-                    price_info.append(f"目标卖出价: {target_price}")
+                    price_info.append(f"目标卖出价: {_fmt_price(target_price)}")
                 if stop_loss:
-                    price_info.append(f"止损价: {stop_loss}")
+                    price_info.append(f"止损价: {_fmt_price(stop_loss)}")
                 lines.append(f"   🎯 {' | '.join(price_info)}")
             if sell_timing:
                 lines.append(f"   ⏰ 卖出时机: {sell_timing}")
@@ -597,9 +609,9 @@ def format_rebalance_report(rebalance: dict) -> str:
                 if buy_range:
                     prices.append(f"买入区间:{buy_range}")
                 if target_price:
-                    prices.append(f"目标:{target_price}")
+                    prices.append(f"目标:{_fmt_price(target_price)}")
                 if stop_loss:
-                    prices.append(f"止损:{stop_loss}")
+                    prices.append(f"止损:{_fmt_price(stop_loss)}")
                 line += f"\n    🎯 {' | '.join(prices)}"
             timing_note = candidate.get("timing_note")
             if timing_note:

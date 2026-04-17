@@ -9,29 +9,90 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 # ── 急停开关（内存级，进程内生效）──
+# 三档开关:
+#   _kill_switch        → True 则 buy/sell 全停
+#   _halt_buy_only      → True 则只停买入（仍允许止损/减仓）
+#   _halt_sell_only     → True 则只停卖出（很少用，但留口）
 _kill_switch = False
+_halt_buy_only = False
+_halt_sell_only = False
 _kill_switch_lock = threading.Lock()
 
 
 def is_trading_halted() -> bool:
-    """检查是否已触发急停"""
+    """检查是否已触发"完全"急停"""
     return _kill_switch
 
 
+def is_buy_halted() -> bool:
+    """是否禁止买入（完全急停 或 买入单独急停）"""
+    return _kill_switch or _halt_buy_only
+
+
+def is_sell_halted() -> bool:
+    """是否禁止卖出（完全急停 或 卖出单独急停）"""
+    return _kill_switch or _halt_sell_only
+
+
+def get_trading_state() -> dict:
+    """返回当前交易开关状态，用于 UI 展示。"""
+    return {
+        "halted_all": _kill_switch,
+        "halted_buy": _halt_buy_only,
+        "halted_sell": _halt_sell_only,
+        "can_buy": not (_kill_switch or _halt_buy_only),
+        "can_sell": not (_kill_switch or _halt_sell_only),
+    }
+
+
 def halt_trading(reason: str = "手动停止") -> None:
-    """触发急停"""
+    """触发急停（买卖全停）"""
     global _kill_switch
     with _kill_switch_lock:
         _kill_switch = True
     logger.warning(f"[安全] 交易已停止: {reason}")
 
 
+def halt_buy(reason: str = "手动停止买入") -> None:
+    """只停买入，保留卖出（用于顶部防御）"""
+    global _halt_buy_only
+    with _kill_switch_lock:
+        _halt_buy_only = True
+    logger.warning(f"[安全] 买入已停止: {reason}")
+
+
+def halt_sell(reason: str = "手动停止卖出") -> None:
+    """只停卖出（少用，极端行情持仓锁仓场景）"""
+    global _halt_sell_only
+    with _kill_switch_lock:
+        _halt_sell_only = True
+    logger.warning(f"[安全] 卖出已停止: {reason}")
+
+
 def resume_trading() -> None:
-    """解除急停"""
-    global _kill_switch
+    """解除全部急停（恢复买+卖）"""
+    global _kill_switch, _halt_buy_only, _halt_sell_only
     with _kill_switch_lock:
         _kill_switch = False
-    logger.info("[安全] 交易已恢复")
+        _halt_buy_only = False
+        _halt_sell_only = False
+    logger.info("[安全] 交易已恢复（全部）")
+
+
+def resume_buy() -> None:
+    """只恢复买入"""
+    global _halt_buy_only
+    with _kill_switch_lock:
+        _halt_buy_only = False
+    logger.info("[安全] 买入已恢复")
+
+
+def resume_sell() -> None:
+    """只恢复卖出"""
+    global _halt_sell_only
+    with _kill_switch_lock:
+        _halt_sell_only = False
+    logger.info("[安全] 卖出已恢复")
 
 
 # ── 每日委托计数（内存级，每日重置）──
@@ -68,15 +129,24 @@ def check_order_allowed(
     price: float,
     shares: int,
     total_asset: float,
+    direction: str = "",
 ) -> tuple:
     """检查单笔委托是否允许
+
+    Args:
+        direction: "buy"/"sell"，可选。提供则可精细化判定（只关买或只关卖）。
 
     Returns:
         (allowed: bool, reason: str)
     """
-    # 急停检查
+    # 急停检查（方向感知）
+    dir_lower = (direction or "").lower()
     if is_trading_halted():
         return False, "交易已被紧急停止，发送「恢复交易」解除"
+    if dir_lower in ("buy", "加仓", "建仓") and is_buy_halted():
+        return False, "自动买入已关闭，发送「开启买入」或「恢复交易」解除"
+    if dir_lower in ("sell", "reduce", "减仓", "清仓") and is_sell_halted():
+        return False, "自动卖出已关闭，发送「开启卖出」或「恢复交易」解除"
 
     # 每日限额
     max_daily = int(os.getenv("BROKER_MAX_DAILY_ORDERS", "20"))

@@ -119,17 +119,47 @@ def run_stock_scan(
         market = regime.get("regime", "sideways")
         logger.info(f"  [REGIME] {market.upper()} (score={regime.get('score', 0)})")
 
-        # 全天候龙头打板（与回测策略一致）
-        # 市场环境只影响仓位大小，不切换策略
-        logger.info(f"  [STRATEGY] 龙头打板 ALL-IN (市场={market.upper()}, 仓位={'95%' if market=='bull' else '60%' if market=='sideways' else '30%'})")
-        results = scan_market(
-            mode="dragon",
-            max_price=50.0,
-            min_turnover=3.0,
-            max_change=20.0,    # 允许涨停
-            min_change=-3.0,
-            top_n=15,
-        )
+        # Dragon v2：oracle 校准 + 封板强度 + 1→2 / 2→3 / pre_limit / ignition 分级入场
+        # 可通过 USE_DRAGON_V2=false 回退到旧 dragon 扫描
+        import os
+        use_v2 = os.getenv("USE_DRAGON_V2", "true").lower() in ("true", "1", "yes")
+
+        # regime 映射：dual_trader 用小写 bull/sideways/bear/crash，dragon_v2 用大写
+        regime_map = {"bull": "BULL", "sideways": "SIDE", "bear": "BEAR", "crash": "CRASH"}
+        regime_upper = regime_map.get(market, "SIDE")
+
+        if use_v2:
+            logger.info(f"  [STRATEGY] Dragon v2 (regime={regime_upper}) 1→2/2→3/pre_limit/ignition + 封板强度")
+            if regime_upper == "CRASH":
+                logger.info("  [STRATEGY] CRASH regime → 强制空扫描，保护资金")
+                results = []
+            else:
+                from market_scanner_dragon import scan_market_dragon_v2
+                results = scan_market_dragon_v2(
+                    regime=regime_upper,
+                    top_n=15,
+                    use_live_seal=True,
+                )
+                # 若发现 ALL-IN 信号，日志重点提示
+                for r in results[:3]:
+                    if r.get("allin_suggest"):
+                        logger.info(f"  ★★★ ALL-IN 建议: {r['code']} {r.get('name','')} "
+                                    f"封单 {r.get('seal_amount_wan',0):.0f} 万, "
+                                    f"续板概率 {r.get('next_prob',0):.2f}")
+                # 字段对齐：旧调用方按 tech_score 读，v2 写 dragon_tech_score
+                for r in results:
+                    if "dragon_tech_score" in r:
+                        r["tech_score"] = r["dragon_tech_score"]
+        else:
+            logger.info(f"  [STRATEGY] Legacy dragon scan (市场={market.upper()})")
+            results = scan_market(
+                mode="dragon",
+                max_price=50.0,
+                min_turnover=3.0,
+                max_change=20.0,
+                min_change=-3.0,
+                top_n=15,
+            )
 
         if not results:
             logger.info("  [STOCK] No candidates from market scan")
@@ -199,15 +229,43 @@ def run_stock_scan(
         except Exception:
             pass
 
+        # ── 游资风格评分层（蒸馏 A 股游资打法 + 多周期 + 消息面 + V2 协同）──
+        try:
+            from youzi_pipeline import enrich_with_youzi, dispatch_report
+
+            # adaptive_coeff 交给 AdaptiveTradeState；这里默认 1.0，main.py 会重写
+            enriched, trace, paths = enrich_with_youzi(
+                results=results,
+                hot_concepts=hot_concepts,
+                regime=regime,
+                adaptive_coeff=float(os.getenv("YOUZI_ADAPTIVE_COEFF", "1.0") or 1.0),
+                event_defense=bool(event_signals),
+                save_report=True,
+            )
+            results = enriched
+
+            # 按环境变量决定是否推送
+            if os.getenv("YOUZI_DISPATCH_REPORT", "true").lower() in ("true", "1", "yes"):
+                try:
+                    dispatch_report(trace, paths.get("md"))
+                except Exception as e:
+                    logger.debug(f"  [YOUZI] dispatch_report failed: {e}")
+        except Exception as e:
+            logger.warning(f"  [YOUZI] enrichment skipped: {e}")
+            import traceback
+            traceback.print_exc()
+
         # 打印结果
         logger.info(f"  [STOCK] Top candidates:")
         for i, r in enumerate(results[:10]):
             hot_tag = " [HOT]" if r.get("hot_concept") else ""
+            votes = r.get("youzi_buy_votes") or []
+            votes_tag = f" [YOUZI:{'+'.join(votes)}]" if votes else ""
             sig = r.get("signal_type", r.get("ma_trend", ""))
             logger.info(
                 f"    #{i+1} {r.get('name', '?')}({r['code']}) "
                 f"price={r.get('price', 0):.2f} chg={r.get('change_pct', 0):+.1f}% "
-                f"score={r.get('tech_score', 0)} {sig}{hot_tag}"
+                f"score={r.get('tech_score', 0)} {sig}{hot_tag}{votes_tag}"
             )
 
         return results

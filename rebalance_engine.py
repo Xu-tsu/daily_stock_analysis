@@ -166,7 +166,7 @@ def _fetch_holding_technical(code: str, cost_price: float = 0) -> dict:
                 "signal_score": tr.signal_score,
             }
             # ---- 盈亏转正预测 ----
-            if cost_price > 0 and tr.current_price < cost_price:
+            if cost_price > 0 and tr.current_price > 0 and tr.current_price < cost_price:
                 gap_pct = round((cost_price - tr.current_price) / tr.current_price * 100, 2)
                 # 用近20日平均日涨幅估算回本天数
                 if len(kdf) >= 20:

@@ -465,11 +465,13 @@ def run_full_analysis(
         logger.exception(f"分析流程执行失败: {e}")
 
 
-def _auto_build_positions(portfolio: dict, config, args, candidates=None, event_signals=None):
+def _auto_build_positions(portfolio: dict, config, args, candidates=None, event_signals=None, regime=None):
     """空仓时自动选股+直接在THS买入。
 
-    流程: scan_market → 选最强1只 → 自适应仓位 → broker.buy → 更新 portfolio
-    如果传入 candidates 则直接使用，不再重新扫描。
+    策略 = V2 (backtest_adaptive_v2, +10.58%) × AdaptiveTradeState × 事件防御
+      - regime → V2 max_positions / single_pct / total_pct
+      - adaptive.position_coeff 作为安全系数（连亏/回撤时自动降仓）
+      - 事件防御再乘 0.5
     """
     import os
     try:
@@ -480,13 +482,14 @@ def _auto_build_positions(portfolio: dict, config, args, candidates=None, event_
             logger.info("[自动建仓] 扫描无合适候选，跳过")
             return
 
-        picks = candidates[:1]  # 龙头打板：只选最强的1只ALL-IN
-        logger.info(f"[自动建仓] 龙头候选: {[(c['code'], c.get('name','')) for c in picks]}")
-
         broker_enabled = os.getenv("BROKER_ENABLED", "false").lower() == "true"
         total_cash = portfolio.get("cash", 0) or 200000
 
-        # ── blind_base 默认实盘入口: 用近期交易结果自适应调整仓位, 不再写死牛熊比例 ──
+        # ── V2 策略参数（来自收益最高的回测版本）──
+        from live_strategy_v2 import get_position_plan
+
+        adaptive_coeff = 1.0
+        event_defense = False
         try:
             from event_signal import (
                 get_event_action,
@@ -495,30 +498,72 @@ def _auto_build_positions(portfolio: dict, config, args, candidates=None, event_
                 save_adaptive_state,
             )
             adaptive = load_adaptive_state()
-            # 用broker总资产更新净值
             adaptive.update_equity(total_cash)
             save_adaptive_state(adaptive)
-            position_pct = adaptive.position_coeff
+            adaptive_coeff = adaptive.position_coeff
 
-            # 事件防御: 有重大负面事件时额外降仓
             event_action = (
                 get_event_action(event_signals)
                 if event_signals
                 else get_recent_event_action(max_age_hours=1.0)
             )
-            if event_action == "defense":
-                position_pct *= 0.5  # 事件防御: 仓位减半
-                logger.info("[自动建仓] 事件防御生效，仓位减半")
+            event_defense = (event_action == "defense")
 
-            logger.info(f"[自动建仓] 自适应仓位={position_pct*100:.0f}% "
+            logger.info(f"[自动建仓] 自适应系数={adaptive_coeff:.2f} "
                         f"(胜率={adaptive.recent_win_rate:.0%} 连亏={adaptive.consecutive_losses} "
                         f"回撤={adaptive.drawdown_pct:.1f}% 事件={event_action})")
         except Exception as e:
-            logger.warning(f"[自动建仓] 自适应仓位加载失败({e}), 使用默认60%")
-            position_pct = 0.60
+            logger.warning(f"[自动建仓] 自适应系数加载失败({e})，使用 1.0")
 
-        per_stock_cash = total_cash * position_pct
-        logger.info(f"[自动建仓] 仓位={position_pct*100:.0f}% 金额={per_stock_cash:,.0f}")
+        # 取当前 regime（没传则默认 SIDE 保守处理）
+        _regime_key = regime if regime is not None else "SIDE"
+        plan = get_position_plan(_regime_key, adaptive_coeff=adaptive_coeff, event_defense=event_defense)
+        max_positions = plan["max_positions"]
+        single_pct = plan["single_pct"]
+        total_pct = plan["total_pct"]
+
+        logger.info(f"[自动建仓] V2策略 regime={plan['regime']} "
+                    f"max_positions={max_positions} single_pct={single_pct*100:.1f}% "
+                    f"total_pct={total_pct*100:.1f}% "
+                    f"(base single={plan['base_single_pct']*100:.0f}% × coeff={adaptive_coeff:.2f}"
+                    f"{' × defense 0.5' if event_defense else ''})")
+
+        # ── 游资 veto 过滤：被任何 style 硬否决且无风格 buy 的候选直接剔除 ──
+        filtered = []
+        vetoed_out = []
+        for c in candidates:
+            verdict = c.get("youzi_verdict")
+            if verdict == "veto" and not c.get("youzi_buy_votes"):
+                vetoed_out.append(f"{c.get('name', c.get('code'))}({c.get('code')})")
+                continue
+            filtered.append(c)
+        if vetoed_out:
+            logger.info(f"[自动建仓] 游资veto剔除: {vetoed_out[:5]}...")
+        picks = filtered[:max_positions]
+        logger.info(f"[自动建仓] V2 候选 top{max_positions}: {[(c['code'], c.get('name','')) for c in picks]}")
+
+        # ── Dragon v2 ALL-IN 检测 ──
+        # 若首只候选带 allin_suggest=True（ULTRA 封板 × 1→2 × BULL），直接 ALL-IN 单票
+        allin_pick = None
+        if picks and picks[0].get("allin_suggest"):
+            allin_pick = picks[0]
+            picks = [allin_pick]   # 只买这一只
+            logger.info(
+                f"[自动建仓] ★★★ Dragon v2 ALL-IN 触发: {allin_pick['code']} "
+                f"{allin_pick.get('name','')} 封单={allin_pick.get('seal_amount_wan',0):.0f}万 "
+                f"续板概率={allin_pick.get('next_prob',0):.2f} entry={allin_pick.get('entry_type')}"
+            )
+
+        # total_pct 上限约束：若 max_positions × single_pct > total_pct，按 total_pct 均分
+        if allin_pick:
+            # ALL-IN：单票吃 85%（给滑点 + 手续费留 15% 缓冲）
+            effective_single = 0.85
+            per_stock_cash = total_cash * effective_single
+            logger.info(f"[自动建仓] ALL-IN 模式: 单票金额={per_stock_cash:,.0f} ({effective_single*100:.0f}%)")
+        else:
+            effective_single = min(single_pct, total_pct / max(1, len(picks)))
+            per_stock_cash = total_cash * effective_single
+            logger.info(f"[自动建仓] 单只金额={per_stock_cash:,.0f} (有效 single_pct={effective_single*100:.1f}%)")
 
         bought = []
         for c in picks:
@@ -579,6 +624,14 @@ def _auto_build_positions(portfolio: dict, config, args, candidates=None, event_
             # 记录到交易日志（复盘用）
             try:
                 from trade_journal import record_buy
+                # 组装游资决策理由，塞入 note，方便复盘归因
+                yz_votes = c.get("youzi_buy_votes") or []
+                yz_ws = c.get("youzi_weighted_score", 0)
+                hot = (c.get("news_ctx") or {}).get("hot_concept_names") or []
+                sig = c.get("signal_type") or c.get("ma_trend", "")
+                reasons_brief = f"sig={sig} votes={'+'.join(yz_votes) or '-'} ws={yz_ws}"
+                if hot:
+                    reasons_brief += f" hot={','.join(hot[:2])}"
                 record_buy(
                     code=code, name=name, shares=shares, price=price,
                     ma_trend=c.get("ma_trend", ""),
@@ -588,7 +641,7 @@ def _auto_build_positions(portfolio: dict, config, args, candidates=None, event_
                     tech_score=c.get("tech_score", 0),
                     sector=c.get("sector", ""),
                     source="auto_build",
-                    note=f"自动建仓 score={c.get('tech_score', 0)}",
+                    note=f"自动建仓 {reasons_brief}",
                 )
             except Exception as e:
                 logger.warning(f"[自动建仓] 交易日志记录失败: {e}")
@@ -640,6 +693,17 @@ def _auto_build_positions(portfolio: dict, config, args, candidates=None, event_
 def _run_checkpoint_with_rebalance(checkpoint: str, send_notification: bool):
     """盘中节点：先做市场快照，再跑调仓+自动执行。空仓时自动选股建仓。"""
     from market_monitor import run_intraday_checkpoint
+
+    # 0) 开盘前节点（9:45）触发游资选股复盘：对前几日的 watchlist 做 T+N 回访
+    if checkpoint in ("morning_review", "pre_market") or os.getenv("YOUZI_ALWAYS_REVIEW", "false").lower() in ("true", "1"):
+        try:
+            from youzi_review import run_and_dispatch
+            md = run_and_dispatch(horizon_days=int(os.getenv("YOUZI_REVIEW_HORIZON", "3")))
+            if md:
+                logger.info(f"[{checkpoint}] 游资复盘完成: {md}")
+        except Exception as e:
+            logger.debug(f"[{checkpoint}] 游资复盘跳过: {e}")
+
     # 1) 盘中快照（指数/板块/异动）
     run_intraday_checkpoint(checkpoint=checkpoint, send_notification=send_notification)
 
@@ -958,6 +1022,7 @@ def main() -> int:
                                 args,
                                 candidates=smart_candidates,
                                 event_signals=event_signals,
+                                regime=regime,
                             )
                         else:
                             logger.info("[Phase 3] 智能选股无候选，使用默认扫描建仓")
@@ -966,6 +1031,7 @@ def main() -> int:
                                 config,
                                 args,
                                 event_signals=event_signals,
+                                regime=regime,
                             )
                     except Exception as e:
                         logger.warning(f"[Phase 3] 智能选股失败({e})，使用默认扫描")
@@ -974,6 +1040,7 @@ def main() -> int:
                             config,
                             args,
                             event_signals=event_signals,
+                            regime=regime,
                         )
                 else:
                     # ── 有仓：正常调仓 ──
